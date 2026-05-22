@@ -58,7 +58,40 @@ and holds non-secret defaults (provider, model, etc).
 cmd/friday/main.go              entry point
 internal/bootstrap/             cfg, agent, persona
 internal/tui/                   bubbletea Model + Sink + render
+internal/tool/                  friday's own custom tools (e.g. echo)
 docs/sdk-feedback.md            evva SDK rough-edge notes
 ```
 
 `internal/` is friday-private. Only the evva `pkg/*` packages are imported.
+
+## Custom tools
+
+Friday demonstrates the SDK's tool-extension surface by shipping its
+own `echo` tool — a trivial example that echoes input back unchanged.
+The wiring is two parts:
+
+1. **Implement the `pkg/tools.Tool` interface** (Name, Description,
+   Schema, Execute). See `internal/tool/echo.go` — about 100 LOC
+   including doc comments and the JSON schema string.
+2. **Register at agent construction** via `agent.WithCustomTool` and
+   append the name to the active list:
+
+```go
+active, deferred := kits.GeneralPurposeKit()
+active = append(active, fridaytool.EchoToolName)
+
+ag, _ := agent.NewWithProfile(prof,
+    // …
+    agent.WithCustomTool(fridaytool.EchoToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+        return fridaytool.NewEcho(), nil
+    }),
+)
+```
+
+To exercise the tool from the TUI, prompt friday with something like
+*"echo `hello world` three times"* — the model will see the `echo`
+tool in its catalog and dispatch it.
+
+To add a tool of your own, drop a sibling file next to `echo.go`,
+mirror the same shape, and wire it through the same two-line
+register-and-append pattern.

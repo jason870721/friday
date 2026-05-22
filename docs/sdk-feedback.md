@@ -602,3 +602,117 @@ Lightweight notes — none rise to a fresh finding yet, just data points:
   optional. The Go zero-value is "" which would render the wrapped
   error as `config: EnvOverrides[]: ...` — confusing. evva could
   validate at Load time and reject empty Names with a clear message.
+
+---
+
+# Round 3 — building a custom tool (echo demo on alpha.3)
+
+Added a `friday/internal/tool/echo.go` custom tool wired through
+`agent.WithCustomTool` to confirm the SDK's tool-extension surface
+works end-to-end. The tool itself is trivial (echoes text, optional
+repeat), but the goal was to observe what writing a downstream tool
+*feels* like.
+
+## What worked exceptionally well
+
+- **The Tool interface is genuinely tiny — 4 methods.** Name,
+  Description, Schema, Execute. No lifecycle hooks, no init phase, no
+  context-builder protocol. The whole echo tool fit in ~100 LOC
+  including the schema string and the input-decoding error paths.
+- **Compile-time interface check via `var _ tools.Tool = (*EchoTool)(nil)`**
+  works as expected. Catches the "did I implement all four methods"
+  question at build time.
+- **The factory wraps the constructor in 1 line.** `WithCustomTool`
+  takes a `func(tools.State) (tools.Tool, error)` — for state-less
+  tools this is `func(pkgtools.State) (pkgtools.Tool, error) { return
+  fridaytool.NewEcho(), nil }`. Looks like boilerplate but it's the
+  only seam for stateful tools to grab cfg/workdir, so the uniformity
+  is worth it.
+- **Appending to `active` from a kit is one line.**
+  `active = append(active, fridaytool.EchoToolName)` extends the kit
+  in-place. No "rebuild the whole profile" dance.
+- **Tests are normal unit tests.** No fixtures, no mock LLM, no
+  agent loop required to exercise the tool. 6 tests + 1 compile-time
+  assertion confirmed the contract in ~10ms.
+
+## Fresh observations
+
+### R3-1. Discoverability — packages named `tools` and `tool` collide naturally
+
+evva's tool interface lives in `pkg/tools`. Friday's first instinct
+was to create `friday/internal/tools/` for custom tools, but that
+shadows the evva package name. We went with `friday/internal/tool/`
+(singular). Importing both then needs an alias:
+
+```go
+import (
+    pkgtools "github.com/johnny1110/evva/pkg/tools"
+
+    fridaytool "github.com/johnny1110/friday/internal/tool"
+)
+```
+
+Not an evva bug — it's a Go package-naming reality. But the
+`extending.md` "Custom tools" section (when 19g+ docs grow one)
+could call out the convention: **downstream apps should name their
+custom-tool package singular (`tool`) or branded (`fridaytool`) to
+avoid shadowing evva's `pkg/tools`.** Saves the next downstream
+author from learning the lesson the same way.
+
+### R3-2. Ergonomics — stateless tools want a factory shortcut
+
+Most custom tools (echo, calc, hash, …) ignore `tools.State`
+entirely — they don't need workdir or config. Today the factory
+spelling is still:
+
+```go
+agent.WithCustomTool(EchoToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+    return NewEcho(), nil
+})
+```
+
+Pure indirection. A helper next to `WithCustomTool` would let
+state-less tools register in one line:
+
+```go
+agent.WithStatelessTool(EchoToolName, NewEcho())
+```
+
+Implementation is 3 lines (wrap the tool in a closure that ignores
+state). Optional sugar; the existing surface already works.
+
+### R3-3. Schema is a raw JSON string — works, but no field-name link to the Go struct
+
+The echo tool's input struct field is `Text string \`json:"text"\``
+and the schema declares `"required": ["text"]`. If someone renames
+the struct field, the JSON tag stays right, but the schema string
+silently drifts. No compile-time link between the two.
+
+Existing evva tools have the same issue (everything ports raw JSON
+schema from the ref source). Wouldn't change for v1, but a future
+"schema-from-Go-struct" generator (à la `kong` for CLI flags) would
+remove the drift class entirely.
+
+### R3-4. The factory's `tools.State.Logger()` isn't reachable from the State interface
+
+Looking at `pkg/tools.State` (Phase 13c) — it exposes `Config()` and
+`Workdir()` but NOT `Logger()`. The factory receives no logger, so
+state-less tools rely on the per-call `Execute(ctx, logger, input)`
+logger. That's fine for echo, but a tool that wants startup-time
+logging (e.g. "loading API key from env at construction") has
+nowhere to write.
+
+Minor. Probably worth a `State.Logger() *slog.Logger` addition next
+time the State surface gets touched.
+
+## What's still carried forward
+
+- **R2-6**: broker promotion (`PermissionPrompter` callback). Same
+  blocker as 19c — needs design before exposure.
+- **R3-1**: doc the package-naming convention in extending.md.
+- **R3-2**: `agent.WithStatelessTool` sugar (cheap; nice-to-have).
+- **R3-3**: long-term schema-from-struct generator (not v1 scope).
+- **R3-4**: `tools.State.Logger()` accessor.
+
+None of R3-1..R3-4 blocked the echo tool. They're "next time the
+surface gets touched, consider these" notes.

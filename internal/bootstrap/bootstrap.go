@@ -26,7 +26,10 @@ import (
 	"github.com/johnny1110/evva/pkg/constant"
 	"github.com/johnny1110/evva/pkg/event"
 	_ "github.com/johnny1110/evva/pkg/llm/builtins"
+	pkgtools "github.com/johnny1110/evva/pkg/tools"
 	"github.com/johnny1110/evva/pkg/tools/kits"
+
+	fridaytool "github.com/johnny1110/friday/internal/tool"
 )
 
 // envTemplate is what friday writes into ~/.friday/.env on first
@@ -96,6 +99,10 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 	// Canonical general-purpose tool kit. (active includes
 	// tool_search because we're using the deferred companion.)
 	active, deferred := kits.GeneralPurposeKit()
+	// Append friday's own custom tools. Echo is wired below via
+	// WithCustomTool; the name must also appear in active so the
+	// LLM sees it in the tool catalog from turn one.
+	active = append(active, fridaytool.EchoToolName)
 
 	prof, err := agent.NewProfile(
 		"friday",
@@ -118,6 +125,13 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 		agent.WithMaxIterations(maxIters(cfg)),
 		agent.WithHeadlessBypass(),
 		agent.WithName("friday"),
+		// Friday's own custom tools. The factory receives tools.State
+		// (Config + Workdir + Logger) at build time; EchoTool ignores
+		// state but real friday tools can reach for cfg or workdir
+		// from here.
+		agent.WithCustomTool(fridaytool.EchoToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewEcho(), nil
+		}),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent.NewWithProfile: %w", err)
