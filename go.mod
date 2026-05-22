@@ -6,7 +6,7 @@ require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
-	github.com/johnny1110/evva v0.2.4-alpha.2
+	github.com/johnny1110/evva v0.2.4-alpha.3
 )
 
 require (

@@ -24,7 +24,9 @@ func main() {
 	// Log the evva SDK version friday is bound to. Useful when the
 	// user files a bug — pkg/version is stable surface so this is
 	// safe to query at any startup.
-	fmt.Fprintf(os.Stderr, "friday: built on evva %s\n", version.String())
+	// Bare() drops the leading "v" — composes cleanly into our own
+	// "evva 0.2.4-alpha.3" log format without the awkward double-v.
+	fmt.Fprintf(os.Stderr, "friday: built on evva %s\n", version.Bare())
 
 	// 1. Build the event sink first. The bubbletea program isn't ready
 	//    yet, so the sink starts unattached; it gets wired below once

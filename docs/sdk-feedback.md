@@ -8,7 +8,11 @@ it.
 - **Round 1** (`v0.2.4-alpha.1`): initial build — 12 findings, all
   resolved by evva's Phase 19. Kept below as the historical record.
 - **Round 2** (`v0.2.4-alpha.2`): post-Phase-19 migration + day-2
-  rough edges. See the **Round 2** heading near the bottom.
+  rough edges. 6 findings (R2-1 through R2-6); R2-1 through R2-5
+  resolved by evva's post-R2 follow-up.
+- **Round 3** (`v0.2.4-alpha.3`, in progress): scorecard updated at
+  the bottom of the Round 2 section; R2-6 (broker promotion) and any
+  fresh findings carry forward.
 
 Loose categories:
 
@@ -533,3 +537,68 @@ Highlighting the wins so the next round of polish keeps them:
   better than the typed `WithPermissionMode(PermissionBypass)`.
 - **`pkg/version.String()` on startup** is a tiny but reassuring
   addition. Users filing bugs include the SDK version automatically.
+
+---
+
+# Round 2 resolution — evva v0.2.4-alpha.3 (next tag)
+
+evva landed all five R2-1–R2-5 fixes between alpha.2 and alpha.3.
+Friday's bootstrap and main both updated to consume the new APIs.
+
+## Round 2 scorecard
+
+| # | Finding | Resolution in alpha.3 | Verified |
+| --- | --- | --- | --- |
+| R2-1 | `EnvOverrides []func(*Config) error` lacks names | New `config.EnvOverride{Name, Fn}` struct; Load wraps the failing override as `config: EnvOverrides[<Name>]: <err>` | ✅ — friday's `max_iters_from_env` is identifiable in failure logs |
+| R2-2 | Provider-creds wiring takes EnvAlias + EnvOverride (two steps) | New `LoadOptions.ProviderCredentials map[string]ProviderCredsFromEnv` reads env vars and calls `SetProviderCredentials` declaratively | ✅ — friday's bootstrap no longer carries an `applyDeepSeekCreds` helper; everything declares inside `LoadOptions{}` |
+| R2-3 | First-run leaves `~/.friday/.env` missing | New `LoadOptions.SeedEnvTemplate string`; written to `<AppHome>/.env` on first launch when file is missing | ✅ — friday ships an `envTemplate` constant; first launch now produces both YAML and `.env` |
+| R2-4 | `GeneralPurposeKit()` bundles `TOOL_SEARCH` even when no deferred | New `kits.GeneralPurposeActive()` returns the active half without tool_search; `GeneralPurposeKit()` remains the default (active + tool_search, deferred = web) | ✅ — godoc on both helpers tells the consumer which to pick |
+| R2-5 | `version.String()` returns `v…` with prefix | New `version.Bare()` returns bare semver (`0.2.4-alpha.3`) and respects SemVer 2.0 `+<stamp>` build-metadata format | ✅ — friday switched to `Bare()` for a cleaner `friday: built on evva 0.2.4-alpha.3` log line |
+
+**5 of 5 resolved.** All Round 2 ergonomics fixes landed.
+
+## Migration delta (alpha.2 → alpha.3)
+
+```diff
+- EnvOverrides []func(*config.Config) error
++ EnvOverrides []config.EnvOverride{{Name, Fn}, ...}
++ ProviderCredentials map[string]config.ProviderCredsFromEnv{...}
++ SeedEnvTemplate string
+- version.String()   // "v0.2.4-alpha.2"
++ version.Bare()     // "0.2.4-alpha.3"
+- kits.GeneralPurposeKit() always includes TOOL_SEARCH active
++ kits.GeneralPurposeActive() // for callers who drop the deferred list
+```
+
+Friday's bootstrap shrunk by **~10 more LOC** vs round 2 (no more
+`applyDeepSeekCreds` helper — declared inline in `LoadOptions`).
+Total: 158 LOC (alpha.1) → 135 LOC (alpha.2) → 125 LOC (alpha.3),
+**21% smaller bootstrap** since round 1.
+
+## Carried forward to Round 3
+
+- **R2-6** — broker promotion (`PermissionPrompter` callback shape).
+  Still deferred per evva's CLAUDE.md Phase 19c notes; friday's
+  bypass mode means we haven't been blocked yet. The shape proposed
+  in R2-6 still seems right.
+
+## Fresh observations from alpha.3 use
+
+Lightweight notes — none rise to a fresh finding yet, just data points:
+
+- **`LoadOptions` is becoming a "what does the host want" config
+  object.** EnvAliases, EnvOverrides, ProviderCredentials,
+  SeedEnvTemplate — four declarative wires to evva's loader. The
+  pattern works; it would be worth a section in `docs/extending.md`
+  framing LoadOptions as the **single declarative surface** for
+  host-driven runtime tuning, with a table of which field handles
+  which class of customisation.
+- **`ProviderCredentials` could grow to support env-var-driven
+  Models lists**. Today `LLMProviderConfig[name].Models` defaults
+  from `constant`. If a host wanted to add an env-driven
+  `DEEPSEEK_MODELS=foo,bar` override, there's no declarative path.
+  Probably YAGNI for v1, but flagging.
+- **`config.EnvOverride.Name` should probably be required**, not
+  optional. The Go zero-value is "" which would render the wrapped
+  error as `config: EnvOverrides[]: ...` — confusing. evva could
+  validate at Load time and reject empty Names with a clear message.

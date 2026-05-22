@@ -3,17 +3,16 @@
 // Profile, construct the agent.
 //
 // Nothing in this package imports evva's internal/* — the entire
-// surface is pkg/agent + pkg/config + pkg/tools + pkg/event +
-// pkg/tools/kits + pkg/llm/builtins. That last blank import
-// side-effect-registers Anthropic, DeepSeek, and Ollama into
-// pkg/llm.DefaultRegistry so the Profile's "deepseek" name resolves
-// at agent construction.
+// surface is pkg/agent + pkg/config + pkg/tools/kits + pkg/event +
+// pkg/llm/builtins. That last blank import side-effect-registers
+// Anthropic, DeepSeek, and Ollama into pkg/llm.DefaultRegistry so the
+// Profile's "deepseek" name resolves at agent construction.
 //
-// Phase 19 (evva v0.2.4-alpha.2) revamp: every multi-line helper here
-// used to be a hand-rolled shim around an evva surface that lacked an
-// ergonomic accessor. The whole bootstrap is now ~60 lines, half the
-// size of the previous round. See docs/sdk-feedback.md for the full
-// round-2 report.
+// Phase 19 R2 revamp: every multi-step shim friday used to carry —
+// pre-Load env aliasing, post-Load credential wiring, hand-rolled
+// kit composition, .env first-run handhold — collapsed into
+// declarative LoadOptions fields and named helper functions.
+// See docs/sdk-feedback.md for the round-by-round story.
 package bootstrap
 
 import (
@@ -30,42 +29,72 @@ import (
 	"github.com/johnny1110/evva/pkg/tools/kits"
 )
 
+// envTemplate is what friday writes into ~/.friday/.env on first
+// launch (via LoadOptions.SeedEnvTemplate). Closes the chicken-and-egg
+// gap where the YAML existed but the .env didn't — users now land in
+// a complete config tree they can edit.
+const envTemplate = `# friday env vars — edit and save, then rerun ` + "`go run ./cmd/friday`" + `.
+DEEPSEEK_API_KEY=
+LOG_LEVEL=info
+# LOG_DIR=/var/log/friday
+# MAX_ITERS=30
+`
+
 // New builds a ready-to-Run friday agent and returns it together with
 // the resolved *config.Config (the TUI reads provider/model from it
 // for the status footer).
-//
-// Failure modes:
-//   - config.Load returns an error (filesystem write-back on first run
-//     hit a permission problem, AppHome is unwriteable, etc.)
-//   - agent.NewWithProfile fails to build the LLM client (typically a
-//     missing API key; we print a hint above so the user can self-heal)
 func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 	home, _ := os.UserHomeDir()
 
-	// config.Load auto-loads ~/.friday/.env via godotenv. EnvAliases
-	// translate friday-flavoured names → evva canonicals before that
-	// happens; EnvOverrides fold any vars that don't have a YAML hook
-	// (MAX_ITERS, APIKEY → deepseek creds) into the populated cfg.
+	// One declarative LoadOptions block carries every env-driven
+	// behaviour: alias promotion, provider credentials, named
+	// post-Load overrides, and the first-run .env seed.
 	cfg, err := config.Load(config.LoadOptions{
 		AppName: "friday",
 		AppHome: filepath.Join(home, ".friday"),
+
+		// Friendlier env-var spellings → evva canonical names.
 		EnvAliases: map[string]string{
 			"LOGDIR":   "LOG_DIR",
 			"LOGLEVEL": "LOG_LEVEL",
 			"APIKEY":   "DEEPSEEK_API_KEY",
 		},
-		EnvOverrides: []func(*config.Config) error{
-			applyMaxItersFromEnv,
-			applyDeepSeekCreds,
+
+		// Declarative provider creds — replaces the post-Load
+		// shim friday used to carry. Read DEEPSEEK_API_KEY (or its
+		// APIKEY alias above) and install via cfg.SetProviderCredentials.
+		ProviderCredentials: map[string]config.ProviderCredsFromEnv{
+			"deepseek": {
+				APIKeyEnv:     "DEEPSEEK_API_KEY",
+				APIURLDefault: constant.DEEPSEEK.ApiUrl,
+			},
 		},
+
+		// Named overrides for env vars without a YAML hook. The
+		// Name field surfaces in the wrapped error if any of these
+		// fail, so a multi-override host can identify the culprit.
+		EnvOverrides: []config.EnvOverride{
+			{Name: "max_iters_from_env", Fn: applyMaxItersFromEnv},
+		},
+
+		// First-launch ~/.friday/.env seed. Never overwrites an
+		// existing file.
+		SeedEnvTemplate: envTemplate,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("config.Load: %w", err)
 	}
 
-	// Canonical general-purpose tool kit. Replaces the
-	// fs.Names()+shell.Names()+todo.Names()+util.Names() chain friday
-	// used to assemble by hand.
+	// Friendly diagnostic — agents fail loudly on first Run() if the
+	// API key is empty, but a one-line hint here saves the user that
+	// round-trip.
+	if cfg.LLMProviderConfig["deepseek"].ApiSecret == "" {
+		fmt.Fprintln(os.Stderr,
+			"friday: DEEPSEEK_API_KEY is empty — set it in ~/.friday/.env and try again.")
+	}
+
+	// Canonical general-purpose tool kit. (active includes
+	// tool_search because we're using the deferred companion.)
 	active, deferred := kits.GeneralPurposeKit()
 
 	prof, err := agent.NewProfile(
@@ -96,25 +125,10 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 	return ag, cfg, nil
 }
 
-// applyDeepSeekCreds installs the DeepSeek API key on cfg from
-// DEEPSEEK_API_KEY (canonical) or APIKEY (the friday-flavoured alias
-// promoted by EnvAliases above).
-//
-// Runs as a LoadOptions.EnvOverrides callback so cfg.mu is the only
-// thing touched.
-func applyDeepSeekCreds(cfg *config.Config) error {
-	apiKey := os.Getenv("DEEPSEEK_API_KEY")
-	if apiKey == "" {
-		// Soft-fail with a hint — let the user reach the TUI before
-		// failing on the first Run.
-		fmt.Fprintln(os.Stderr,
-			"friday: DEEPSEEK_API_KEY is empty — set it in ~/.friday/.env and try again.")
-	}
-	return cfg.SetProviderCredentials("deepseek", constant.DEEPSEEK.ApiUrl, apiKey)
-}
-
 // applyMaxItersFromEnv lets users tweak the loop cap from a one-line
-// .env edit without touching the YAML.
+// .env edit without touching the YAML. Wired through
+// LoadOptions.EnvOverrides so any failure surfaces in the
+// "config: EnvOverrides[max_iters_from_env]: ..." form.
 func applyMaxItersFromEnv(cfg *config.Config) error {
 	v := os.Getenv("MAX_ITERS")
 	if v == "" {
