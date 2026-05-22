@@ -102,7 +102,6 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 	// Append friday's own custom tools. Echo is wired below via
 	// WithCustomTool; the name must also appear in active so the
 	// LLM sees it in the tool catalog from turn one.
-	active = append(active, fridaytool.EchoToolName)
 
 	prof, err := agent.NewProfile(
 		"friday",
@@ -136,6 +135,11 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent.NewWithProfile: %w", err)
 	}
+
+	for _, act := range active {
+		ag.Logger().Info("ExposeTool", act)
+	}
+
 	return ag, cfg, nil
 }
 
