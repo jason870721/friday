@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -42,7 +43,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			if m.busy && m.runCancel != nil {
 				m.runCancel()
-				m.appendLines(styleNotice.Render("⨯ cancel requested"))
+				notice := "⨯ cancel requested"
+				if n := len(m.pendingPrompts); n > 0 {
+					m.pendingPrompts = nil
+					notice = fmt.Sprintf("⨯ cancel requested (%d queued discarded)", n)
+				}
+				m.appendLines(styleNotice.Render(notice))
 				return m, nil
 			}
 			return m, tea.Quit
@@ -54,7 +60,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyEnter:
 			prompt := strings.TrimSpace(m.input.Value())
-			if prompt == "" || m.busy {
+			if prompt == "" {
+				return m, nil
+			}
+			if m.busy {
+				// Agent is mid-Run — queue the prompt for delivery after
+				// the current Run finishes. We can't inject mid-Run on
+				// evva v0.2.4-alpha.3 (no public UserPromptQueue API),
+				// so the queue drains as a sequence of fresh Runs.
+				m.pendingPrompts = append(m.pendingPrompts, prompt)
+				m.appendLines(styleNotice.Render(
+					fmt.Sprintf("↳ queued (%d): %s", len(m.pendingPrompts), promptPreview(prompt))))
+				m.input.Reset()
 				return m, nil
 			}
 			return m.startRun(prompt)
@@ -72,6 +89,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// don't re-print msg.Result here.
 		m.input.Reset()
 		m.input.Focus()
+		// If the user queued prompts while we were busy, deliver the
+		// next one as a fresh Run. The remaining queue stays put — each
+		// RunDoneMsg drains exactly one entry.
+		if len(m.pendingPrompts) > 0 {
+			next := m.pendingPrompts[0]
+			m.pendingPrompts = m.pendingPrompts[1:]
+			return m.startRun(next)
+		}
 		return m, nil
 	}
 
@@ -123,6 +148,19 @@ func (m Model) handleAgentEvent(e event.Event) tea.Model {
 		m.messages = s.MessageCount
 	}
 	return m
+}
+
+// promptPreview returns a single-line, max-60-rune snippet of a prompt
+// for the "↳ queued" transcript notice. Long prompts (e.g. the trading
+// starting prompt) get truncated with an ellipsis so the queue line
+// stays readable.
+func promptPreview(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ⏎ ")
+	const max = 60
+	if r := []rune(s); len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
 }
 
 // transcriptHeight returns the viewport height after reserving rows for

@@ -27,7 +27,9 @@ import (
 	"github.com/johnny1110/evva/pkg/event"
 	_ "github.com/johnny1110/evva/pkg/llm/builtins"
 	pkgtools "github.com/johnny1110/evva/pkg/tools"
+	"github.com/johnny1110/evva/pkg/tools/daemon"
 	"github.com/johnny1110/evva/pkg/tools/kits"
+	"github.com/johnny1110/evva/pkg/tools/monitor"
 
 	fridaytool "github.com/johnny1110/friday/internal/tool"
 )
@@ -40,7 +42,17 @@ const envTemplate = `# friday env vars — edit and save, then rerun ` + "`go ru
 DEEPSEEK_API_KEY=
 LOG_LEVEL=info
 # LOG_DIR=/var/log/friday
-# MAX_ITERS=30
+
+# Agent loop iteration cap. 15s cycles × ~5760 = one full day. SDK
+# default is 30, which the binance trading loop would hit in 7.5
+# minutes — raise it here.
+MAX_ITERS=12000
+
+# Binance USDⓈ-M Futures (testnet by default). Required by the
+# binance_* trading tools; leave blank to disable them at runtime.
+BINANCE_API_KEY=
+BINANCE_SECRET_KEY=
+BINANCE_BASE_URL=https://testnet.binancefuture.com
 `
 
 // New builds a ready-to-Run friday agent and returns it together with
@@ -99,9 +111,17 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 	// Canonical general-purpose tool kit. (active includes
 	// tool_search because we're using the deferred companion.)
 	active, deferred := kits.GeneralPurposeKit()
-	// Append friday's own custom tools. Echo is wired below via
-	// WithCustomTool; the name must also appear in active so the
-	// LLM sees it in the tool catalog from turn one.
+	// schedule_wakeup is a built-in evva tool (registered in evva's
+	// toolset builtins) but not part of GeneralPurposeKit's active set.
+	// The binance auto-trading loop relies on it to self-pace 15s
+	// cycles, so opt it in explicitly here.
+	active = append(active, pkgtools.SCHEDULE_WAKEUP)
+	active = append(active, pkgtools.SKILL)
+	// Friday's own custom tools (echo + binance_*) are wired below
+	// via WithCustomTool — agent.NewWithProfile auto-registers each
+	// of them into the active catalog, so no explicit append here.
+	deferred = append(deferred, monitor.Names()...)
+	deferred = append(deferred, daemon.Names()...)
 
 	prof, err := agent.NewProfile(
 		"friday",
@@ -131,13 +151,50 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 		agent.WithCustomTool(fridaytool.EchoToolName, func(pkgtools.State) (pkgtools.Tool, error) {
 			return fridaytool.NewEcho(), nil
 		}),
+		// Binance Futures trading suite. All nine tools share a single
+		// process-wide client built lazily from BINANCE_* env vars on
+		// first call — see internal/tool/binance_client.go.
+		agent.WithCustomTool(fridaytool.BinancePriceToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinancePrice(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceTickerToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceTicker(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceKlinesToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceKlines(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceFundingToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceFunding(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceFeeToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceFee(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceLeverageToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceLeverage(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceOrderToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceOrder(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceCloseAllToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceCloseAll(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinanceBalanceToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinanceBalance(), nil
+		}),
+		agent.WithCustomTool(fridaytool.BinancePositionToolName, func(pkgtools.State) (pkgtools.Tool, error) {
+			return fridaytool.NewBinancePosition(), nil
+		}),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent.NewWithProfile: %w", err)
 	}
 
+	if err := ag.SetEffort("ultra"); err != nil {
+		return nil, nil, fmt.Errorf("ag.SetEffort: %w", err)
+	}
+
 	for _, act := range active {
-		ag.Logger().Info("ExposeTool", act)
+		ag.Logger().Info("ExposeTool", "tool", string(act))
 	}
 
 	return ag, cfg, nil

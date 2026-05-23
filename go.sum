@@ -26,8 +26,8 @@ github.com/clipperhouse/uax29/v2 v2.5.0 h1:x7T0T4eTHDONxFJsL94uKNKPHrclyFI0lm7+w
 github.com/clipperhouse/uax29/v2 v2.5.0/go.mod h1:Wn1g7MK6OoeDT0vL+Q0SQLDz/KpfsVRgg6W7ihQeh4g=
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f h1:Y/CXytFA4m6baUTXGLOoWe4PQhGxaX0KpnayAqC48p4=
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f/go.mod h1:vw97MGsxSvLiUE2X8qFplwetxpGLQrlU1Q9AUEIzCaM=
-github.com/johnny1110/evva v0.2.4-alpha.3 h1:Gm7w98kxsG6AFgW4zrO5ByD+ZOSNudKRiGy8Dk/jwSk=
-github.com/johnny1110/evva v0.2.4-alpha.3/go.mod h1:PyLjRn2F9cOkT+qTNZ8pPbM3vCiz6lAErJ4uK4uyv0U=
+github.com/johnny1110/evva v0.2.7-beta.1 h1:3Oq0NiAN5fRUpY/3sDb150U5yMAFrUjnDKOy7zBvV8I=
+github.com/johnny1110/evva v0.2.7-beta.1/go.mod h1:PyLjRn2F9cOkT+qTNZ8pPbM3vCiz6lAErJ4uK4uyv0U=
 github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
 github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
 github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728 h1:QwWKgMY28TAXaDl+ExRDqGQltzXqN/xypdKP86niVn8=

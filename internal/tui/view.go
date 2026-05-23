@@ -43,15 +43,16 @@ func (m Model) footer() string {
 	}
 	tokens := fmt.Sprintf("%s in / %s out toks",
 		commafy(m.inputTokens), commafy(m.outputTokens))
-	return footerStyle.Render(
-		fmt.Sprintf("%s%s%s%s%d msgs%s%s",
-			model,
-			footerDivider,
-			m.persona,
-			footerDivider,
-			m.messages,
-			footerDivider,
-			tokens))
+	parts := []string{
+		model,
+		m.persona,
+		fmt.Sprintf("%d msgs", m.messages),
+		tokens,
+	}
+	if n := len(m.pendingPrompts); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d queued", n))
+	}
+	return footerStyle.Render(strings.Join(parts, footerDivider))
 }
 
 // commafy renders n with thousands separators. Bytes-only, no
