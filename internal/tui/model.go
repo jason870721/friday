@@ -37,6 +37,13 @@ type Model struct {
 	busy      bool
 	runCancel context.CancelFunc
 
+	// pendingPrompts buffers user input typed while the agent is busy.
+	// Each Enter-while-busy appends one entry; RunDoneMsg pops the head
+	// and starts a new Run. Cleared on Ctrl+C-while-busy. The queue is
+	// FIFO and unbounded (charLimit on the textinput is the only
+	// per-entry guardrail).
+	pendingPrompts []string
+
 	// Cumulative token usage — driven by KindUsage events.
 	inputTokens, outputTokens int
 	messages                  int
