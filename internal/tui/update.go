@@ -78,7 +78,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case AgentEventMsg:
-		return m.handleAgentEvent(msg.Event), nil
+		return m.handleAgentEvent(msg), nil
 
 	case RunDoneMsg:
 		m.busy = false
@@ -119,33 +119,34 @@ func (m Model) startRun(prompt string) (tea.Model, tea.Cmd) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.runCancel = cancel
 
-	ag := m.agent
+	runner := m.runner
 	cmd := func() tea.Msg {
-		resp, err := ag.Run(ctx, prompt)
+		resp, err := runner.Run(ctx, prompt)
 		return RunDoneMsg{Result: resp, Err: err}
 	}
 	return m, cmd
 }
 
 // handleAgentEvent renders one evva event into a transcript line and
-// folds usage data into the cumulative counters.
-func (m Model) handleAgentEvent(e event.Event) tea.Model {
+// folds usage data into the cumulative counters. msg.Source carries the
+// producing role (Analyst / Risk / Executor / Pipeline) so the line can
+// be prefixed.
+func (m Model) handleAgentEvent(msg AgentEventMsg) tea.Model {
+	e := msg.Event
 	if e.Kind == event.KindUsage && e.Usage != nil {
 		m.inputTokens = e.Usage.Cumulative.InputTokens
 		m.outputTokens = e.Usage.Cumulative.OutputTokens
+		// Each per-turn usage event marks one completed model turn across
+		// the three agents — a reasonable proxy for the old msg counter.
+		m.messages++
 		return m
 	}
 
 	if line := renderEvent(e); line != "" {
+		if msg.Source != "" {
+			line = rolePrefix(msg.Source) + line
+		}
 		m.appendLines(line)
-	}
-
-	// Track approximate message count from session info — cheap, no
-	// extra LLM calls. Pull on RunEnd so the footer updates exactly
-	// once per turn.
-	if e.Kind == event.KindRunEnd {
-		s := m.agent.Session()
-		m.messages = s.MessageCount
 	}
 	return m
 }

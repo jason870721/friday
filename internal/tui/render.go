@@ -22,6 +22,24 @@ var (
 	styleNotice     = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("245"))
 )
 
+// roleStyles colours each pipeline role's transcript prefix so a round
+// reads as a visible Analyst → Risk → Executor flow.
+var roleStyles = map[string]lipgloss.Style{
+	"Analyst":  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")),  // blue
+	"Risk":     lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")), // amber
+	"Executor": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("48")),  // green
+	"Pipeline": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141")), // purple
+}
+
+// rolePrefix renders a "[Role] " tag for the start of a transcript line.
+func rolePrefix(role string) string {
+	style, ok := roleStyles[role]
+	if !ok {
+		style = styleNotice
+	}
+	return style.Render("["+role+"] ")
+}
+
 // renderEvent maps an evva Event into the transcript lines we want
 // the user to see. Returns an empty string when the event is silent
 // (the status footer covers it, or it's a v1-dropped kind).

@@ -10,7 +10,13 @@ import (
 // program.Send is goroutine-safe and pushes onto the program's msg
 // channel, so the Model only ever sees events serialised through
 // Update().
-type AgentEventMsg struct{ Event event.Event }
+//
+// Source carries the role tag (Analyst / Risk / Executor / Pipeline) so
+// the transcript can prefix the line. Empty for untagged events.
+type AgentEventMsg struct {
+	Event  event.Event
+	Source string
+}
 
 // RunDoneMsg is delivered when an agent.Run() goroutine finishes (or
 // errors). The Update handler unlocks the input on receipt.
@@ -36,10 +42,16 @@ func NewSink() *Sink { return &Sink{} }
 // Emit forwards through program.Send.
 func (s *Sink) Attach(p *tea.Program) { s.program = p }
 
-// Emit satisfies event.Sink.
+// Emit satisfies event.Sink — untagged events (Source "").
 func (s *Sink) Emit(e event.Event) {
+	s.EmitRole("", e)
+}
+
+// EmitRole satisfies orchestrator.RoleEmitter: forwards an event tagged
+// with the producing role so the transcript can prefix the line.
+func (s *Sink) EmitRole(role string, e event.Event) {
 	if s.program == nil {
 		return
 	}
-	s.program.Send(AgentEventMsg{Event: e})
+	s.program.Send(AgentEventMsg{Event: e, Source: role})
 }

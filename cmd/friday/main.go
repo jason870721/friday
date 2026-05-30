@@ -34,9 +34,10 @@ func main() {
 	sink := tui.NewSink()
 
 	// 2. Bootstrap loads ~/.friday/.env + ~/.friday/config/friday-config.yml,
-	//    registers DeepSeek credentials, builds the F.R.I.D.A.Y. Profile,
-	//    and returns a ready agent.Agent.
-	ag, cfg, err := bootstrap.New(sink)
+	//    registers DeepSeek credentials, and builds the PRD-003 three-agent
+	//    orchestrator (Analyst → Risk Manager → Executor). The sink doubles
+	//    as the orchestrator's RoleEmitter for role-tagged events.
+	orch, cfg, err := bootstrap.New(sink)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "friday: bootstrap failed:", err)
 		os.Exit(1)
@@ -44,7 +45,7 @@ func main() {
 
 	// 3. Bubbletea program. Alt-screen + mouse support is plenty for v1;
 	//    the textinput handles its own focus.
-	model := tui.New(ag, cfg, sink)
+	model := tui.New(orch, "deepseek · 3-agent pipeline", cfg, sink)
 	prog := tea.NewProgram(model,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),

@@ -8,16 +8,23 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/johnny1110/evva/pkg/agent"
 	"github.com/johnny1110/evva/pkg/config"
 )
+
+// Runner is the slice of behaviour the TUI needs from whatever drives a
+// prompt. Both a single agent.Agent and the multi-agent
+// orchestrator.Orchestrator satisfy it, so the TUI is agnostic to which
+// is wired in.
+type Runner interface {
+	Run(ctx context.Context, prompt string) (string, error)
+}
 
 // Model is friday's bubbletea Model. Three stacked regions: a viewport
 // holding the transcript, a textinput for the prompt, a one-line status
 // footer. The agent runs on a separate goroutine spawned from Update;
 // events stream back through Sink → program.Send → AgentEventMsg.
 type Model struct {
-	agent   agent.Agent
+	runner  Runner
 	cfg     *config.Config
 	sink    *Sink
 	model   string // provider/model label cached for the footer
@@ -52,8 +59,9 @@ type Model struct {
 }
 
 // New constructs the Model. The Sink should already exist; main attaches
-// it to the program after the program is created.
-func New(ag agent.Agent, cfg *config.Config, sink *Sink) Model {
+// it to the program after the program is created. modelLabel is the
+// provider/model string shown in the footer.
+func New(runner Runner, modelLabel string, cfg *config.Config, sink *Sink) Model {
 	ti := textinput.New()
 	ti.Placeholder = "ask friday…"
 	ti.Focus()
@@ -61,17 +69,16 @@ func New(ag agent.Agent, cfg *config.Config, sink *Sink) Model {
 	ti.Prompt = "› "
 	ti.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 
-	model := ag.Model()
-	if model == "" {
-		model = "deepseek/?"
+	if modelLabel == "" {
+		modelLabel = "deepseek/?"
 	}
 
 	m := Model{
-		agent:      ag,
+		runner:     runner,
 		cfg:        cfg,
 		sink:       sink,
-		model:      model,
-		persona:    "friday",
+		model:      modelLabel,
+		persona:    "analyst→risk→executor",
 		input:      ti,
 		transcript: []string{welcomeBanner()},
 	}

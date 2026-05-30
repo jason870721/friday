@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/johnny1110/evva/pkg/tools"
+	"github.com/johnny1110/friday/internal/binance"
+	"github.com/johnny1110/friday/internal/strategy"
 )
 
 const BinanceKlinesToolName tools.ToolName = "binance_klines"
@@ -15,7 +17,9 @@ const BinanceKlinesToolName tools.ToolName = "binance_klines"
 const binanceKlinesDescription = `Get recent candlestick (OHLCV) data for a Binance Futures symbol.
 
 Returns up to 'limit' candles for the given interval, formatted as one
-candle per line: time | open | high | low | close | volume.
+candle per line: time | open | high | low | close | volume. A trailing
+"Summary:" line gives a natural-language read of the series — price vs
+MA20, RSI(14) with its zone, and short-term momentum.
 
 Typical use:
 - interval=5m, limit=20 — last 100 minutes for a quick trend read
@@ -83,5 +87,13 @@ func (BinanceKlinesTool) Execute(ctx context.Context, logger *slog.Logger, raw j
 		fmt.Fprintf(&b, "%d | %.4f | %.4f | %.4f | %.4f | %.4f\n",
 			k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume)
 	}
+	// PRD-001: a natural-language read of the same candles — MA20, RSI(14),
+	// and short-term momentum. PRD-006: append the deterministic strategy
+	// consensus (momentum / breakout / mean-reversion) so the Analyst reads
+	// pre-computed signals instead of inventing direction. The candle table
+	// above is retained alongside both.
+	summary := binance.SemanticSummary(ks)
+	consensus := strategy.ConsensusFor(in.Symbol, ks)
+	fmt.Fprintf(&b, "\nSummary: %s\n", strategy.FormatSummary(summary, consensus))
 	return tools.Result{Content: b.String()}, nil
 }
