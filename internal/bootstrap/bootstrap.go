@@ -21,16 +21,12 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/johnny1110/evva/pkg/agent"
 	"github.com/johnny1110/evva/pkg/config"
 	"github.com/johnny1110/evva/pkg/constant"
-	"github.com/johnny1110/evva/pkg/event"
 	_ "github.com/johnny1110/evva/pkg/llm/builtins"
-	pkgtools "github.com/johnny1110/evva/pkg/tools"
-	"github.com/johnny1110/evva/pkg/tools/daemon"
-	"github.com/johnny1110/evva/pkg/tools/kits"
-	"github.com/johnny1110/evva/pkg/tools/monitor"
 
+	"github.com/johnny1110/friday/internal/orchestrator"
+	"github.com/johnny1110/friday/internal/risk"
 	fridaytool "github.com/johnny1110/friday/internal/tool"
 )
 
@@ -55,10 +51,11 @@ BINANCE_SECRET_KEY=
 BINANCE_BASE_URL=https://testnet.binancefuture.com
 `
 
-// New builds a ready-to-Run friday agent and returns it together with
-// the resolved *config.Config (the TUI reads provider/model from it
-// for the status footer).
-func New(sink event.Sink) (agent.Agent, *config.Config, error) {
+// New loads friday's config and builds the PRD-003 multi-agent
+// orchestrator (Analyst → Risk Manager → Executor), returning it together
+// with the resolved *config.Config. The emitter (the TUI sink) receives
+// role-tagged events from all three agents.
+func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.Config, error) {
 	home, _ := os.UserHomeDir()
 
 	// One declarative LoadOptions block carries every env-driven
@@ -108,96 +105,56 @@ func New(sink event.Sink) (agent.Agent, *config.Config, error) {
 			"friday: DEEPSEEK_API_KEY is empty — set it in ~/.friday/.env and try again.")
 	}
 
-	// Canonical general-purpose tool kit. (active includes
-	// tool_search because we're using the deferred companion.)
-	active, deferred := kits.GeneralPurposeKit()
-	// schedule_wakeup is a built-in evva tool (registered in evva's
-	// toolset builtins) but not part of GeneralPurposeKit's active set.
-	// The binance auto-trading loop relies on it to self-pace 15s
-	// cycles, so opt it in explicitly here.
-	active = append(active, pkgtools.SCHEDULE_WAKEUP)
-	active = append(active, pkgtools.SKILL)
-	// Friday's own custom tools (echo + binance_*) are wired below
-	// via WithCustomTool — agent.NewWithProfile auto-registers each
-	// of them into the active catalog, so no explicit append here.
-	deferred = append(deferred, monitor.Names()...)
-	deferred = append(deferred, daemon.Names()...)
-
-	prof, err := agent.NewProfile(
-		"friday",
-		SystemPrompt,
-		active,
-		"deepseek",
-		constant.DEEPSEEK_V4_PRO,
-		agent.ProfileOptions{
-			DeferredTools: deferred,
-			Stream:        false, // buffered — keeps the TUI simple
-		},
+	// PRD-005: session circuit breaker. Thresholds come from env (with
+	// documented defaults). Install it on the tool package (binance_order
+	// consults it; log_trade feeds it) and hand the same pointer to the
+	// orchestrator so it can Observe/Tick each round.
+	breaker := risk.NewCircuitBreaker(
+		envFloat("FRIDAY_DAILY_LOSS_PCT", 0.10),
+		envInt("FRIDAY_MAX_CONSEC_LOSSES", 5),
+		envFloat("FRIDAY_DRAWDOWN_HALT_PCT", 0.20),
+		envInt("FRIDAY_COOLDOWN_CYCLES", 20),
 	)
+	fridaytool.SetCircuitBreaker(breaker)
+
+	// PRD-003: build the three-agent orchestrator (Analyst → Risk
+	// Manager → Executor). Tool wiring, profiles, and the round loop all
+	// live in internal/orchestrator now; bootstrap only loads config and
+	// hands the emitter (TUI sink) in for role-tagged events.
+	orch, err := orchestrator.New(cfg, emitter, breaker)
 	if err != nil {
-		return nil, nil, fmt.Errorf("agent.NewProfile: %w", err)
+		return nil, nil, fmt.Errorf("orchestrator.New: %w", err)
 	}
 
-	ag, err := agent.NewWithProfile(prof,
-		agent.WithConfig(cfg),
-		agent.WithSink(sink),
-		agent.WithMaxIterations(maxIters(cfg)),
-		agent.WithHeadlessBypass(),
-		agent.WithName("friday"),
-		// Friday's own custom tools. The factory receives tools.State
-		// (Config + Workdir + Logger) at build time; EchoTool ignores
-		// state but real friday tools can reach for cfg or workdir
-		// from here.
-		agent.WithCustomTool(fridaytool.EchoToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewEcho(), nil
-		}),
-		// Binance Futures trading suite. All nine tools share a single
-		// process-wide client built lazily from BINANCE_* env vars on
-		// first call — see internal/tool/binance_client.go.
-		agent.WithCustomTool(fridaytool.BinancePriceToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinancePrice(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceTickerToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceTicker(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceKlinesToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceKlines(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceFundingToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceFunding(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceFeeToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceFee(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceLeverageToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceLeverage(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceOrderToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceOrder(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceCloseAllToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceCloseAll(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinanceBalanceToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinanceBalance(), nil
-		}),
-		agent.WithCustomTool(fridaytool.BinancePositionToolName, func(pkgtools.State) (pkgtools.Tool, error) {
-			return fridaytool.NewBinancePosition(), nil
-		}),
-	)
+	return orch, cfg, nil
+}
+
+// envFloat reads a float env var, returning def when unset or unparsable.
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
-		return nil, nil, fmt.Errorf("agent.NewWithProfile: %w", err)
+		fmt.Fprintf(os.Stderr, "friday: %s=%q ignored: %v\n", key, v, err)
+		return def
 	}
+	return f
+}
 
-	if err := ag.SetEffort("ultra"); err != nil {
-		return nil, nil, fmt.Errorf("ag.SetEffort: %w", err)
+// envInt reads an int env var, returning def when unset or unparsable.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-
-	for _, act := range active {
-		ag.Logger().Info("ExposeTool", "tool", string(act))
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "friday: %s=%q ignored: %v\n", key, v, err)
+		return def
 	}
-
-	return ag, cfg, nil
+	return n
 }
 
 // applyMaxItersFromEnv lets users tweak the loop cap from a one-line
@@ -215,11 +172,4 @@ func applyMaxItersFromEnv(cfg *config.Config) error {
 		return nil
 	}
 	return cfg.SetMaxIterations(n)
-}
-
-func maxIters(cfg *config.Config) int {
-	if cfg.DefaultMaxIterations > 0 {
-		return cfg.DefaultMaxIterations
-	}
-	return 30
 }

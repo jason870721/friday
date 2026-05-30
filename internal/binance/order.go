@@ -134,7 +134,16 @@ func (c *Client) cancelAllOpenOrders(ctx context.Context, symbol string) error {
 // useful for tool-result content.
 func FormatOrder(o *OrderResponse) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s %s qty=%s", o.Symbol, o.Side, o.Type, o.ExecutedQty)
+	// A just-acked MARKET order frequently reports executedQty=0 because
+	// the fill settles asynchronously — showing "qty=0" then misleads the
+	// reader (and the agent) into thinking nothing traded. Fall back to the
+	// requested origQty so the line reflects the order size; the status
+	// field already distinguishes NEW from FILLED.
+	qty := o.ExecutedQty
+	if isZeroQty(qty) && !isZeroQty(o.OrigQty) {
+		qty = o.OrigQty
+	}
+	fmt.Fprintf(&b, "%s %s %s qty=%s", o.Symbol, o.Side, o.Type, qty)
 	if o.AvgPrice != "" && o.AvgPrice != "0" && o.AvgPrice != "0.00" {
 		fmt.Fprintf(&b, " @ %s", o.AvgPrice)
 	}
@@ -143,4 +152,14 @@ func FormatOrder(o *OrderResponse) string {
 		b.WriteString(" reduceOnly")
 	}
 	return b.String()
+}
+
+// isZeroQty reports whether a Binance quantity string is empty or
+// numerically zero (e.g. "", "0", "0.000").
+func isZeroQty(s string) bool {
+	if s == "" {
+		return true
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	return err == nil && f == 0
 }

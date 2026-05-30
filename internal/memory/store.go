@@ -1,0 +1,193 @@
+// Package memory is friday's trade-log vector memory (PRD-004). It is a
+// lightweight, embedded, file-backed vector store — no external server,
+// no embedding model. Each closed trade is logged with a numeric
+// market-feature vector; before evaluating a new setup the Analyst
+// retrieves the most similar past trades and their outcomes.
+//
+// Market-feature vectors (RSI, price-vs-MA20, momentum, funding,
+// sentiment) are a more faithful notion of "similar market conditions"
+// than text embeddings would be, and they need no embedding API.
+package memory
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+)
+
+// Features is the numeric characterisation of a market context at the time
+// of a trade. The same fields are supplied when logging and when
+// recalling, so similarity compares like with like.
+type Features struct {
+	RSI       float64 `json:"rsi"`         // 0-100
+	PriceVsMA float64 `json:"price_vs_ma"` // (price-MA20)/MA20 as a percent, e.g. +0.3
+	Momentum  float64 `json:"momentum"`    // -1 falling / 0 mixed / +1 rising
+	Funding   float64 `json:"funding"`     // funding rate as a percent, e.g. +0.01
+	Sentiment float64 `json:"sentiment"`   // Fear & Greed index, 0-100
+}
+
+// vec maps Features to a normalised vector. A constant leading dimension
+// keeps every vector non-degenerate (no zero vectors), so cosine
+// similarity is always well-defined. Each remaining dimension is scaled to
+// roughly [-1,1] so no single feature dominates the angle.
+func (f Features) vec() []float64 {
+	return []float64{
+		1.0,
+		f.RSI / 100.0,
+		clamp(f.PriceVsMA/10.0, -1, 1),
+		clamp(f.Momentum, -1, 1),
+		clamp(f.Funding*10.0, -1, 1),
+		f.Sentiment / 100.0,
+	}
+}
+
+// TradeRecord is one logged closed trade.
+type TradeRecord struct {
+	Symbol      string   `json:"symbol"`
+	Time        int64    `json:"time"` // unix seconds
+	Features    Features `json:"features"`
+	EntryReason string   `json:"entry_reason"`
+	Bias        string   `json:"bias"`    // LONG / SHORT
+	PnL         float64  `json:"pnl"`     // realised PnL in USDT
+	Outcome     string   `json:"outcome"` // WIN / LOSS / FLAT (derived if empty)
+}
+
+// Scored pairs a record with its similarity to a query (1 = identical
+// direction in feature space, 0 = orthogonal).
+type Scored struct {
+	Record     TradeRecord
+	Similarity float64
+}
+
+// Store is a process-wide, file-backed collection of trade records. It
+// loads the whole file into memory on Open (trade logs are small) and
+// appends one JSON line per Log.
+type Store struct {
+	mu      sync.Mutex
+	path    string
+	records []TradeRecord
+}
+
+// Open loads (or creates) a store backed by path. A missing file is not an
+// error — it yields an empty store that the first Log will create.
+func Open(path string) (*Store, error) {
+	s := &Store{path: path}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s, nil
+		}
+		return nil, fmt.Errorf("memory: open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var rec TradeRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue // skip a corrupt line rather than fail the whole store
+		}
+		s.records = append(s.records, rec)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("memory: read %s: %w", path, err)
+	}
+	return s, nil
+}
+
+// Len reports how many records the store holds.
+func (s *Store) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.records)
+}
+
+// Log appends a record and persists it. Outcome is derived from PnL when
+// not set.
+func (s *Store) Log(rec TradeRecord) error {
+	if rec.Outcome == "" {
+		switch {
+		case rec.PnL > 0:
+			rec.Outcome = "WIN"
+		case rec.PnL < 0:
+			rec.Outcome = "LOSS"
+		default:
+			rec.Outcome = "FLAT"
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, rec)
+
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+		return fmt.Errorf("memory: mkdir: %w", err)
+	}
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("memory: open for append: %w", err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(rec); err != nil {
+		return fmt.Errorf("memory: encode: %w", err)
+	}
+	return nil
+}
+
+// Similar returns the top-k records most similar to f, highest similarity
+// first. When symbol is non-empty, only records for that symbol are
+// considered. Ties and fewer-than-k cases are handled gracefully.
+func (s *Store) Similar(symbol string, f Features, k int) []Scored {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	q := f.vec()
+	scored := make([]Scored, 0, len(s.records))
+	for _, rec := range s.records {
+		if symbol != "" && rec.Symbol != symbol {
+			continue
+		}
+		scored = append(scored, Scored{Record: rec, Similarity: cosine(q, rec.Features.vec())})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].Similarity > scored[j].Similarity
+	})
+	if k > 0 && len(scored) > k {
+		scored = scored[:k]
+	}
+	return scored
+}
+
+func cosine(a, b []float64) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+func clamp(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}

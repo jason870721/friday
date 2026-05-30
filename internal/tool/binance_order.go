@@ -5,11 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/johnny1110/evva/pkg/tools"
 	"github.com/johnny1110/friday/internal/binance"
+	"github.com/johnny1110/friday/internal/risk"
 )
+
+// guardrailMaxMarginPct is the hard ceiling the pre-trade guardrail
+// enforces: an opening order's margin may not exceed this fraction of the
+// wallet balance. 15% mirrors the per-position cap documented in the
+// system prompt — enforced here in code so the model can't talk past it.
+const guardrailMaxMarginPct = 0.15
+
+// orderValidator is the process-wide pre-trade guardrail (PRD-002).
+var orderValidator = risk.NewMarginCapValidator(guardrailMaxMarginPct)
 
 const BinanceOrderToolName tools.ToolName = "binance_order"
 
@@ -73,6 +84,16 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: quantity=%g must be > 0", in.Quantity)}, nil
 	}
 
+	// Circuit breaker (PRD-005): session-level gate, BEFORE the per-trade
+	// margin guardrail. Blocks new entries when the session is paused/halted.
+	// Reduce-only closes always bypass — flattening risk is never blocked.
+	if !in.ReduceOnly && globalBreaker != nil {
+		if berr := globalBreaker.Check(); berr != nil {
+			logger.Info("binance_order.breaker_blocked", "symbol", in.Symbol, "reason", berr.Error())
+			return tools.Result{IsError: true, Content: berr.Error()}, nil
+		}
+	}
+
 	cli, err := sharedBinanceClient()
 	if err != nil {
 		return tools.Result{IsError: true, Content: err.Error()}, nil
@@ -81,9 +102,60 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 	logger.Debug("binance_order.dispatch",
 		"symbol", in.Symbol, "side", side, "quantity", in.Quantity, "reduce_only", in.ReduceOnly)
 
+	// Pre-trade guardrail (PRD-002): pull the live snapshot and run the
+	// margin-cap validator BEFORE the order reaches Binance. A breach
+	// blocks the order and tells the model to recalculate. If the snapshot
+	// can't be fetched we fail open (the LLM-level caps still apply) but
+	// note the degradation in the result.
+	var guardNote string
+	acct, snapErr := orderGuardSnapshot(ctx, cli, in.Symbol)
+	if snapErr != nil {
+		logger.Warn("binance_order.guardrail_snapshot_failed", "symbol", in.Symbol, "err", snapErr)
+		guardNote = fmt.Sprintf("[guardrail skipped: could not fetch snapshot: %v] ", snapErr)
+	} else if verr := orderValidator.Validate(risk.Order{
+		Symbol:     in.Symbol,
+		Side:       in.Side,
+		Quantity:   in.Quantity,
+		ReduceOnly: in.ReduceOnly,
+	}, acct); verr != nil {
+		logger.Info("binance_order.guardrail_blocked", "symbol", in.Symbol, "reason", verr.Error())
+		return tools.Result{IsError: true, Content: verr.Error()}, nil
+	}
+
 	ord, err := cli.MarketOrder(ctx, in.Symbol, side, in.Quantity, in.ReduceOnly)
 	if err != nil {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: %v", err)}, nil
 	}
-	return tools.Result{Content: binance.FormatOrder(ord)}, nil
+	return tools.Result{Content: guardNote + binance.FormatOrder(ord)}, nil
+}
+
+// orderGuardSnapshot pulls the live wallet balance, mark price, and
+// configured leverage the pre-trade guardrail needs to judge an order.
+// Any fetch failure is returned so the caller can fail open and flag it.
+func orderGuardSnapshot(ctx context.Context, cli *binance.Client, symbol string) (risk.Account, error) {
+	bal, err := cli.USDTBalance(ctx)
+	if err != nil {
+		return risk.Account{}, fmt.Errorf("balance: %w", err)
+	}
+	walletBalance, _ := strconv.ParseFloat(bal.Balance, 64)
+
+	mp, err := cli.Price(ctx, symbol)
+	if err != nil {
+		return risk.Account{}, fmt.Errorf("price: %w", err)
+	}
+	markPrice, _ := strconv.ParseFloat(mp.MarkPrice, 64)
+
+	// Leverage is best-effort: positionRisk returns the configured
+	// leverage per symbol even when flat. A miss leaves Leverage=0, which
+	// makes the validator treat margin as full notional (conservative).
+	var leverage float64
+	if pos, perr := cli.Positions(ctx, symbol); perr == nil && len(pos) > 0 {
+		leverage, _ = strconv.ParseFloat(pos[0].Leverage, 64)
+	}
+
+	return risk.Account{
+		WalletBalance: walletBalance,
+		MarkPrice:     markPrice,
+		Leverage:      leverage,
+	}, nil
 }
