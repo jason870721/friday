@@ -145,6 +145,36 @@ func ADX(ks []Kline, period int) (adx float64, ok bool) {
 	return dxSum / float64(dxCount), true
 }
 
+// ATR returns Wilder's Average True Range over the candle series for the given
+// period (14 conventional) — the average absolute per-candle range, in price
+// units (a volatility measure). True range is max(high−low, |high−prevClose|,
+// |low−prevClose|); ATR seeds from the simple average of the first `period`
+// true ranges, then applies Wilder smoothing. ok is false when there are fewer
+// than period+1 candles (true range needs a previous close).
+func ATR(ks []Kline, period int) (atr float64, ok bool) {
+	if period < 1 || len(ks) < period+1 {
+		return 0, false
+	}
+	n := len(ks)
+	tr := make([]float64, n)
+	for i := 1; i < n; i++ {
+		hl := ks[i].High - ks[i].Low
+		hc := math.Abs(ks[i].High - ks[i-1].Close)
+		lc := math.Abs(ks[i].Low - ks[i-1].Close)
+		tr[i] = math.Max(hl, math.Max(hc, lc))
+	}
+
+	var sum float64
+	for i := 1; i <= period; i++ {
+		sum += tr[i]
+	}
+	atr = sum / float64(period)
+	for i := period + 1; i < n; i++ {
+		atr = (atr*float64(period-1) + tr[i]) / float64(period)
+	}
+	return atr, true
+}
+
 // SemanticSummary renders a candle series into a single natural-language
 // line the LLM can read at a glance: current price, position relative to
 // MA20, RSI(14) with its zone, and short-term momentum from the last three
@@ -192,6 +222,14 @@ func SemanticSummary(ks []Kline) string {
 		default:
 			parts = append(parts, "Short-term momentum is mixed/choppy.")
 		}
+	}
+
+	if atr, ok := ATR(ks, 14); ok {
+		pct := 0.0
+		if last != 0 {
+			pct = atr / last * 100
+		}
+		parts = append(parts, fmt.Sprintf("ATR(14) is %.4f (%.2f%% of price) — volatility for risk-based sizing.", atr, pct))
 	}
 
 	return strings.Join(parts, " ")

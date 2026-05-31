@@ -51,7 +51,13 @@
 - **策略訊號層**（`internal/strategy`）—— 動量/突破/均值回歸的確定性訊號，
   附在 `binance_klines` 的 Summary 行，供分析師驗證（而非自行臆測方向）。
 - **交易記憶 + 沙盒回測**（`internal/memory`、`internal/backtest`）——
-  `recall_trades` 取出相似的歷史交易結果；`run_backtest` 可在實戰前先驗證策略勝率。
+  `recall_trades` 取出相似的歷史交易結果;`run_backtest` 可在實戰前先驗證策略勝率。
+- **損益以交易所為準（不信任 LLM 自報）**—— `log_trade` 平倉後會比對
+  `/fapi/v1/income` 帳本,記錄真實的「已實現損益 − 手續費 − 資金費率」淨值
+  (`pnl_source:"exchange"`);WIN/LOSS 與熔斷都以這個淨值為準,避免機器人把
+  賠錢的平倉誤記成獲利。若舊的 `trades.jsonl` 已被污染,執行
+  `go run ./cmd/reconcile-memory`(預設只預覽,加 `-write` 才寫入,會先備份 `.bak`)
+  用交易所真值修正。
 
 ---
 

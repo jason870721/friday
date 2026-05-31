@@ -5,12 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/johnny1110/evva/pkg/tools"
 	"github.com/johnny1110/friday/internal/binance"
+	"github.com/johnny1110/friday/internal/risk"
 	"github.com/johnny1110/friday/internal/strategy"
 )
+
+// hintLeverage is the illustrative leverage used only for the sizing hint's
+// margin figure; the Risk Manager recomputes with the leverage it actually
+// sets. Quantity itself is risk-based and leverage-independent.
+const hintLeverage = 20.0
 
 const BinanceKlinesToolName tools.ToolName = "binance_klines"
 
@@ -95,5 +102,52 @@ func (BinanceKlinesTool) Execute(ctx context.Context, logger *slog.Logger, raw j
 	summary := binance.SemanticSummary(ks)
 	consensus := strategy.ConsensusFor(in.Symbol, ks)
 	fmt.Fprintf(&b, "\nSummary: %s\n", strategy.FormatSummary(summary, consensus))
+
+	// PRD-007: append a volatility-based sizing hint (risk ÷ ATR stop) so the
+	// Analyst can carry ATR + the suggested stop into its report for the Risk
+	// Manager. Best-effort: needs the live balance, so silently omit it if the
+	// (signed) balance read is unavailable.
+	if bal, berr := cli.USDTBalance(ctx); berr == nil {
+		if hint := atrSizingHint(ks, parseBalance(bal.Balance)); hint != "" {
+			fmt.Fprintf(&b, "%s\n", hint)
+		}
+	}
 	return tools.Result{Content: b.String()}, nil
+}
+
+// atrSizingHint renders the PRD-007 risk-based sizing suggestion for the series,
+// or "" when ATR or the balance is unavailable.
+func atrSizingHint(ks []binance.Kline, balance float64) string {
+	atr, ok := binance.ATR(ks, 14)
+	if !ok || balance <= 0 || len(ks) == 0 {
+		return ""
+	}
+	entry := ks[len(ks)-1].Close
+	sz := risk.SuggestedSize(risk.DirLong, risk.SizeParams{
+		Balance:        balance,
+		EntryPrice:     entry,
+		ATR:            atr,
+		Leverage:       hintLeverage,
+		RiskPerTrade:   risk.DefaultRiskPerTrade,
+		StopMultiplier: risk.DefaultStopMultiplier,
+		MaxMarginPct:   guardrailMaxMarginPct,
+	})
+	if sz.Quantity <= 0 {
+		return ""
+	}
+	shortStop := entry + risk.DefaultStopMultiplier*atr
+	capNote := ""
+	if sz.CappedByLimit {
+		capNote = " [risk target exceeds cap → clamped to it]"
+	}
+	return fmt.Sprintf(
+		"Sizing hint (%.0f%% risk, %.0f×ATR stop, @%.0fx illustrative): ~%.4f units, margin ~$%.2f, stop long ~%.4f / short ~%.4f; %.0f%% margin cap = $%.2f.%s",
+		risk.DefaultRiskPerTrade*100, risk.DefaultStopMultiplier, hintLeverage,
+		sz.Quantity, sz.Margin, sz.StopPrice, shortStop,
+		guardrailMaxMarginPct*100, balance*guardrailMaxMarginPct, capNote)
+}
+
+func parseBalance(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
 }

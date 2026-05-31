@@ -49,13 +49,14 @@ order, breaker awareness) lives in the **three role system prompts** in
 
 ```
 cmd/friday/main.go            entry point: sink → bootstrap → bubbletea TUI
-internal/bootstrap/           config load, env, builds the orchestrator + circuit breaker
+cmd/reconcile-memory/         one-off tool: rewrite trades.jsonl PnL/outcome from the exchange income ledger
+internal/bootstrap/           config load, env, symbol resolution + exchangeInfo preflight, builds the orchestrator + circuit breaker
 internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop
 internal/tui/                 bubbletea Model + role-tagged event rendering
-internal/binance/             Binance Futures REST client + indicators (SMA, RSI, ADX, ATR*, SemanticSummary)
+internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, TradFi-Perps sign) + indicators (SMA, RSI, ADX, ATR, SemanticSummary)
 internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, divergence) + aggregator
 internal/risk/                MarginCapValidator (15% guardrail), CircuitBreaker (session safety)
-internal/memory/              embedded vector trade-memory (file-backed, cosine similarity)
+internal/memory/              embedded vector trade-memory (file-backed, cosine similarity); PnL reconciled against the exchange ledger
 internal/backtest/            sandbox strategy simulator over historical klines
 internal/tool/                friday's custom tools (binance_*, fear_greed_index, recall_trades, run_backtest, log_trade, submit_* via orchestrator)
 docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the index
@@ -75,24 +76,32 @@ docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the in
   `FRIDAY_MAX_CONSEC_LOSSES`, `FRIDAY_DRAWDOWN_HALT_PCT`,
   `FRIDAY_COOLDOWN_CYCLES`.
 - Reduce-only closes always bypass both gates.
+- **PnL is exchange-truth, not agent-reported** — `log_trade` reconciles a
+  closed trade against the `/fapi/v1/income` ledger (realised PnL − commission
+  − funding) and stores the true net (`pnl_source:"exchange"`); WIN/LOSS and
+  the circuit breaker both key off that net, never the LLM's estimate (which
+  was unreliable). `cmd/reconcile-memory` backfills the same correction onto an
+  existing `trades.jsonl`.
 
 ## Roadmap status (see docs/roadmap.md)
 
 Implemented & verified: **PRD-001** (semantic klines + ReAct),
 **PRD-002** (sentiment + margin guardrail), **PRD-003** (multi-agent
 refactor), **PRD-004** (vector memory + backtest), **PRD-005** (circuit
-breakers), **PRD-006** (strategy layer).
+breakers), **PRD-006** (strategy layer), **PRD-007** (ATR position sizing),
+plus operational hardening **PRD-010** (configurable venue-validated symbols)
+and **PRD-011** (exchange-truth PnL reconciliation).
 
-Planned (P1): **PRD-007** ATR position sizing, **PRD-008** multi-timeframe
-analysis, **PRD-009** stop-loss/TP execution monitor. (`ATR` in the
-indicator list above is added by PRD-007 — not yet present.)
+Planned (P1): **PRD-008** multi-timeframe analysis, **PRD-009** stop-loss/TP
+execution monitor (executes the 2×ATR stop level PRD-007 now computes).
 
 ## Build / run / test
 
 ```sh
 go build ./...
-go test ./...          # all internal/* packages have unit tests
-go run ./cmd/friday    # launches the TUI; paste the kickoff prompt from SKILL.md
+go test ./...                          # all internal/* packages have unit tests
+go run ./cmd/friday                    # launches the TUI; paste the kickoff prompt from SKILL.md
+go run ./cmd/reconcile-memory          # dry-run: fix trades.jsonl PnL from the exchange ledger (-write to apply)
 ```
 
 ## Conventions

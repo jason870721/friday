@@ -1,15 +1,16 @@
 # Friday Roadmap
 
-Two tranches of work. The **completed** tranche (PRD-001..004) realised the
-original 4-phase upgrade in [`plan.md`](./plan.md). The **planned** tranche
-(PRD-005..009) comes from the P0/P1 plans in
-[`.evva/plans/`](../.evva/plans/) and pushes Friday from "LLM as trader"
-toward "LLM as supervisor over deterministic Go strategy + hard safety
-rails".
+Three tranches of work. The **4-phase upgrade** (PRD-001..004) from
+[`plan.md`](./plan.md) and the **P0 safety/strategy** tranche (PRD-005..006)
+from the P0/P1 plans in [`.evva/plans/`](../.evva/plans/) are complete; the
+**P1** tranche (PRD-007..009) is still planned. Together they push Friday from
+"LLM as trader" toward "LLM as supervisor over deterministic Go strategy + hard
+safety rails". A separate **operational-hardening** tranche (PRD-010..011)
+captures fixes that came out of running real testnet sessions.
 
 ---
 
-## ⚠️ Architecture-alignment note (read before implementing PRD-005+)
+## ⚠️ Architecture-alignment note (read before implementing PRD-007+)
 
 The P0/P1 plans were written against the **pre-refactor single-agent**
 codebase. PRD-003 has since replaced that with the multi-agent
@@ -37,26 +38,34 @@ Each PRD below names the corrected integration points.
 
 ---
 
-## Planned — P0: strategy supervision + system safety
+## Completed — P0: strategy supervision + system safety
 
 Source: [`.evva/plans/p0-strategy-and-circuit-breaker.md`](../.evva/plans/p0-strategy-and-circuit-breaker.md)
 
-- ⬜ **[PRD-005](./PRD/PRD-005.md)** — System-Level Circuit Breakers. Session-wide safety switches (daily-loss limit, consecutive-loss pause, drawdown halt) that block new entries when the system is bleeding. *Lowest-risk, highest-immediate-safety — do this first.* Depends on PRD-002/003.
-- ⬜ **[PRD-006](./PRD/PRD-006.md)** — Strategy Layer. Deterministic Go signal engine (`internal/strategy/`: momentum / breakout / mean-reversion / divergence) + aggregator; the Analyst shifts from inventing direction to validating Go-computed signals. Depends on PRD-003; complements PRD-005.
+- ✅ **[PRD-005](./PRD/PRD-005.md)** — System-Level Circuit Breakers. Session-wide safety switches (daily-loss limit, consecutive-loss pause, drawdown halt) that block new entries when the system is bleeding. Depends on PRD-002/003.
+- ✅ **[PRD-006](./PRD/PRD-006.md)** — Strategy Layer. Deterministic Go signal engine (`internal/strategy/`: momentum / breakout / mean-reversion / divergence) + aggregator; the Analyst shifts from inventing direction to validating Go-computed signals. Depends on PRD-003. *(divergence implemented + unit-tested; live cross-symbol wiring deferred — see PRD-006 §5.)*
 
 ## Planned — P1: volatility-aware sizing, stops, multi-timeframe
 
 Source: [`.evva/plans/p1-volatility-stop-mtf.md`](../.evva/plans/p1-volatility-stop-mtf.md)
 
-- ⬜ **[PRD-007](./PRD/PRD-007.md)** — ATR Position Sizing. ATR(14) indicator + `risk.SuggestedSize` (risk-per-trade ÷ ATR stop distance); feeds the Risk Manager a volatility-calibrated target within the 15% cap. Foundation for PRD-009. Depends on PRD-002/003.
+- ✅ **[PRD-007](./PRD/PRD-007.md)** — ATR Position Sizing. `binance.ATR(14)` + `risk.SuggestedSize` (risk-per-trade ÷ 2×ATR stop); ATR + a sizing hint surface in the `binance_klines` Summary and the Risk Manager sizes from the volatility target within the 14%/15% caps. Foundation for PRD-009. Depends on PRD-002/003.
 - ⬜ **[PRD-008](./PRD/PRD-008.md)** — Multi-Timeframe Analysis. `binance_mtf_klines` tool (5m / 1h / 4h fetched concurrently) + cross-TF alignment; the Analyst reads macro context, not just 5m. Depends on PRD-003.
 - ⬜ **[PRD-009](./PRD/PRD-009.md)** — Stop-Loss/TP Execution Monitor. A goroutine polling price every ~1s that fires reduce-only market closes on SL/TP breach — a fast safety net independent of the 15s LLM loop. Depends on PRD-007 (ATR stop distance).
 
 ---
 
+## Completed — operational hardening
+
+Fixes surfaced by running real testnet sessions (not from the original plans).
+
+- ✅ **[PRD-010](./PRD/PRD-010.md)** — Configurable, Venue-Validated Symbol Universe. `FRIDAY_SYMBOLS` + startup `exchangeInfo` preflight (drop non-`TRADING`, real `LOT_SIZE` steps); symbol set threaded into prompts/schemas; TradFi-Perps agreement auto-signed so US-stock perps (NVDA/GOOGL/AMZN/META) trade. Depends on PRD-003.
+- ✅ **[PRD-011](./PRD/PRD-011.md)** — Exchange-Truth PnL Reconciliation. `log_trade` records the `/fapi/v1/income` net (realised − fees − funding) instead of the LLM's estimate; WIN/LOSS + circuit breaker key off the true net; `cmd/reconcile-memory` backfills corrupted history. Depends on PRD-004/005.
+
+---
+
 ## Suggested implementation order
 
-`PRD-005` (safety first) → `PRD-007` (ATR foundation) → `PRD-009` (stops,
-needs ATR) → `PRD-008` (MTF, standalone) → `PRD-006` (strategy layer,
-largest behavioural change). PRD-005/007/008/009 are mostly additive; PRD-006
-changes the Analyst's role and is best done once the safety rails are in.
+Done: `PRD-005` (circuit breakers) → `PRD-006` (strategy layer) → `PRD-007`
+(ATR sizing). Remaining: `PRD-009` (stop monitor, builds on PRD-007's stop
+level) → `PRD-008` (MTF, standalone) — both additive.
