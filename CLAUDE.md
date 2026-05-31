@@ -55,7 +55,7 @@ cmd/friday/main.go            entry point: sink → bootstrap → stop monitor �
 cmd/reconcile-memory/         one-off tool: rewrite trades.jsonl PnL/outcome from the exchange income ledger
 internal/bootstrap/           config load, env, symbol resolution + exchangeInfo preflight, builds the orchestrator + circuit breaker
 internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop, per-round analysis log (roundlog.go)
-internal/tui/                 bubbletea Model + role-tagged event rendering
+internal/tui/                 bubbletea Model + role-tagged event rendering + "/<name>" slash-skill commands (skills.go)
 internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, leverage brackets, TradFi-Perps sign) + indicators (SMA, EMA, RSI, ADX, ATR, ClassifyDirection, SemanticSummary)
 internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, ema_cross, cross-symbol divergence) + aggregator (single-TF + MTF cross-timeframe vote) + startup confidence calibration store (PRD-015) + ADX regime detection & regime-weighted consensus (PRD-016) + MTF strategy consensus (PRD-017)
 internal/risk/                MarginCapValidator (15% guardrail), CircuitBreaker (session safety), SuggestedSize (ATR sizing), StopMonitor (SL/TP poller)
@@ -63,7 +63,7 @@ internal/memory/              embedded vector trade-memory (file-backed, cosine 
 internal/backtest/            sandbox simulator: rule-based (run_backtest) + strategy-aware RunStrategy/Calibrate for startup confidence calibration (PRD-015)
 internal/tool/                friday's custom tools (binance_*, fear_greed_index, recall_trades, run_backtest, log_trade, submit_* via orchestrator)
 docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the index
-.friday/skills/start/SKILL.md startup / kickoff doc (Mandarin)
+.friday/skills/<name>/SKILL.md startup/kickoff docs (Mandarin); the TUI turns each into a "/<name>" command — frontmatter `prompt:` is what it sends (e.g. `/start`)
 ```
 
 `internal/` is friday-private; only evva `pkg/*` is imported upstream.

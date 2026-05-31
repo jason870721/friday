@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -55,6 +56,10 @@ type Model struct {
 	inputTokens, outputTokens int
 	messages                  int
 
+	// skills are the user-invocable "/<name>" commands discovered under
+	// .friday/skills/ at startup (see skills.go).
+	skills []Skill
+
 	ready bool
 }
 
@@ -73,6 +78,17 @@ func New(runner Runner, modelLabel string, cfg *config.Config, sink *Sink) Model
 		modelLabel = "deepseek/?"
 	}
 
+	// Discover user-invocable "/<name>" skills relative to the working
+	// directory (the repo root when launched via `go run ./cmd/friday`).
+	root, _ := os.Getwd()
+	skills := loadSkills(root)
+
+	transcript := []string{welcomeBanner()}
+	if len(skills) > 0 {
+		transcript = append(transcript, styleNotice.Render(
+			"tip: type / to see skills (e.g. /"+skills[0].Name+"), or just ask."))
+	}
+
 	m := Model{
 		runner:     runner,
 		cfg:        cfg,
@@ -80,7 +96,8 @@ func New(runner Runner, modelLabel string, cfg *config.Config, sink *Sink) Model
 		model:      modelLabel,
 		persona:    "analyst→risk→executor",
 		input:      ti,
-		transcript: []string{welcomeBanner()},
+		skills:     skills,
+		transcript: transcript,
 	}
 	return m
 }

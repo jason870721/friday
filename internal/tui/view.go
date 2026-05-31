@@ -24,9 +24,33 @@ func (m Model) View() string {
 		inputLine = styleNotice.Render("… working …") + "  " + inputLine
 	}
 
+	// While the user is typing a "/..." command, the footer turns into a live
+	// skill picker; otherwise it shows the usual status line. Keeping it in the
+	// single footer slot avoids disturbing the viewport height math.
 	footer := m.footer()
+	if strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/") {
+		footer = m.skillFooter()
+	}
 
 	return strings.Join([]string{transcript, inputLine, footer}, "\n")
+}
+
+// skillFooter renders the live "/" command picker: the skills whose name
+// matches what's typed so far, on the footer line.
+func (m Model) skillFooter() string {
+	typed := strings.TrimPrefix(strings.TrimSpace(m.input.Value()), "/")
+	matches := matchSkills(m.skills, typed)
+	if len(m.skills) == 0 {
+		return footerStyle.Render("no skills found under .friday/skills/")
+	}
+	if len(matches) == 0 {
+		return footerStyle.Render("no skill matches /" + typed + " — /help to list all")
+	}
+	names := make([]string, len(matches))
+	for i, s := range matches {
+		names[i] = "/" + s.Name
+	}
+	return footerStyle.Render("skills: " + strings.Join(names, "  ") + "  · ⏎ to run")
 }
 
 var (
