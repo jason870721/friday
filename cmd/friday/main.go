@@ -10,13 +10,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/johnny1110/evva/pkg/version"
 	"github.com/johnny1110/friday/internal/bootstrap"
+	"github.com/johnny1110/friday/internal/risk"
+	"github.com/johnny1110/friday/internal/tool"
 	"github.com/johnny1110/friday/internal/tui"
 )
 
@@ -41,6 +46,21 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "friday: bootstrap failed:", err)
 		os.Exit(1)
+	}
+
+	// 2b. PRD-009: start the stop-loss/TP monitor — a goroutine that polls
+	//     mark price ~every second and fires reduce-only closes the instant a
+	//     registered level is breached, independent of the agents' 15s loop.
+	//     It shares the tools' Binance client and lives for the whole session
+	//     (cancelled on exit). Skipped if Binance credentials are absent.
+	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
+	defer cancelMonitor()
+	if cli, err := tool.SharedBinanceClient(); err != nil {
+		fmt.Fprintf(os.Stderr, "friday: stop monitor disabled (%v)\n", err)
+	} else {
+		monitor := risk.NewStopMonitor(tool.NewBinanceStopBroker(cli), time.Second, slog.Default())
+		tool.SetStopMonitor(monitor)
+		go monitor.Start(monitorCtx)
 	}
 
 	// 3. Bubbletea program. Alt-screen + mouse support is plenty for v1;

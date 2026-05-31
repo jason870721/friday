@@ -1,0 +1,167 @@
+package risk
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+// PRD-009: a fast-reaction stop-loss / take-profit safety net. A goroutine
+// polls mark price ~every second and fires a reduce-only market close the
+// instant a registered level is crossed — independent of (and far faster than)
+// the agents' 15s round loop, so an open position is never left unprotected
+// between cycles.
+//
+// Limitations (documented, see PRD-009 §6): levels are in-memory only (no
+// persistence across restarts) and are enforced by friday's own polling, not
+// exchange-native STOP_MARKET orders.
+
+// DefaultStopPollInterval is how often the monitor samples price.
+const DefaultStopPollInterval = time.Second
+
+// StopLevels is the protection registered for one symbol's open position.
+type StopLevels struct {
+	StopPrice    float64 // mark price that triggers the stop-loss (0 = none)
+	TakeProfit   float64 // mark price that triggers the take-profit (0 = none)
+	PositionQty  float64 // base-asset size to close on breach
+	PositionSide string  // DirLong / DirShort
+}
+
+// active reports whether these levels are worth monitoring.
+func (l StopLevels) active() bool {
+	return l.PositionQty > 0 &&
+		(l.StopPrice > 0 || l.TakeProfit > 0) &&
+		(l.PositionSide == DirLong || l.PositionSide == DirShort)
+}
+
+// StopBroker is the minimal exchange access the monitor needs. Kept narrow and
+// primitive-typed so it mocks cleanly in tests (no binance import here).
+type StopBroker interface {
+	MarkPrice(ctx context.Context, symbol string) (float64, error)
+	CloseReduceOnly(ctx context.Context, symbol string, qty float64, positionSide string) error
+}
+
+// StopMonitor watches registered levels and flattens on breach.
+type StopMonitor struct {
+	broker   StopBroker
+	interval time.Duration
+	logger   *slog.Logger
+
+	mu     sync.Mutex
+	levels map[string]StopLevels
+}
+
+// NewStopMonitor builds a monitor. interval ≤ 0 uses DefaultStopPollInterval;
+// a nil logger falls back to slog.Default().
+func NewStopMonitor(broker StopBroker, interval time.Duration, logger *slog.Logger) *StopMonitor {
+	if interval <= 0 {
+		interval = DefaultStopPollInterval
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &StopMonitor{
+		broker:   broker,
+		interval: interval,
+		logger:   logger,
+		levels:   make(map[string]StopLevels),
+	}
+}
+
+// SetLevels registers protection for symbol. An INACTIVE level (zero quantity,
+// or neither a stop nor a TP) clears any existing entry — so the same call both
+// arms and disarms the monitor.
+func (m *StopMonitor) SetLevels(symbol string, l StopLevels) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !l.active() {
+		delete(m.levels, symbol)
+		return
+	}
+	m.levels[symbol] = l
+}
+
+// Active reports how many symbols currently have levels (diagnostics/tests).
+func (m *StopMonitor) Active() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.levels)
+}
+
+// Start polls until ctx is cancelled. Safe to run in a goroutine.
+func (m *StopMonitor) Start(ctx context.Context) {
+	t := time.NewTicker(m.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			m.check(ctx)
+		}
+	}
+}
+
+// snapshot copies the active levels so the (network) price/close calls happen
+// without holding the lock.
+func (m *StopMonitor) snapshot() map[string]StopLevels {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.levels) == 0 {
+		return nil
+	}
+	out := make(map[string]StopLevels, len(m.levels))
+	for k, v := range m.levels {
+		out[k] = v
+	}
+	return out
+}
+
+// check runs one polling pass over the registered levels.
+func (m *StopMonitor) check(ctx context.Context) {
+	for symbol, l := range m.snapshot() {
+		mark, err := m.broker.MarkPrice(ctx, symbol)
+		if err != nil {
+			m.logger.Debug("stop_monitor.price_failed", "symbol", symbol, "err", err)
+			continue
+		}
+		reason := breachReason(l, mark)
+		if reason == "" {
+			continue
+		}
+		m.logger.Info("stop_monitor.fired", "symbol", symbol, "reason", reason,
+			"mark", mark, "qty", l.PositionQty, "side", l.PositionSide)
+		if err := m.broker.CloseReduceOnly(ctx, symbol, l.PositionQty, l.PositionSide); err != nil {
+			m.logger.Error("stop_monitor.close_failed", "symbol", symbol, "err", err)
+		} else {
+			m.logger.Info("stop_monitor.closed", "symbol", symbol, "reason", reason, "mark", mark)
+		}
+		// One-shot: clear whether or not the close succeeded, so a persistent
+		// failure (e.g. position already gone) can't spin; the next round's
+		// risk checks reconcile any remainder.
+		m.SetLevels(symbol, StopLevels{})
+	}
+}
+
+// breachReason returns "" (in range), "stop-loss", or "take-profit" for a
+// position given the current mark price.
+func breachReason(l StopLevels, mark float64) string {
+	switch l.PositionSide {
+	case DirLong:
+		if l.StopPrice > 0 && mark <= l.StopPrice {
+			return "stop-loss"
+		}
+		if l.TakeProfit > 0 && mark >= l.TakeProfit {
+			return "take-profit"
+		}
+	case DirShort:
+		if l.StopPrice > 0 && mark >= l.StopPrice {
+			return "stop-loss"
+		}
+		if l.TakeProfit > 0 && mark <= l.TakeProfit {
+			return "take-profit"
+		}
+	}
+	return ""
+}

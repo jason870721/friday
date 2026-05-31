@@ -129,6 +129,7 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 		customTool(tool.BinanceLeverageToolName, func() pkgtools.Tool { return tool.NewBinanceLeverage() }),
 		customTool(tool.BinanceOrderToolName, func() pkgtools.Tool { return tool.NewBinanceOrder() }),
 		customTool(tool.BinanceCloseAllToolName, func() pkgtools.Tool { return tool.NewBinanceCloseAll() }),
+		customTool(tool.BinanceStopMonitorToolName, func() pkgtools.Tool { return tool.NewBinanceStopMonitor() }),
 		customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
 		// PRD-004: log every closed trade to memory for future recall.
 		customTool(tool.LogTradeToolName, func() pkgtools.Tool { return tool.NewLogTrade() }),

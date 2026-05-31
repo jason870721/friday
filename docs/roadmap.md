@@ -2,11 +2,11 @@
 
 Three tranches of work. The **4-phase upgrade** (PRD-001..004) from
 [`plan.md`](./plan.md) and the **P0 safety/strategy** tranche (PRD-005..006)
-from the P0/P1 plans in [`.evva/plans/`](../.evva/plans/) are complete; the
-**P1** tranche (PRD-007..009) is still planned. Together they push Friday from
-"LLM as trader" toward "LLM as supervisor over deterministic Go strategy + hard
-safety rails". A separate **operational-hardening** tranche (PRD-010..011)
-captures fixes that came out of running real testnet sessions.
+from the P0/P1 plans in [`.evva/plans/`](../.evva/plans/), and the **P1**
+tranche (PRD-007..009) are all complete. Together they push Friday from "LLM as
+trader" toward "LLM as supervisor over deterministic Go strategy + hard safety
+rails". A separate **operational-hardening** tranche (PRD-010..011) captures
+fixes that came out of running real testnet sessions.
 
 ---
 
@@ -50,8 +50,8 @@ Source: [`.evva/plans/p0-strategy-and-circuit-breaker.md`](../.evva/plans/p0-str
 Source: [`.evva/plans/p1-volatility-stop-mtf.md`](../.evva/plans/p1-volatility-stop-mtf.md)
 
 - ✅ **[PRD-007](./PRD/PRD-007.md)** — ATR Position Sizing. `binance.ATR(14)` + `risk.SuggestedSize` (risk-per-trade ÷ 2×ATR stop); ATR + a sizing hint surface in the `binance_klines` Summary and the Risk Manager sizes from the volatility target within the 14%/15% caps. Foundation for PRD-009. Depends on PRD-002/003.
-- ⬜ **[PRD-008](./PRD/PRD-008.md)** — Multi-Timeframe Analysis. `binance_mtf_klines` tool (5m / 1h / 4h fetched concurrently) + cross-TF alignment; the Analyst reads macro context, not just 5m. Depends on PRD-003.
-- ⬜ **[PRD-009](./PRD/PRD-009.md)** — Stop-Loss/TP Execution Monitor. A goroutine polling price every ~1s that fires reduce-only market closes on SL/TP breach — a fast safety net independent of the 15s LLM loop. Depends on PRD-007 (ATR stop distance).
+- ✅ **[PRD-008](./PRD/PRD-008.md)** — Multi-Timeframe Analysis. `binance_mtf_klines` tool (5m / 1h / 4h fetched concurrently) + `ClassifyDirection` and a cross-TF ALIGNED/CONFLICT/NO-EDGE verdict (higher TF dominates); the Analyst's primary read. Depends on PRD-003.
+- ✅ **[PRD-009](./PRD/PRD-009.md)** — Stop-Loss/TP Execution Monitor. `risk.StopMonitor` goroutine polling price ~every 1s that fires reduce-only closes on SL/TP breach; `binance_stop_monitor` lets the Executor register PRD-007's stop level after each OPEN — a fast safety net independent of the 15s LLM loop. Depends on PRD-007.
 
 ---
 
@@ -66,6 +66,9 @@ Fixes surfaced by running real testnet sessions (not from the original plans).
 
 ## Suggested implementation order
 
-Done: `PRD-005` (circuit breakers) → `PRD-006` (strategy layer) → `PRD-007`
-(ATR sizing). Remaining: `PRD-009` (stop monitor, builds on PRD-007's stop
-level) → `PRD-008` (MTF, standalone) — both additive.
+All planned PRDs (005–009) plus operational hardening (010–011) are
+implemented. Build order followed: `PRD-005` (circuit breakers) → `PRD-006`
+(strategy layer) → `PRD-007` (ATR sizing) → `PRD-008` (multi-timeframe) →
+`PRD-009` (stop monitor). Future work lives in the Out-of-Scope sections of the
+individual PRDs (e.g. exchange-native STOP_MARKET orders, fee/churn budgeting,
+divergence live-wiring).
