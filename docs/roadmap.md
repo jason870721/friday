@@ -134,6 +134,41 @@ The P2 tranche (PRD-013..018) is now **complete**, built in dependency order:
 014's strategy attribution) → `PRD-016` (regime, needs 015's calibrated weights)
 → `PRD-017` (MTF voting) + `PRD-018` (strategy-aware exits).
 
-All PRDs (001–019) are now implemented. Future work lives in the Out-of-Scope
-sections of the individual PRDs (per-TF calibration, strategy-specific
-take-profits, exchange-native STOP_MARKET orders, fee/churn budgeting).
+All PRDs (001–019) are now implemented.
+
+---
+
+## Planned — P3: production hardening + operations & observability
+
+Source: [`.evva/plans/current.md`](../.evva/plans/current.md) — post-P2 review
+
+The P2 tranche hardened the strategy engine. The remaining gaps fall into two
+categories: production hardening (safety gaps only code can close, signal
+improvements the backtest infrastructure enables) and operations (tooling to
+make the system observable and testable without real money).
+
+- [ ] **[PRD-020](./PRD/PRD-020.md)** — Production Hardening (Safety + Signal).
+  Six changes within the trading loop: native STOP_MARKET orders for
+  crash-survivable stop-loss, a fee-budget guardrail against overtrading,
+  portfolio-level correlation-aware position sizing, online strategy
+  re-calibration, strategy-specific take-profit levels, and a Bollinger Band
+  strategy. Depends on PRD-005/006/007/009/010/011/015.
+- [ ] **[PRD-021](./PRD/PRD-021.md)** — Operations & Observability. Three
+  operator-facing tools: `cmd/analyze` for session post-mortem analysis
+  (per-strategy win rate, per-symbol PnL, Analyst accuracy, breaker timeline),
+  Discord/Telegram webhook notifications for critical events (breaker trips,
+  large PnL), and `FRIDAY_PAPER=true` paper trading mode with a virtual
+  portfolio for safe strategy validation. Depends on PRD-003/004/005 +
+  roundlog.go.
+
+---
+
+## Suggested implementation order (P3)
+
+**PRD-020** — implement in dependency order within the PRD:
+native stops → fee budget → portfolio groups (safety, parallelizable) →
+Bollinger (cheapest signal) → strategy TP → online calibration (needs TP infra).
+
+**PRD-021** — independently parallelizable with PRD-020:
+post-mortem tool (data already exists) + paper trading → notifications
+(benefits from paper mode for safe event testing).
