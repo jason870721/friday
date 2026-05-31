@@ -10,11 +10,11 @@ import (
 func TestExchangeInfo_ParsesStatusAndStepSize(t *testing.T) {
 	const body = `{
 		"symbols": [
-			{"symbol":"BTCUSDT","status":"TRADING","filters":[
+			{"symbol":"BTCUSDT","status":"TRADING","contractType":"PERPETUAL","filters":[
 				{"filterType":"PRICE_FILTER","tickSize":"0.10"},
 				{"filterType":"LOT_SIZE","stepSize":"0.001"}
 			]},
-			{"symbol":"GOOGLUSDT","status":"PENDING_TRADING","filters":[
+			{"symbol":"GOOGLUSDT","status":"PENDING_TRADING","contractType":"TRADIFI_PERPETUAL","filters":[
 				{"filterType":"LOT_SIZE","stepSize":"1"}
 			]},
 			{"symbol":"NOLOT","status":"TRADING","filters":[
@@ -43,11 +43,11 @@ func TestExchangeInfo_ParsesStatusAndStepSize(t *testing.T) {
 	for _, s := range got {
 		byName[s.Symbol] = s
 	}
-	if s := byName["BTCUSDT"]; s.Status != "TRADING" || s.StepSize != "0.001" {
-		t.Errorf("BTCUSDT = %+v; want TRADING / 0.001", s)
+	if s := byName["BTCUSDT"]; s.Status != "TRADING" || s.StepSize != "0.001" || s.IsTradFiPerp() {
+		t.Errorf("BTCUSDT = %+v; want TRADING / 0.001 / not TradFi", s)
 	}
-	if s := byName["GOOGLUSDT"]; s.Status != "PENDING_TRADING" || s.StepSize != "1" {
-		t.Errorf("GOOGLUSDT = %+v; want PENDING_TRADING / 1", s)
+	if s := byName["GOOGLUSDT"]; s.Status != "PENDING_TRADING" || s.StepSize != "1" || !s.IsTradFiPerp() {
+		t.Errorf("GOOGLUSDT = %+v; want PENDING_TRADING / 1 / TradFi perp", s)
 	}
 	// A symbol without a LOT_SIZE filter parses with an empty StepSize rather
 	// than failing the whole call.

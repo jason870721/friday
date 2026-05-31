@@ -61,6 +61,7 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 	}
 
 	out := make([]orchestrator.MarketSymbol, 0, len(want))
+	hasTradFi := false
 	for _, sym := range want {
 		s, ok := listed[sym]
 		if !ok {
@@ -75,7 +76,20 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 		if step == "" {
 			step = fallbackStepSizes[sym]
 		}
+		if s.IsTradFiPerp() {
+			hasTradFi = true
+		}
 		out = append(out, orchestrator.MarketSymbol{Name: sym, StepSize: step})
+	}
+
+	// Stock-linked (TradFi) perps need a one-time, account-level agreement
+	// before Binance accepts orders on them (otherwise binance_order fails with
+	// code -4411). Sign it once at startup — idempotent — when any resolved
+	// symbol is a TradFi perp and credentials are present. Market data reads
+	// fine without it, so a sign failure is a loud warning, not a reason to
+	// drop the symbols.
+	if hasTradFi {
+		signTradFiAgreement(ctx, cli)
 	}
 
 	names := make([]string, len(out))
@@ -84,6 +98,23 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 	}
 	fmt.Fprintf(os.Stderr, "friday: trading %d symbol(s): %s\n", len(out), strings.Join(names, ", "))
 	return out
+}
+
+// signTradFiAgreement signs the TradFi-Perps agreement so stock-perp orders are
+// accepted this session. Requires signed-endpoint credentials; skipped (with a
+// note) when they are absent.
+func signTradFiAgreement(ctx context.Context, cli *binance.Client) {
+	if os.Getenv("BINANCE_API_KEY") == "" || os.Getenv("BINANCE_SECRET_KEY") == "" {
+		fmt.Fprintln(os.Stderr,
+			"friday: TradFi perps configured but BINANCE_API_KEY/SECRET unset — cannot sign agreement; stock-perp orders will be rejected")
+		return
+	}
+	if err := cli.SignTradFiPerpsAgreement(ctx); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"friday: TradFi-Perps agreement sign failed (%v) — stock-perp orders may be rejected with code -4411 until signed\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "friday: TradFi-Perps agreement signed — stock perps tradable")
 }
 
 // fallbackSymbols is the degraded path when the preflight can't reach the
