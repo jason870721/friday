@@ -14,6 +14,16 @@
 // themselves, so "never stop the loop" is enforced in Go, not by prompt.
 package orchestrator
 
+// MarketSymbol is one validated trading pair the pipeline covers this
+// session, with the quantity step the Risk Manager must round orders to. The
+// set is resolved and venue-validated at bootstrap (see bootstrap.resolveSymbols)
+// then injected into every role prompt and submit schema, so adding or
+// removing a market is a config change (FRIDAY_SYMBOLS), not a code change.
+type MarketSymbol struct {
+	Name     string // e.g. "BTCUSDT"
+	StepSize string // LOT_SIZE step from exchangeInfo, e.g. "0.001"; may be "" if unknown
+}
+
 // Bias / conviction enums are kept as plain strings (validated by the
 // submit-tool JSON schema) so the structs marshal cleanly to and from the
 // LLM without custom (un)marshalers.
