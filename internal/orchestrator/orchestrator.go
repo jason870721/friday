@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/johnny1110/evva/pkg/agent"
 	"github.com/johnny1110/evva/pkg/config"
 	"github.com/johnny1110/evva/pkg/event"
 	pkgtools "github.com/johnny1110/evva/pkg/tools"
@@ -25,6 +26,12 @@ const (
 )
 
 const defaultInterval = 15 * time.Second
+
+// compactEvery is the number of rounds between full session compactions.
+// At 15 s/round and ~7.5K tokens/round, 50 rounds (~12.5 min, ~375K tokens)
+// compacts well before the 1M context window fills, keeping the model crisp
+// without burning a summarization LLM call every few minutes.
+const compactEvery = 50
 
 // RoleEmitter receives role-tagged events from the orchestrator. The TUI
 // sink implements it (stamping each event with its source role so the
@@ -48,6 +55,13 @@ type Orchestrator struct {
 	analyst  agentRunner
 	risk     agentRunner
 	executor agentRunner
+
+	// Full agent references for lifecycle operations (compact, etc.).
+	// agentRunner is the narrow interface for Run() so tests can inject
+	// fakes; these hold the real agent.Agent handles.
+	analystAg  agent.Agent
+	riskAg     agent.Agent
+	executorAg agent.Agent
 
 	capAnalysis *capture
 	capRisk     *capture
@@ -124,6 +138,7 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 	}
 
 	o.analyst, o.risk, o.executor = analyst, risk, executor
+	o.analystAg, o.riskAg, o.executorAg = analyst, risk, executor
 	return o, nil
 }
 
@@ -150,6 +165,12 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 			if c := strings.TrimSpace(res.Carry); c != "" {
 				carry = c
 			}
+		}
+
+		// Periodic full compaction: prevent session bloat across
+		// hundreds of rounds (see compactEvery).
+		if round%compactEvery == 0 {
+			o.compactAll(ctx)
 		}
 
 		// Advance the circuit-breaker cooldown once per round (PRD-005).
@@ -264,6 +285,25 @@ func (o *Orchestrator) narrate(role, msg string) {
 		Kind: event.KindText,
 		Text: &event.TextPayload{Text: msg},
 	})
+}
+
+// compactAll triggers a full compaction on each role agent, summarising
+// the accumulated session history into a context brief. This keeps the
+// model sharp across hundreds of rounds by preventing the system prompt
+// from being diluted by stale klines / old biases still in the transcript.
+//
+// Failures are logged but non-fatal — the next round will retry.
+func (o *Orchestrator) compactAll(ctx context.Context) {
+	o.narrate(roleOrch, "Compacting agent sessions (full) …")
+	for _, ag := range []agent.Agent{o.analystAg, o.riskAg, o.executorAg} {
+		if ag == nil {
+			continue
+		}
+		if err := ag.Compact(ctx, "full"); err != nil {
+			o.narrate(roleOrch, fmt.Sprintf("Compact failed: %v — will retry next cycle", err))
+		}
+	}
+	o.narrate(roleOrch, "Compaction complete.")
 }
 
 // --- small helpers ---
