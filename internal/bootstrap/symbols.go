@@ -9,6 +9,7 @@ import (
 
 	"github.com/johnny1110/friday/internal/binance"
 	"github.com/johnny1110/friday/internal/orchestrator"
+	fridaytool "github.com/johnny1110/friday/internal/tool"
 )
 
 // defaultSymbols is friday's out-of-the-box market list when FRIDAY_SYMBOLS is
@@ -80,6 +81,22 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 			hasTradFi = true
 		}
 		out = append(out, orchestrator.MarketSymbol{Name: sym, StepSize: step})
+	}
+
+	// PRD-012: per-symbol max leverage (signed leverageBracket). Attach it to
+	// the symbols (so the Risk Manager prompt shows each "≤Nx") and feed the
+	// binance_leverage clamp, so an over-cap request can't fail with -4028.
+	if os.Getenv("BINANCE_API_KEY") != "" && os.Getenv("BINANCE_SECRET_KEY") != "" {
+		if lev, lerr := cli.MaxLeverages(ctx); lerr != nil {
+			fmt.Fprintf(os.Stderr, "friday: leverage preflight failed (%v) — per-symbol caps unknown this session\n", lerr)
+		} else {
+			for i := range out {
+				if mx, ok := lev[out[i].Name]; ok {
+					out[i].MaxLeverage = mx
+				}
+			}
+			fridaytool.SetMaxLeverages(lev)
+		}
 	}
 
 	// Stock-linked (TradFi) perps need a one-time, account-level agreement

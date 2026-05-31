@@ -61,6 +61,10 @@
 - **停損/停利即時監控**（PRD-009，`risk.StopMonitor`）—— 背景 goroutine 每秒輪詢標記價，
   觸及停損/停利立即以 reduce-only 市價平倉，是獨立於 15 秒迴圈的快速保護網；Executor 開倉後
   以 `binance_stop_monitor` 註冊風控算出的 2×ATR 停損。僅存記憶體（重啟不保留）。
+- **逐標的槓桿上限**（PRD-012，`binance.MaxLeverages`）—— 各標的最大槓桿不同
+  （BTC 125x、ETH 100x、SOL 50x、美股永續僅 10x）。啟動時抓 leverageBracket，
+  注入風控提示（每個標的顯示「≤Nx」），並在 `binance_leverage` 內把超過上限的請求自動夾到上限，
+  避免 `-4028` 失敗。15% 保證金硬上限維持「擋下並回報、不自動縮量」。
 - **交易記憶 + 沙盒回測**（`internal/memory`、`internal/backtest`）——
   `recall_trades` 取出相似的歷史交易結果;`run_backtest` 可在實戰前先驗證策略勝率。
 - **損益以交易所為準（不信任 LLM 自報）**—— `log_trade` 平倉後會比對

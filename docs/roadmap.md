@@ -61,6 +61,7 @@ Fixes surfaced by running real testnet sessions (not from the original plans).
 
 - ✅ **[PRD-010](./PRD/PRD-010.md)** — Configurable, Venue-Validated Symbol Universe. `FRIDAY_SYMBOLS` + startup `exchangeInfo` preflight (drop non-`TRADING`, real `LOT_SIZE` steps); symbol set threaded into prompts/schemas; TradFi-Perps agreement auto-signed so US-stock perps (NVDA/GOOGL/AMZN/META) trade. Depends on PRD-003.
 - ✅ **[PRD-011](./PRD/PRD-011.md)** — Exchange-Truth PnL Reconciliation. `log_trade` records the `/fapi/v1/income` net (realised − fees − funding) instead of the LLM's estimate; WIN/LOSS + circuit breaker key off the true net; `cmd/reconcile-memory` backfills corrupted history. Depends on PRD-004/005.
+- ✅ **[PRD-012](./PRD/PRD-012.md)** — Per-Symbol Leverage Caps. `binance.MaxLeverages` (leverageBracket) captured at startup, injected into the Risk Manager prompt as each symbol's `≤Nx`, and clamped in `binance_leverage` so an over-cap request (e.g. 100x on a 10x stock perp) is corrected instead of failing -4028. Depends on PRD-007/010.
 
 ---
 

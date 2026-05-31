@@ -41,16 +41,21 @@ func symbolNames(syms []MarketSymbol) string {
 	return strings.Join(names, ", ")
 }
 
-// stepSizeHint renders the per-symbol quantity step the Risk Manager rounds
-// to, e.g. "BTCUSDT 0.001, ETHUSDT 0.01, SOLUSDT 0.1". Symbols whose step is
-// unknown (preflight skipped) fall back to a generic instruction.
+// stepSizeHint renders the per-symbol quantity step the Risk Manager rounds to
+// AND its max leverage (PRD-012), e.g.
+// "BTCUSDT 0.001 (≤125x), SOLUSDT 0.01 (≤50x), NVDAUSDT 0.01 (≤10x)". A symbol
+// with no known step is skipped; an unknown max leverage omits the "(≤Nx)".
 func stepSizeHint(syms []MarketSymbol) string {
 	parts := make([]string, 0, len(syms))
 	for _, s := range syms {
 		if s.StepSize == "" {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s %s", s.Name, s.StepSize))
+		p := fmt.Sprintf("%s %s", s.Name, s.StepSize)
+		if s.MaxLeverage > 0 {
+			p += fmt.Sprintf(" (≤%dx)", s.MaxLeverage)
+		}
+		parts = append(parts, p)
 	}
 	if len(parts) == 0 {
 		return "each symbol's exchangeInfo LOT_SIZE step"
@@ -117,7 +122,7 @@ You receive the Analyst's report (in the user message). Your job: compute dynami
     max_total_mgn  = balance × 60%
     hard_stop      = balance × -10%   (total uPnL → CLOSE everything)
     profit_guard   = balance × +20%   (→ halve new sizes)
-    max_positions  = {{COUNT}} (one per symbol);  leverage 1x–100x
+    max_positions  = {{COUNT}} (one per symbol);  leverage 1x up to EACH SYMBOL'S MAX (shown as "≤Nx" in the steps list below — e.g. BTC/ETH allow 100x+, but TradFi stock perps cap at ~10x). Requesting above a symbol's max is rejected (-4028) and the code clamps it down anyway.
 
 # Mandatory risk checks (run on every open position, state results in risk_notes)
 1. Stop-loss: position uPnL ≤ -15% of its margin → CLOSE (reduce_only).
@@ -130,7 +135,7 @@ You receive the Analyst's report (in the user message). Your job: compute dynami
 
 # Sizing (for OPEN_LONG / OPEN_SHORT / ADD)
 - **Volatility-based target (size by RISK, not a flat percent).** Risk ~1% of balance per trade with a 2×ATR stop: quantity ≈ (0.01 × balance) / (2 × ATR), using the ATR(14) the Analyst reported for the symbol (it is in each symbol's klines Summary). This makes a low-vol market (BTC) and a high-vol one (SOL) carry comparable risk. Round DOWN to the symbol's step size (steps: {{STEPS}}). Set stop_loss to entry − 2×ATR for longs / entry + 2×ATR for shorts (this is the level a future stop monitor will enforce).
-- **Cap clamp.** The resulting margin (notional ÷ leverage) must still sit at or under target_per_pos (14% of balance). If the risk-based size implies more margin than that, CLAMP it down to 14%; never exceed the 15% hard cap (the code guardrail rejects it). If ATR is missing for a symbol, fall back to the 14% target.
+- **Cap clamp.** The resulting margin (notional ÷ leverage) must still sit at or under target_per_pos (14% of balance). If the risk-based size implies more margin than that, CLAMP it down to 14%; never exceed the 15% hard cap (the code guardrail rejects it). If ATR is missing for a symbol, fall back to the 14% target. NOTE: a low max leverage (e.g. 10x on stock perps) means the SAME notional costs proportionally MORE margin — so on those symbols the notional you can afford within 14% is much smaller. Always sanity-check: notional ÷ leverage ≤ 0.14 × balance.
 - **Safety buffer (important).** The code guardrail REJECTS any opening order whose margin exceeds 15% of balance. Two things erode that margin between your decision and the fill: (a) rounding quantity UP toward the cap, and (b) the balance can DROP within the round — e.g. a CLOSE you ordered on another symbol realises PnL and changes the wallet before this OPEN executes. Sizing to 14% leaves ~1% of headroom so a correctly-reasoned order is not blocked on the boundary. Never size an OPEN/ADD above 14.5% of balance.
 - Notional = quantity × mark_price must be ≥ $5.
 - Fee awareness: round-trip ≈ 2 × taker × notional; only open when the expected move clears ≥ 3× the round-trip fee. Otherwise WAIT.

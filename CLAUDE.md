@@ -55,7 +55,7 @@ cmd/reconcile-memory/         one-off tool: rewrite trades.jsonl PnL/outcome fro
 internal/bootstrap/           config load, env, symbol resolution + exchangeInfo preflight, builds the orchestrator + circuit breaker
 internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop
 internal/tui/                 bubbletea Model + role-tagged event rendering
-internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, TradFi-Perps sign) + indicators (SMA, RSI, ADX, ATR, ClassifyDirection, SemanticSummary)
+internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, leverage brackets, TradFi-Perps sign) + indicators (SMA, RSI, ADX, ATR, ClassifyDirection, SemanticSummary)
 internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, divergence) + aggregator
 internal/risk/                MarginCapValidator (15% guardrail), CircuitBreaker (session safety), SuggestedSize (ATR sizing), StopMonitor (SL/TP poller)
 internal/memory/              embedded vector trade-memory (file-backed, cosine similarity); PnL reconciled against the exchange ledger
@@ -84,6 +84,11 @@ docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the in
   loop. The Executor registers levels via `binance_stop_monitor` after each
   OPEN (using PRD-007's 2×ATR stop). In-memory only (no persistence across
   restarts); bypasses the gates so flattening always succeeds.
+- **Per-symbol leverage caps** — `binance.MaxLeverages` (leverageBracket) is
+  resolved at startup, shown to the Risk Manager in-prompt as each symbol's
+  `≤Nx`, and `binance_leverage` clamps an over-cap request down to the symbol's
+  max (PRD-012) — so a 100× ask on a 10× stock perp is corrected, not rejected
+  with `-4028`. The 15% margin guardrail stays reject-and-report (no auto-resize).
 - **PnL is exchange-truth, not agent-reported** — `log_trade` reconciles a
   closed trade against the `/fapi/v1/income` ledger (realised PnL − commission
   − funding) and stores the true net (`pnl_source:"exchange"`); WIN/LOSS and
@@ -99,7 +104,8 @@ refactor), **PRD-004** (vector memory + backtest), **PRD-005** (circuit
 breakers), **PRD-006** (strategy layer), **PRD-007** (ATR position sizing),
 **PRD-008** (multi-timeframe analysis), **PRD-009** (stop-loss/TP execution
 monitor), plus operational hardening **PRD-010** (configurable venue-validated
-symbols) and **PRD-011** (exchange-truth PnL reconciliation).
+symbols), **PRD-011** (exchange-truth PnL reconciliation), and **PRD-012**
+(per-symbol leverage caps).
 
 All planned PRDs are implemented. Future work lives in the Out-of-Scope
 sections of the individual PRDs (e.g. exchange-native STOP_MARKET orders,
