@@ -65,11 +65,57 @@ Fixes surfaced by running real testnet sessions (not from the original plans).
 
 ---
 
+## Planned — P2: strategy-engine hardening
+
+Source: [`.evva/plans/current.md`](../.evva/plans/current.md)
+
+The strategy engine is the least empirically validated part of Friday —
+confidences are magic numbers (0.6/0.65), there are only 3 single-symbol
+strategies, and no feedback loop exists from trade outcomes back to signal
+quality. This tranche makes the strategy layer self-calibrating, expands the
+signal portfolio from 3 to 5+ votes, and wires strategy awareness into every
+layer from memory through exit logic.
+
+- [ ] **[PRD-013](./PRD/PRD-013.md)** — Strategy Portfolio Expansion. Wire the
+  already-implemented divergence strategy into the live klines flow; add an EMA
+  crossover strategy as a fourth single-symbol vote so the aggregator can form
+  consensus on strong trends. Depends on PRD-006.
+- [ ] **[PRD-014](./PRD/PRD-014.md)** — Strategy Performance Tracking. Add a
+  `strategy` field to `TradeRecord` so every closed trade is attributed to its
+  triggering strategy; add outcome-filtered similarity queries so `recall_trades`
+  returns win/loss breakdowns instead of bare similar trades. Depends on
+  PRD-004/006.
+- [ ] **[PRD-015](./PRD/PRD-015.md)** — Confidence Calibration. Replace hardcoded
+  strategy confidences with backtest-derived win rates, recomputed per-symbol at
+  startup (or periodically). `backtest.RunStrategy` replays a strategy over
+  historical candles; `strategy.Calibrate` maps win rate → confidence. Depends on
+  PRD-004/006/014.
+- [ ] **[PRD-016](./PRD/PRD-016.md)** — Market Regime Detection. Classify the
+  current market as trending/ranging/transitional from ADX(14), then
+  dynamically up-weight strategies suited to the regime and down-weight (or
+  disable) those that underperform in it. Depends on PRD-006.
+- [ ] **[PRD-017](./PRD/PRD-017.md)** — MTF Strategy Consensus. Run the strategy
+  engine on all three timeframes already fetched by `binance_mtf_klines`
+  (5m/1h/4h), then aggregate into a weighted cross-timeframe vote where higher
+  timeframes dominate on conflict. Depends on PRD-006/008.
+- [ ] **[PRD-018](./PRD/PRD-018.md)** — Strategy-Aware Exits. Surface each
+  strategy's `Invalidation` level (already computed — MA20 for momentum, range
+  boundary for breakout, entry×0.99 for mean-reversion) in the klines Summary and
+  instruct the Risk Manager to prefer it over the generic 2×ATR stop when it
+  offers tighter protection. Depends on PRD-006/007.
+
+---
+
 ## Suggested implementation order
 
-All planned PRDs (005–009) plus operational hardening (010–011) are
+All planned PRDs (005–009) plus operational hardening (010–012) are
 implemented. Build order followed: `PRD-005` (circuit breakers) → `PRD-006`
 (strategy layer) → `PRD-007` (ATR sizing) → `PRD-008` (multi-timeframe) →
-`PRD-009` (stop monitor). Future work lives in the Out-of-Scope sections of the
-individual PRDs (e.g. exchange-native STOP_MARKET orders, fee/churn budgeting,
-divergence live-wiring).
+`PRD-009` (stop monitor). Operational hardening (PRD-010/011/012) was driven by
+testnet sessions.
+
+The P2 tranche (PRD-013..018) is ordered by dependency chain:
+`PRD-013` (expansion, no deps beyond 006) + `PRD-014` (tracking, no hard deps) →
+`PRD-015` (calibration, needs 014's strategy attribution) → `PRD-016` (regime,
+needs 015's calibrated weights) → `PRD-017` (MTF voting) + `PRD-018` (exits) in
+parallel.
