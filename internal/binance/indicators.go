@@ -175,6 +175,48 @@ func ATR(ks []Kline, period int) (atr float64, ok bool) {
 	return atr, true
 }
 
+// Direction labels for ClassifyDirection (PRD-008), matching the Analyst's
+// bias vocabulary.
+const (
+	DirectionBullish = "BULLISH"
+	DirectionBearish = "BEARISH"
+	DirectionNeutral = "NEUTRAL"
+)
+
+// ClassifyDirection reduces a candle series to a single coarse direction for
+// cross-timeframe alignment (PRD-008):
+//
+//	BULLISH  price > MA20, RSI(14) in [50,70], last 3 closes rising
+//	BEARISH  price < MA20, RSI(14) in [30,50], last 3 closes falling
+//	NEUTRAL  otherwise (incl. too few candles for MA20/RSI)
+//
+// The RSI bands deliberately exclude the extremes (>70 / <30) so an
+// overbought/oversold exhaustion move is not read as trend confirmation.
+func ClassifyDirection(ks []Kline) string {
+	cs := closesOf(ks)
+	if len(cs) < 3 {
+		return DirectionNeutral
+	}
+	ma, okMA := SMA(cs, 20)
+	rsi, okRSI := RSI(cs, 14)
+	if !okMA || !okRSI {
+		return DirectionNeutral
+	}
+	last := cs[len(cs)-1]
+	a, b, c := cs[len(cs)-3], cs[len(cs)-2], cs[len(cs)-1]
+	rising := c > b && b > a
+	falling := c < b && b < a
+
+	switch {
+	case last > ma && rsi >= 50 && rsi <= 70 && rising:
+		return DirectionBullish
+	case last < ma && rsi >= 30 && rsi <= 50 && falling:
+		return DirectionBearish
+	default:
+		return DirectionNeutral
+	}
+}
+
 // SemanticSummary renders a candle series into a single natural-language
 // line the LLM can read at a glance: current price, position relative to
 // MA20, RSI(14) with its zone, and short-term momentum from the last three
