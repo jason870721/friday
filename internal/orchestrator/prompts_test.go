@@ -51,6 +51,22 @@ func TestStepSizeHint_FallsBackWhenUnknown(t *testing.T) {
 	}
 }
 
+func TestStepSizeHint_IncludesMaxLeverage(t *testing.T) {
+	// PRD-012: the steps hint carries each symbol's max leverage as "(≤Nx)";
+	// a zero MaxLeverage omits it.
+	hint := stepSizeHint([]MarketSymbol{
+		{Name: "BTCUSDT", StepSize: "0.001", MaxLeverage: 125},
+		{Name: "NVDAUSDT", StepSize: "0.01", MaxLeverage: 10},
+		{Name: "FOOUSDT", StepSize: "0.1"}, // unknown leverage
+	})
+	if !strings.Contains(hint, "BTCUSDT 0.001 (≤125x)") || !strings.Contains(hint, "NVDAUSDT 0.01 (≤10x)") {
+		t.Errorf("missing per-symbol leverage caps in %q", hint)
+	}
+	if strings.Contains(hint, "FOOUSDT 0.1 (≤") {
+		t.Errorf("unknown leverage should omit the (≤Nx) suffix: %q", hint)
+	}
+}
+
 func TestSubmitSchemas_PinMinItemsToSymbolCount(t *testing.T) {
 	for _, n := range []int{1, 3, 7} {
 		for _, schema := range []string{submitAnalysisSchema(n), submitRiskSchema(n)} {

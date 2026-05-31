@@ -47,14 +47,40 @@ func (f Features) vec() []float64 {
 }
 
 // TradeRecord is one logged closed trade.
+//
+// PnL is the realised price-difference P&L. When the trade was reconciled
+// against the exchange ledger (PnLSource == "exchange"), Commission, Funding
+// and NetPnL are also populated and Outcome reflects the true wallet impact
+// (NetPnL); otherwise the figures are the agent's best-effort report.
 type TradeRecord struct {
 	Symbol      string   `json:"symbol"`
 	Time        int64    `json:"time"` // unix seconds
 	Features    Features `json:"features"`
 	EntryReason string   `json:"entry_reason"`
-	Bias        string   `json:"bias"`    // LONG / SHORT
-	PnL         float64  `json:"pnl"`     // realised PnL in USDT
-	Outcome     string   `json:"outcome"` // WIN / LOSS / FLAT (derived if empty)
+	Bias        string   `json:"bias"`                  // LONG / SHORT
+	PnL         float64  `json:"pnl"`                   // realised price PnL in USDT
+	Commission  float64  `json:"commission,omitempty"`  // trading fees for the trade (negative)
+	Funding     float64  `json:"funding_fee,omitempty"` // funding paid (−) / received (+)
+	NetPnL      float64  `json:"net_pnl,omitempty"`     // PnL + Commission + Funding (true wallet impact)
+	PnLSource   string   `json:"pnl_source,omitempty"`  // "exchange" (reconciled) or "reported" (agent)
+	Outcome     string   `json:"outcome"`               // WIN / LOSS / FLAT (derived if empty)
+}
+
+// DeriveOutcome sets Outcome from the most authoritative figure available: the
+// net wallet impact when reconciled against the exchange, else the raw PnL.
+func (r *TradeRecord) DeriveOutcome() {
+	basis := r.PnL
+	if r.PnLSource == "exchange" {
+		basis = r.NetPnL
+	}
+	switch {
+	case basis > 0:
+		r.Outcome = "WIN"
+	case basis < 0:
+		r.Outcome = "LOSS"
+	default:
+		r.Outcome = "FLAT"
+	}
 }
 
 // Scored pairs a record with its similarity to a query (1 = identical
@@ -112,18 +138,11 @@ func (s *Store) Len() int {
 	return len(s.records)
 }
 
-// Log appends a record and persists it. Outcome is derived from PnL when
-// not set.
+// Log appends a record and persists it. Outcome is derived (from the net
+// wallet impact, or raw PnL) when not already set.
 func (s *Store) Log(rec TradeRecord) error {
 	if rec.Outcome == "" {
-		switch {
-		case rec.PnL > 0:
-			rec.Outcome = "WIN"
-		case rec.PnL < 0:
-			rec.Outcome = "LOSS"
-		default:
-			rec.Outcome = "FLAT"
-		}
+		rec.DeriveOutcome()
 	}
 
 	s.mu.Lock()
