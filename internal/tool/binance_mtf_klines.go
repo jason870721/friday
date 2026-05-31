@@ -10,6 +10,7 @@ import (
 
 	"github.com/johnny1110/evva/pkg/tools"
 	"github.com/johnny1110/friday/internal/binance"
+	"github.com/johnny1110/friday/internal/strategy"
 )
 
 const BinanceMTFKlinesToolName tools.ToolName = "binance_mtf_klines"
@@ -58,13 +59,14 @@ var mtfFrames = []struct {
 }{
 	{"5m", 20},
 	{"1h", 24},
-	{"4h", 24},
+	{"4h", 48}, // PRD-016: ≥29 candles so ADX(14) → regime detection is computable
 }
 
 type tfRead struct {
 	interval string
 	summary  string
 	dir      string
+	ks       []binance.Kline // raw candles (kept for the 5m frame's divergence hint, PRD-013)
 	err      error
 }
 
@@ -99,6 +101,7 @@ func (BinanceMTFKlinesTool) Execute(ctx context.Context, logger *slog.Logger, ra
 				interval: interval,
 				summary:  binance.SemanticSummary(ks),
 				dir:      binance.ClassifyDirection(ks),
+				ks:       ks,
 			}
 		}(i, f.Interval, f.Limit)
 	}
@@ -129,7 +132,54 @@ func (BinanceMTFKlinesTool) Execute(ctx context.Context, logger *slog.Logger, ra
 		fmt.Fprintf(&b, "[%s] %s → %s\n", r.interval, r.summary, r.dir)
 	}
 	fmt.Fprintf(&b, "Cross-TF: %s\n", crossTimeframeVerdict(reads))
+
+	// PRD-016: classify the market regime from the 4h candles (slow-moving,
+	// structural) so the Analyst knows which strategy type the regime favours.
+	if fourH := reads[2]; fourH.err == nil && fourH.interval == "4h" && len(fourH.ks) > 0 {
+		if line := regimeLine(fourH.ks); line != "" {
+			fmt.Fprintf(&b, "%s\n", line)
+		}
+	}
+
+	// PRD-017: run the full (calibrated + regime-weighted) strategy engine on
+	// EVERY timeframe's candles, then combine into one cross-timeframe vote where
+	// higher timeframes dominate (5m×1.0, 1h×1.5, 4h×2.0). This replaces the old
+	// 5m-only consensus with a quantitative MTF signal the Analyst treats as
+	// primary. (Only 4h has enough candles for ADX, so lower TFs are calibrated
+	// but regime-transitional — see PRD-016.)
+	consensusByTF := make(map[string]strategy.Consensus, len(reads))
+	for _, r := range reads {
+		if r.err == nil && len(r.ks) > 0 {
+			consensusByTF[r.interval] = strategy.ConsensusForWithRegime(in.Symbol, r.ks)
+		}
+	}
+	if len(consensusByTF) > 0 {
+		mtf := strategy.AggregateMTF(consensusByTF)
+		fmt.Fprintf(&b, "MTF Strategy: %s %s\n", mtf.Direction, mtf.Summary)
+	}
+
+	// PRD-013: cache the 5m frame (the divergence strategy's reference series)
+	// and append a cross-symbol divergence hint when this symbol is moving
+	// decisively against a flat BTC anchor.
+	if fiveMin := reads[0]; fiveMin.err == nil && fiveMin.interval == "5m" {
+		cacheKlines(in.Symbol, fiveMin.ks)
+		if hint := divergenceHint(in.Symbol, fiveMin.ks); hint != "" {
+			fmt.Fprintf(&b, "%s\n", hint)
+		}
+	}
 	return tools.Result{Content: b.String()}, nil
+}
+
+// regimeLine renders the PRD-016 regime classification for a candle series:
+// "Regime: TRENDING (ADX 34.2) → favoring momentum/breakout/ema_cross." Returns
+// "" when there are too few candles for ADX (regime is then undetermined).
+func regimeLine(ks []binance.Kline) string {
+	adx, ok := binance.ADX(ks, 14)
+	if !ok {
+		return ""
+	}
+	r := strategy.DetectRegime(ks)
+	return fmt.Sprintf("Regime: %s (ADX %.1f) → %s.", r, adx, r.Favors())
 }
 
 // crossTimeframeVerdict reduces the per-timeframe directions (ordered LOW →

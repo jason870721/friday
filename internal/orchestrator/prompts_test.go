@@ -67,6 +67,41 @@ func TestStepSizeHint_IncludesMaxLeverage(t *testing.T) {
 	}
 }
 
+func TestStepSizeHint_IncludesNotionalCeiling(t *testing.T) {
+	// PRD-019: when a max-leverage notional ceiling is known, the hint shows it
+	// as "≤$Xk @max-lev" so the Risk Manager sizes within the tier (avoids -2027).
+	hint := stepSizeHint([]MarketSymbol{
+		{Name: "AMZNUSDT", StepSize: "0.01", MaxLeverage: 10, MaxNotional: 5000},
+		{Name: "BTCUSDT", StepSize: "0.001", MaxLeverage: 125, MaxNotional: 50000},
+		{Name: "NVDAUSDT", StepSize: "0.1", MaxLeverage: 10}, // cap unknown
+	})
+	if !strings.Contains(hint, "AMZNUSDT 0.01 (≤10x, ≤$5k @max-lev)") {
+		t.Errorf("missing notional ceiling for AMZNUSDT in %q", hint)
+	}
+	if !strings.Contains(hint, "BTCUSDT 0.001 (≤125x, ≤$50k @max-lev)") {
+		t.Errorf("missing notional ceiling for BTCUSDT in %q", hint)
+	}
+	// A known leverage but unknown notional cap keeps the bare "(≤Nx)".
+	if !strings.Contains(hint, "NVDAUSDT 0.1 (≤10x)") || strings.Contains(hint, "NVDAUSDT 0.1 (≤10x,") {
+		t.Errorf("unknown notional cap should omit the @max-lev part: %q", hint)
+	}
+}
+
+func TestShortUSD(t *testing.T) {
+	cases := map[float64]string{
+		300:     "$300",
+		5000:    "$5k",
+		25000:   "$25k",
+		1200000: "$1.2M",
+		2000000: "$2M",
+	}
+	for v, want := range cases {
+		if got := shortUSD(v); got != want {
+			t.Errorf("shortUSD(%g) = %q; want %q", v, got, want)
+		}
+	}
+}
+
 func TestSubmitSchemas_PinMinItemsToSymbolCount(t *testing.T) {
 	for _, n := range []int{1, 3, 7} {
 		for _, schema := range []string{submitAnalysisSchema(n), submitRiskSchema(n)} {

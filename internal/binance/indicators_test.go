@@ -31,6 +31,30 @@ func TestSMA(t *testing.T) {
 	}
 }
 
+func TestEMA(t *testing.T) {
+	// Hand-calculated: seed = SMA(1,2,3) = 2; α = 2/(3+1) = 0.5.
+	//   value 4 → 2 + 0.5·(4−2) = 3;  value 5 → 3 + 0.5·(5−3) = 4.
+	if got, ok := EMA([]float64{1, 2, 3, 4, 5}, 3); !ok || math.Abs(got-4) > 1e-9 {
+		t.Errorf("EMA([1..5],3) = %v (ok=%v); want 4", got, ok)
+	}
+	// period 2 on [1,2,3,4]: seed 1.5, α=2/3 → 2.5 → 3.5.
+	if got, ok := EMA([]float64{1, 2, 3, 4}, 2); !ok || math.Abs(got-3.5) > 1e-9 {
+		t.Errorf("EMA([1..4],2) = %v (ok=%v); want 3.5", got, ok)
+	}
+	// Exactly `period` values → equals the SMA (no smoothing steps).
+	if got, ok := EMA([]float64{2, 4, 6}, 3); !ok || math.Abs(got-4) > 1e-9 {
+		t.Errorf("EMA(exact period) = %v (ok=%v); want SMA 4", got, ok)
+	}
+	// A constant series stays constant.
+	if got, ok := EMA([]float64{5, 5, 5, 5, 5}, 3); !ok || math.Abs(got-5) > 1e-9 {
+		t.Errorf("EMA(constant) = %v (ok=%v); want 5", got, ok)
+	}
+	// Too few values → not ok.
+	if _, ok := EMA([]float64{1, 2}, 3); ok {
+		t.Error("EMA with fewer values than period: want ok=false")
+	}
+}
+
 func TestRSI_MonotonicEdges(t *testing.T) {
 	rising := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	if got, ok := RSI(rising, 14); !ok || got != 100 {

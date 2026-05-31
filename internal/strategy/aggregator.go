@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -15,6 +16,12 @@ import (
 func Aggregate(symbol string, signals []Signal) Consensus {
 	var longs, shorts []Signal
 	for _, s := range signals {
+		// A zero-confidence directional signal abstains: calibration (PRD-015)
+		// sets confidence to 0 for a strategy with no historical edge (≤50% win
+		// rate) on this symbol, and such a vote should not sway consensus.
+		if s.Confidence <= 0 {
+			continue
+		}
 		switch s.Direction {
 		case Long:
 			longs = append(longs, s)
@@ -71,7 +78,14 @@ func summarise(c Consensus, longs, shorts []Signal) string {
 func names(sigs []Signal) []string {
 	out := make([]string, 0, len(sigs))
 	for _, s := range sigs {
-		out = append(out, fmt.Sprintf("%s(%.0f%%)", s.Strategy, s.Confidence*100))
+		// PRD-018: surface each strategy's invalidation level (the price at which
+		// its thesis is void) so the Risk Manager can use it as the stop. Omitted
+		// when 0 (n/a) rather than printed as inval=0.00.
+		if s.Invalidation != 0 {
+			out = append(out, fmt.Sprintf("%s(%.0f%% inval=%.2f)", s.Strategy, s.Confidence*100, s.Invalidation))
+		} else {
+			out = append(out, fmt.Sprintf("%s(%.0f%%)", s.Strategy, s.Confidence*100))
+		}
 	}
 	return out
 }
@@ -84,6 +98,109 @@ func firedNames(sigs []Signal) []string {
 		}
 	}
 	return out
+}
+
+// mtfTFWeights are the cross-timeframe vote weights (PRD-017): a higher
+// timeframe is structurally more important, so it outweighs a lower one — but
+// not enough to silence it. mtfTFOrder fixes a deterministic display/iteration
+// order over the (unordered) input map.
+var (
+	mtfTFWeights = map[string]float64{"5m": 1.0, "1h": 1.5, "4h": 2.0}
+	mtfTFOrder   = []string{"5m", "1h", "4h"}
+)
+
+// mtfHysteresis is the dead-band around 0 in which the weighted net score is
+// read as NEUTRAL, so the MTF direction doesn't flip on tiny round-to-round
+// changes.
+const mtfHysteresis = 0.1
+
+// AggregateMTF combines per-timeframe consensuses into one cross-timeframe vote
+// (PRD-017). Each TF contributes `±Confidence × tfWeight` (+ for LONG, − for
+// SHORT, 0 for NEUTRAL); the net decides direction (with a ±0.1 hysteresis
+// band) and `abs(net) / Σweights` the confidence. Higher timeframes dominate on
+// conflict but a lower TF still moves the final confidence. With a single TF
+// present it degrades to that TF's consensus unchanged.
+func AggregateMTF(consensusByTF map[string]Consensus) Consensus {
+	present := make([]string, 0, len(mtfTFOrder))
+	for _, tf := range mtfTFOrder {
+		if _, ok := consensusByTF[tf]; ok {
+			present = append(present, tf)
+		}
+	}
+
+	switch len(present) {
+	case 0:
+		return Consensus{Direction: Neutral, Summary: "no timeframe data for an MTF vote."}
+	case 1:
+		return consensusByTF[present[0]] // graceful degrade: one TF → its own consensus
+	}
+
+	var net, sumW float64
+	parts := make([]string, 0, len(present))
+	for _, tf := range present {
+		c := consensusByTF[tf]
+		w := mtfTFWeights[tf]
+		if w == 0 {
+			w = 1.0
+		}
+		sumW += w
+		switch c.Direction {
+		case Long:
+			net += c.Confidence * w
+		case Short:
+			net -= c.Confidence * w
+		}
+		parts = append(parts, mtfPart(tf, c))
+	}
+
+	out := Consensus{Symbol: consensusByTF[present[0]].Symbol}
+	switch {
+	case net > mtfHysteresis:
+		out.Direction = Long
+	case net < -mtfHysteresis:
+		out.Direction = Short
+	default:
+		out.Direction = Neutral
+	}
+	out.Confidence = clamp01(math.Abs(net) / sumW)
+	out.Summary = fmt.Sprintf("(%s) → weighted %s %.2f", strings.Join(parts, " + "), out.Direction, out.Confidence)
+	return out
+}
+
+// mtfPart renders one timeframe's contribution: "4h:LONG 0.71 inval=96100.50",
+// "4h:LONG 0.71" (no invalidation), or "1h:NEUTRAL".
+func mtfPart(tf string, c Consensus) string {
+	if c.Direction == Neutral {
+		return tf + ":NEUTRAL"
+	}
+	if inval := c.Invalidation(); inval != 0 {
+		return fmt.Sprintf("%s:%s %.2f inval=%.2f", tf, c.Direction, c.Confidence, inval)
+	}
+	return fmt.Sprintf("%s:%s %.2f", tf, c.Direction, c.Confidence)
+}
+
+// Invalidation returns the consensus's effective stop level (PRD-018): the
+// CLOSEST-to-entry invalidation among the signals that agree with the consensus
+// direction — the most conservative (tightest) stop, so the position exits as
+// soon as any contributing strategy's thesis breaks. For LONG that is the
+// highest invalidation (nearest below price); for SHORT the lowest (nearest
+// above). 0 when no agreeing signal carries one, or the consensus is NEUTRAL.
+func (c Consensus) Invalidation() float64 {
+	best := 0.0
+	for _, s := range c.Signals {
+		if s.Direction != c.Direction || s.Invalidation == 0 {
+			continue
+		}
+		switch {
+		case best == 0:
+			best = s.Invalidation
+		case c.Direction == Long && s.Invalidation > best:
+			best = s.Invalidation
+		case c.Direction == Short && s.Invalidation < best:
+			best = s.Invalidation
+		}
+	}
+	return best
 }
 
 // FormatSummary appends the strategy consensus to a klines Summary line, in

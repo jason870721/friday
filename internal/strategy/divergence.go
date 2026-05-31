@@ -15,9 +15,9 @@ import (
 // "BTCUSDT"). A symbol "moves decisively" when its recent return exceeds
 // moveThresholdPct while the anchor's is within flatThresholdPct.
 //
-// NOTE: not yet wired into the live per-symbol klines flow (that path has
-// one symbol at a time). It is unit-tested and ready; live wiring pairs
-// naturally with the multi-symbol pass in PRD-008.
+// Wired into the live klines flow in PRD-013: the tool layer keeps a per-round
+// klines cache (tool.divergenceHint) so the single-symbol klines tools can
+// cross-reference the anchor and append a divergence hint to their output.
 func DivergenceSignals(data map[string][]binance.Kline, anchor string, moveThresholdPct, flatThresholdPct float64) []Signal {
 	anchorMove, ok := recentReturnPct(data[anchor])
 	if !ok {

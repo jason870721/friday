@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -80,6 +81,60 @@ func TestStore_SimilarFiltersBySymbol(t *testing.T) {
 	got := s.Similar("ETHUSDT", Features{RSI: 50}, 10)
 	if len(got) != 1 || got[0].Record.Symbol != "ETHUSDT" {
 		t.Errorf("symbol filter failed: got %+v", got)
+	}
+}
+
+func TestStore_StrategyFieldRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trades.jsonl")
+	s, _ := Open(path)
+	if err := s.Log(TradeRecord{Symbol: "BTCUSDT", Strategy: "momentum", PnL: 5}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _ := Open(path)
+	got := reopened.Similar("BTCUSDT", Features{}, 1)
+	if len(got) != 1 || got[0].Record.Strategy != "momentum" {
+		t.Fatalf("strategy did not round-trip: %+v", got)
+	}
+}
+
+func TestStore_PrePRD014RecordLoads(t *testing.T) {
+	// A record written before PRD-014 has no "strategy" key — it must load with
+	// a zero-value Strategy rather than erroring.
+	path := filepath.Join(t.TempDir(), "trades.jsonl")
+	legacy := `{"symbol":"ETHUSDT","bias":"LONG","pnl":3.0,"outcome":"WIN"}` + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy file: %v", err)
+	}
+	got := s.Similar("ETHUSDT", Features{}, 1)
+	if len(got) != 1 || got[0].Record.Strategy != "" {
+		t.Fatalf("legacy record should load with empty strategy: %+v", got)
+	}
+}
+
+func TestStore_SimilarByStrategy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trades.jsonl")
+	s, _ := Open(path)
+	f := Features{RSI: 60, Momentum: 1}
+	_ = s.Log(TradeRecord{Symbol: "BTCUSDT", Strategy: "momentum", PnL: 10, Features: f})
+	_ = s.Log(TradeRecord{Symbol: "BTCUSDT", Strategy: "breakout", PnL: -4, Features: f})
+	_ = s.Log(TradeRecord{Symbol: "BTCUSDT", Strategy: "momentum", PnL: 7, Features: f})
+
+	got := s.SimilarByStrategy("BTCUSDT", "momentum", f, 5)
+	if len(got) != 2 {
+		t.Fatalf("momentum-only returned %d; want 2", len(got))
+	}
+	for _, m := range got {
+		if m.Record.Strategy != "momentum" {
+			t.Errorf("got a %q record; want only momentum", m.Record.Strategy)
+		}
+	}
+	// Empty strategy = no filter (same as Similar).
+	if all := s.SimilarByStrategy("BTCUSDT", "", f, 5); len(all) != 3 {
+		t.Errorf("empty strategy filter returned %d; want all 3", len(all))
 	}
 }
 

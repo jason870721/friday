@@ -31,6 +31,7 @@ const logTradeSchema = `{
 	"properties": {
 		"symbol":      {"type": "string", "description": "The closed position's symbol, e.g. BTCUSDT."},
 		"bias":        {"type": "string", "enum": ["LONG", "SHORT"], "description": "Direction the trade was taken."},
+		"strategy":    {"type": "string", "description": "The strategy that triggered this trade, e.g. momentum / breakout / mean_reversion / ema_cross / divergence (from the Risk Manager's decision reason). Optional but enables per-strategy win/loss tracking."},
 		"pnl":         {"type": "number", "description": "Your best estimate of realised PnL in USDT (a hint; reconciled against the exchange ledger)."},
 		"entry_reason":{"type": "string", "description": "Why the trade was opened (the setup)."},
 		"rsi":         {"type": "number", "description": "RSI(14) at the trade, 0-100."},
@@ -52,6 +53,7 @@ func (LogTradeTool) Schema() json.RawMessage { return json.RawMessage(logTradeSc
 type logTradeInput struct {
 	Symbol      string  `json:"symbol"`
 	Bias        string  `json:"bias"`
+	Strategy    string  `json:"strategy,omitempty"`
 	PnL         float64 `json:"pnl"`
 	EntryReason string  `json:"entry_reason"`
 	RSI         float64 `json:"rsi"`
@@ -86,6 +88,7 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 		Time:        time.Now().Unix(),
 		EntryReason: in.EntryReason,
 		Bias:        in.Bias,
+		Strategy:    in.Strategy,
 		PnL:         in.PnL,
 		PnLSource:   "reported",
 		Features: memory.Features{

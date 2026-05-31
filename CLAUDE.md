@@ -24,10 +24,11 @@ Analyst → Risk Manager → Executor      (one round, every 15s)
 ```
 
 - **Analyst** — reads market data (multi-timeframe 5m/1h/4h via
-  `binance_mtf_klines` + cross-TF alignment) + sentiment + deterministic
-  strategy signals + trade memory; emits an `AnalystReport`. Validates signals
-  (anchors bias to the strategy consensus, overrides only with a cited
-  reason). No trading tools.
+  `binance_mtf_klines` + cross-TF alignment + a 4h ADX **market-regime** read
+  and a **regime-weighted, calibrated** strategy consensus) + sentiment +
+  deterministic strategy signals + trade memory; emits an `AnalystReport`.
+  Validates signals (anchors bias to the strategy consensus, overrides only
+  with a cited reason). No trading tools.
 - **Risk Manager** — computes dynamic caps, runs the mandatory risk
   checks, sizes positions by ATR volatility (risk ÷ 2×ATR stop, within the
   caps) / sets stops, or vetoes; emits `RiskDecisions`. No trading tools.
@@ -53,13 +54,13 @@ order, breaker awareness) lives in the **three role system prompts** in
 cmd/friday/main.go            entry point: sink → bootstrap → stop monitor → bubbletea TUI
 cmd/reconcile-memory/         one-off tool: rewrite trades.jsonl PnL/outcome from the exchange income ledger
 internal/bootstrap/           config load, env, symbol resolution + exchangeInfo preflight, builds the orchestrator + circuit breaker
-internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop
+internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop, per-round analysis log (roundlog.go)
 internal/tui/                 bubbletea Model + role-tagged event rendering
-internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, leverage brackets, TradFi-Perps sign) + indicators (SMA, RSI, ADX, ATR, ClassifyDirection, SemanticSummary)
-internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, divergence) + aggregator
+internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, leverage brackets, TradFi-Perps sign) + indicators (SMA, EMA, RSI, ADX, ATR, ClassifyDirection, SemanticSummary)
+internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, ema_cross, cross-symbol divergence) + aggregator (single-TF + MTF cross-timeframe vote) + startup confidence calibration store (PRD-015) + ADX regime detection & regime-weighted consensus (PRD-016) + MTF strategy consensus (PRD-017)
 internal/risk/                MarginCapValidator (15% guardrail), CircuitBreaker (session safety), SuggestedSize (ATR sizing), StopMonitor (SL/TP poller)
-internal/memory/              embedded vector trade-memory (file-backed, cosine similarity); PnL reconciled against the exchange ledger
-internal/backtest/            sandbox strategy simulator over historical klines
+internal/memory/              embedded vector trade-memory (file-backed, cosine similarity); PnL reconciled against the exchange ledger; per-strategy outcome stats (PRD-014)
+internal/backtest/            sandbox simulator: rule-based (run_backtest) + strategy-aware RunStrategy/Calibrate for startup confidence calibration (PRD-015)
 internal/tool/                friday's custom tools (binance_*, fear_greed_index, recall_trades, run_backtest, log_trade, submit_* via orchestrator)
 docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the index
 .friday/skills/start/SKILL.md startup / kickoff doc (Mandarin)
@@ -89,6 +90,22 @@ docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the in
   `≤Nx`, and `binance_leverage` clamps an over-cap request down to the symbol's
   max (PRD-012) — so a 100× ask on a 10× stock perp is corrected, not rejected
   with `-4028`. The 15% margin guardrail stays reject-and-report (no auto-resize).
+- **Per-notional leverage tier clamp** — leverage brackets are tiered by
+  notional (the max leverage only covers the *smallest* tier). `binance_order`
+  computes the order's notional and auto-lowers leverage to the tier it falls
+  into (`binance.LeverageBrackets` / `MaxLeverageForNotional`) *before* the
+  order, so a position can't exceed the tier its leverage allows and fail with
+  `-2027` (PRD-019). Margin is re-validated at the lower leverage; the Risk
+  Manager prompt shows each symbol's `≤$Xk @max-lev` notional ceiling.
+- **Per-round analysis log** — every round's full Analyst→Risk→Executor
+  outcome (sentiment, per-symbol bias/conviction/setups, the Risk Manager's
+  numeric decisions + notes, balance, breaker status, whether the Executor ran,
+  and the report/carry) is appended as one JSON line to
+  `~/.friday/memory/rounds.jsonl` by `orchestrator.RoundRecorder` (roundlog.go) —
+  the same append-only JSONL format as `trades.jsonl`, so it loads into jq/pandas
+  for offline analysis. Written on BOTH the actionable and the all-WAIT
+  short-circuit paths; non-fatal on write failure. Distinct from trade memory,
+  which only records CLOSED trades.
 - **PnL is exchange-truth, not agent-reported** — `log_trade` reconciles a
   closed trade against the `/fapi/v1/income` ledger (realised PnL − commission
   − funding) and stores the true net (`pnl_source:"exchange"`); WIN/LOSS and
@@ -104,12 +121,20 @@ refactor), **PRD-004** (vector memory + backtest), **PRD-005** (circuit
 breakers), **PRD-006** (strategy layer), **PRD-007** (ATR position sizing),
 **PRD-008** (multi-timeframe analysis), **PRD-009** (stop-loss/TP execution
 monitor), plus operational hardening **PRD-010** (configurable venue-validated
-symbols), **PRD-011** (exchange-truth PnL reconciliation), and **PRD-012**
-(per-symbol leverage caps).
+symbols), **PRD-011** (exchange-truth PnL reconciliation), **PRD-012**
+(per-symbol leverage caps), **PRD-019** (per-notional leverage tier clamp), and
+**PRD-013** (strategy portfolio expansion: EMA crossover + live divergence
+wiring), **PRD-014** (per-strategy performance tracking), **PRD-015** (startup
+confidence calibration from backtested win rates), **PRD-016** (ADX market
+regime detection + regime-weighted strategy consensus), **PRD-017** (MTF
+strategy consensus — the strategy engine on 5m/1h/4h, combined into one weighted
+cross-timeframe vote), and **PRD-018** (strategy-aware exits — each strategy's
+invalidation level surfaced as a candidate stop).
 
-All planned PRDs are implemented. Future work lives in the Out-of-Scope
-sections of the individual PRDs (e.g. exchange-native STOP_MARKET orders,
-fee/churn budgeting, divergence live-wiring).
+All PRDs (001–019) are implemented; the P2 strategy-engine tranche (013–018) is
+complete. Future work lives in the Out-of-Scope sections of the individual PRDs
+(e.g. per-TF calibration, strategy-specific take-profits, exchange-native
+STOP_MARKET orders, fee/churn budgeting).
 
 ## Build / run / test
 

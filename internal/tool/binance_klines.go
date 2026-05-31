@@ -103,6 +103,13 @@ func (BinanceKlinesTool) Execute(ctx context.Context, logger *slog.Logger, raw j
 	consensus := strategy.ConsensusFor(in.Symbol, ks)
 	fmt.Fprintf(&b, "\nSummary: %s\n", strategy.FormatSummary(summary, consensus))
 
+	// PRD-013: cross-symbol divergence. Cache this read, then append a hint if
+	// the symbol is diverging from a flat BTC anchor (empty otherwise).
+	cacheKlines(in.Symbol, ks)
+	if hint := divergenceHint(in.Symbol, ks); hint != "" {
+		fmt.Fprintf(&b, "%s\n", hint)
+	}
+
 	// PRD-007: append a volatility-based sizing hint (risk ÷ ATR stop) so the
 	// Analyst can carry ATR + the suggested stop into its report for the Risk
 	// Manager. Best-effort: needs the live balance, so silently omit it if the

@@ -71,6 +71,10 @@ type Orchestrator struct {
 	interval time.Duration
 	breaker  *risk.CircuitBreaker
 
+	// recorder appends each round's full pipeline outcome to a JSONL file for
+	// offline analysis (see roundlog.go). nil → round logging disabled.
+	recorder *RoundRecorder
+
 	// symbols is the venue-validated market list this session covers,
 	// injected into every role prompt and submit schema. Resolved at
 	// bootstrap from FRIDAY_SYMBOLS (see bootstrap.resolveSymbols).
@@ -230,7 +234,9 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	if !anyActionable(decisions) {
 		rep := "No actionable trades this round. " + decisions.RiskNotes
 		o.narrate(roleOrch, rep)
-		return ExecutionResult{Report: rep, Carry: carry}, nil
+		res := ExecutionResult{Report: rep, Carry: carry}
+		o.recordRound(report, decisions, res, false, round)
+		return res, nil
 	}
 
 	// 3. Executor.
@@ -242,6 +248,7 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	if err := o.capExec.into(&execRes); err != nil {
 		return ExecutionResult{}, fmt.Errorf("executor output: %w", err)
 	}
+	o.recordRound(report, decisions, execRes, true, round)
 	return execRes, nil
 }
 

@@ -134,6 +134,11 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 			"no tradable symbols resolved from FRIDAY_SYMBOLS — set it to symbols listed on %s", binanceBaseURL())
 	}
 
+	// PRD-015: calibrate strategy confidences from a startup backtest sweep over
+	// recent 4h candles, so each strategy votes with its real per-symbol win rate
+	// this session. Best-effort: on failure the hardcoded confidences stand.
+	calibrateStrategies(symbols)
+
 	// PRD-003: build the three-agent orchestrator (Analyst → Risk
 	// Manager → Executor). Tool wiring, profiles, and the round loop all
 	// live in internal/orchestrator now; bootstrap only loads config and
@@ -142,6 +147,12 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 	if err != nil {
 		return nil, nil, fmt.Errorf("orchestrator.New: %w", err)
 	}
+
+	// Per-round analysis log: append each round's full Analyst→Risk→Executor
+	// outcome to ~/.friday/memory/rounds.jsonl (alongside the trade log) for
+	// offline analysis. Same append-only JSONL format as trades.jsonl.
+	roundLogPath := filepath.Join(home, ".friday", "memory", "rounds.jsonl")
+	orch.SetRoundRecorder(orchestrator.NewRoundRecorder(roundLogPath))
 
 	return orch, cfg, nil
 }

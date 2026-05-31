@@ -112,14 +112,43 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 	if snapErr != nil {
 		logger.Warn("binance_order.guardrail_snapshot_failed", "symbol", in.Symbol, "err", snapErr)
 		guardNote = fmt.Sprintf("[guardrail skipped: could not fetch snapshot: %v] ", snapErr)
-	} else if verr := orderValidator.Validate(risk.Order{
-		Symbol:     in.Symbol,
-		Side:       in.Side,
-		Quantity:   in.Quantity,
-		ReduceOnly: in.ReduceOnly,
-	}, acct); verr != nil {
-		logger.Info("binance_order.guardrail_blocked", "symbol", in.Symbol, "reason", verr.Error())
-		return tools.Result{IsError: true, Content: verr.Error()}, nil
+	}
+
+	// Notional leverage clamp (PRD-019): Binance caps a position's notional by
+	// leverage tier — the highest leverage only covers the smallest notional.
+	// An OPEN whose notional (qty × mark) exceeds the tier the currently-set
+	// leverage allows is rejected with -2027. The PRD-012 clamp only stopped
+	// over-cap leverage (-4028); it can't see notional. Here we know it, so we
+	// auto-LOWER leverage to the tier this notional fits BEFORE the order — the
+	// position then opens at a valid leverage instead of failing. Reduce-only
+	// closes are exempt (they shrink the position, never trip the cap). The
+	// guardrail below re-validates margin at the lowered leverage, so a position
+	// too big to fit both the tier and the 15% margin cap is cleanly rejected.
+	if !in.ReduceOnly && snapErr == nil && acct.MarkPrice > 0 {
+		notional := in.Quantity * acct.MarkPrice
+		if maxLev, ok := maxLeverageForNotional(in.Symbol, notional); ok && acct.Leverage > float64(maxLev) {
+			logger.Info("binance_order.leverage_lowered_for_notional",
+				"symbol", in.Symbol, "notional", notional, "from", acct.Leverage, "to", maxLev)
+			if _, lerr := cli.SetLeverage(ctx, in.Symbol, maxLev); lerr != nil {
+				logger.Warn("binance_order.leverage_lower_failed", "symbol", in.Symbol, "err", lerr)
+				guardNote += fmt.Sprintf("[warn: could not lower leverage to %dx for $%.0f notional: %v] ", maxLev, notional, lerr)
+			} else {
+				guardNote += fmt.Sprintf("[leverage auto-lowered to %dx so $%.0f notional fits the bracket cap (avoids -2027)] ", maxLev, notional)
+				acct.Leverage = float64(maxLev)
+			}
+		}
+	}
+
+	if snapErr == nil {
+		if verr := orderValidator.Validate(risk.Order{
+			Symbol:     in.Symbol,
+			Side:       in.Side,
+			Quantity:   in.Quantity,
+			ReduceOnly: in.ReduceOnly,
+		}, acct); verr != nil {
+			logger.Info("binance_order.guardrail_blocked", "symbol", in.Symbol, "reason", verr.Error())
+			return tools.Result{IsError: true, Content: verr.Error()}, nil
+		}
 	}
 
 	ord, err := cli.MarketOrder(ctx, in.Symbol, side, in.Quantity, in.ReduceOnly)
