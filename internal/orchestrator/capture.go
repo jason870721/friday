@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/johnny1110/evva/pkg/tools"
@@ -59,7 +60,7 @@ func newSubmitTool(name, desc, schema string, cap *capture) *submitTool {
 }
 
 func (t *submitTool) Name() string            { return t.name }
-func (t *submitTool) Description() string      { return t.desc }
+func (t *submitTool) Description() string     { return t.desc }
 func (t *submitTool) Schema() json.RawMessage { return t.schema }
 
 func (t *submitTool) Execute(_ context.Context, logger *slog.Logger, raw json.RawMessage) (tools.Result, error) {
@@ -83,11 +84,18 @@ var _ tools.Tool = (*submitTool)(nil)
 const submitAnalysisName = "submit_analysis"
 
 const submitAnalysisDesc = `Submit your final market-analysis report for this round.
-Call this EXACTLY ONCE, after you have analysed all three symbols. This is
+Call this EXACTLY ONCE, after you have analysed every covered symbol. This is
 how your analysis is handed to the Risk Manager — nothing else you write is
 passed downstream.`
 
-const submitAnalysisSchema = `{
+// submitAnalysisSchema returns the report schema with minItems pinned to the
+// session's symbol count, so the Analyst must return one entry per covered
+// market (no more, no fewer) — matching the venue-validated list.
+func submitAnalysisSchema(n int) string {
+	return strings.ReplaceAll(submitAnalysisSchemaTmpl, `"minItems": SYMBOL_COUNT`, fmt.Sprintf(`"minItems": %d`, n))
+}
+
+const submitAnalysisSchemaTmpl = `{
 	"type": "object",
 	"additionalProperties": false,
 	"required": ["sentiment", "symbols"],
@@ -96,13 +104,13 @@ const submitAnalysisSchema = `{
 		"notes": {"type": "string", "description": "Optional cross-market notes."},
 		"symbols": {
 			"type": "array",
-			"minItems": 3,
+			"minItems": SYMBOL_COUNT,
 			"items": {
 				"type": "object",
 				"additionalProperties": false,
 				"required": ["symbol", "bias", "conviction", "summary"],
 				"properties": {
-					"symbol": {"type": "string", "description": "BTCUSDT / ETHUSDT / SOLUSDT."},
+					"symbol": {"type": "string", "description": "One of the covered symbols, e.g. BTCUSDT."},
 					"bias": {"type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"]},
 					"conviction": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
 					"setups": {"type": "array", "items": {"type": "string"}, "description": "Matched setup triggers."},
@@ -121,7 +129,13 @@ Call this EXACTLY ONCE. These numeric parameters are handed verbatim to the
 Executor — it places exactly what you specify and decides nothing itself.
 Use VETO to block a proposed trade, WAIT to stand down.`
 
-const submitRiskSchema = `{
+// submitRiskSchema returns the decisions schema with minItems pinned to the
+// session's symbol count — one decision per covered market.
+func submitRiskSchema(n int) string {
+	return strings.ReplaceAll(submitRiskSchemaTmpl, `"minItems": SYMBOL_COUNT`, fmt.Sprintf(`"minItems": %d`, n))
+}
+
+const submitRiskSchemaTmpl = `{
 	"type": "object",
 	"additionalProperties": false,
 	"required": ["balance", "decisions"],
@@ -130,7 +144,7 @@ const submitRiskSchema = `{
 		"risk_notes": {"type": "string", "description": "Which of the 7 risk checks were evaluated and which tripped."},
 		"decisions": {
 			"type": "array",
-			"minItems": 3,
+			"minItems": SYMBOL_COUNT,
 			"items": {
 				"type": "object",
 				"additionalProperties": false,

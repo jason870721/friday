@@ -93,8 +93,11 @@ func (c *Client) do(ctx context.Context, method, path string, params url.Values,
 	}
 
 	// Check for Binance error envelope (always HTTP 200 with an error code).
+	// Genuine API errors use NEGATIVE codes (e.g. -4411, -1121); some action
+	// endpoints — notably the TradFi-Perps agreement — return code 200 on
+	// SUCCESS, so that is not an error.
 	var errResp apiError
-	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Code != 0 {
+	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Code != 0 && errResp.Code != 200 {
 		return fmt.Errorf("binance: %s %s: [%d] %s", method, path, errResp.Code, errResp.Msg)
 	}
 

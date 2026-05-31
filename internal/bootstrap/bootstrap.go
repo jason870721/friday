@@ -49,6 +49,13 @@ MAX_ITERS=12000
 BINANCE_API_KEY=
 BINANCE_SECRET_KEY=
 BINANCE_BASE_URL=https://testnet.binancefuture.com
+
+# Active trading pairs (comma-separated). Validated at startup against the
+# endpoint's exchangeInfo: any symbol not listed as TRADING is logged and
+# skipped, so the bot never iterates an unavailable market. The stock perps
+# below depend on the endpoint — ones the venue doesn't list are skipped until
+# it does. Watch the "friday: trading N symbol(s)" log line for the live set.
+FRIDAY_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,NVDAUSDT,GOOGLUSDT,AMZNUSDT,METAUSDT
 `
 
 // New loads friday's config and builds the PRD-003 multi-agent
@@ -117,11 +124,21 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 	)
 	fridaytool.SetCircuitBreaker(breaker)
 
+	// Resolve the active trading pairs from FRIDAY_SYMBOLS and validate them
+	// against the venue's exchangeInfo (testnet or mainnet) — symbols the
+	// endpoint does not list as TRADING are logged and dropped here, so the
+	// per-round pipeline only ever iterates markets that actually exist.
+	symbols := resolveSymbols()
+	if len(symbols) == 0 {
+		return nil, nil, fmt.Errorf(
+			"no tradable symbols resolved from FRIDAY_SYMBOLS — set it to symbols listed on %s", binanceBaseURL())
+	}
+
 	// PRD-003: build the three-agent orchestrator (Analyst → Risk
 	// Manager → Executor). Tool wiring, profiles, and the round loop all
 	// live in internal/orchestrator now; bootstrap only loads config and
 	// hands the emitter (TUI sink) in for role-tagged events.
-	orch, err := orchestrator.New(cfg, emitter, breaker)
+	orch, err := orchestrator.New(cfg, emitter, breaker, symbols)
 	if err != nil {
 		return nil, nil, fmt.Errorf("orchestrator.New: %w", err)
 	}

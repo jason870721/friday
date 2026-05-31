@@ -10,9 +10,16 @@
 
 ## 任務
 
-自主、高風險的幣安 USDⓈ-M 永續合約交易員。同時**獨立**操作三個市場：
-BTCUSDT、ETHUSDT、SOLUSDT，目標是穩定獲利。市場間走勢可能連動也可能分化，
-每個市場都要獨立判斷。**只有使用者按 Ctrl+C 能停止你。**
+自主、高風險的幣安 USDⓈ-M 永續合約交易員。同時**獨立**操作多個市場，
+目標是穩定獲利。市場間走勢可能連動也可能分化，每個市場都要獨立判斷。
+**只有使用者按 Ctrl+C 能停止你。**
+
+操作的市場由 `FRIDAY_SYMBOLS` 環境變數設定（逗號分隔；預設含三個加密貨幣對
+加上數個美股永續），且在啟動時會以幣安 `exchangeInfo` 驗證——端點未列為
+`TRADING` 的標的會被記錄並略過，因此每輪只會處理確實存在的市場。新增/移除
+市場只需改設定，不需要動程式碼。美股永續是否可交易視端點而定（測試網與主網
+不同），未上架者會在啟動時自動略過，端點上架後即自動生效；實際生效清單以
+啟動時印出的 `friday: trading N symbol(s)` 為準。
 
 ---
 
@@ -53,10 +60,13 @@ BTCUSDT、ETHUSDT、SOLUSDT，目標是穩定獲利。市場間走勢可能連�
 1. `~/.friday/.env` 已填：`DEEPSEEK_API_KEY`、`BINANCE_API_KEY`、`BINANCE_SECRET_KEY`，
    且 `BINANCE_BASE_URL=https://testnet.binancefuture.com`。
 2. 測試網的 USDⓈ-M 合約錢包 USDT 餘額 > 0（否則每筆下單都會失敗）。
-3. （可選）熔斷門檻環境變數，不設則用預設：
+3. （可選）`FRIDAY_SYMBOLS` 設定要操作的標的（逗號分隔），不設則用預設
+   清單。啟動時會以 `exchangeInfo` 驗證並略過未上架者；終端機會印出
+   `friday: trading N symbol(s): …` 顯示最終生效的清單。
+4. （可選）熔斷門檻環境變數，不設則用預設：
    `FRIDAY_DAILY_LOSS_PCT`(0.10)、`FRIDAY_MAX_CONSEC_LOSSES`(5)、
    `FRIDAY_DRAWDOWN_HALT_PCT`(0.20)、`FRIDAY_COOLDOWN_CYCLES`(20)。
-4. `go build ./...` 與 `go test ./...` 通過。
+5. `go build ./...` 與 `go test ./...` 通過。
 
 ---
 
@@ -68,7 +78,7 @@ go run ./cmd/friday
 
 在 TUI 視窗貼上以下**啟動指令**並按 Enter，即開始第一輪；之後協調器每 15 秒自動跑下一輪：
 
-> 開始交易。立即分析 BTC/ETH/SOL 三個市場，依授權執行。分析與報告請以中文回覆。
+> 開始交易。立即分析所有已設定的市場（見啟動時印出的清單），依授權執行。分析與報告請以中文回覆。
 
 按 **Ctrl+C** 停止。
 

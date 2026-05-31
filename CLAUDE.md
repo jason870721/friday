@@ -1,8 +1,17 @@
 # Friday — an agentic crypto-futures auto-trader
 
-A quantitative trading agent for Binance USDⓈ-M perpetual futures
-(BTCUSDT / ETHUSDT / SOLUSDT), built on the evva Go agent SDK
-(`github.com/johnny1110/evva`). Goal: stable profit. Testnet by default.
+A quantitative trading agent for Binance USDⓈ-M perpetual futures, built on
+the evva Go agent SDK (`github.com/johnny1110/evva`). Goal: stable profit.
+Testnet by default.
+
+The covered markets are **configurable**, not hardcoded. `FRIDAY_SYMBOLS`
+(comma-separated; default `BTCUSDT,ETHUSDT,SOLUSDT,…`) is resolved at
+startup and **validated against the venue's `exchangeInfo`** — any symbol the
+endpoint doesn't list as `TRADING` is logged and dropped, so the pipeline only
+ever iterates markets that actually exist (see `bootstrap.resolveSymbols`). The
+validated list (with each symbol's real `LOT_SIZE` step) is injected into the
+three role prompts and the `submit_*` schemas; adding/removing a market is a
+config change, not a code change.
 
 ## Architecture (multi-agent, post PRD-003)
 

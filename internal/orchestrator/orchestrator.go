@@ -56,13 +56,21 @@ type Orchestrator struct {
 	emitter  RoleEmitter
 	interval time.Duration
 	breaker  *risk.CircuitBreaker
+
+	// symbols is the venue-validated market list this session covers,
+	// injected into every role prompt and submit schema. Resolved at
+	// bootstrap from FRIDAY_SYMBOLS (see bootstrap.resolveSymbols).
+	symbols []MarketSymbol
 }
 
 // New builds the three role agents (each with a disjoint tool set) and
 // returns a ready orchestrator. breaker is the shared session circuit
 // breaker (PRD-005); it may be nil (the pipeline then runs without
 // session-level gating).
-func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker) (*Orchestrator, error) {
+func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, symbols []MarketSymbol) (*Orchestrator, error) {
+	if len(symbols) == 0 {
+		return nil, fmt.Errorf("orchestrator: no symbols to trade")
+	}
 	o := &Orchestrator{
 		emitter:     emitter,
 		interval:    defaultInterval,
@@ -70,9 +78,10 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker) 
 		capRisk:     &capture{},
 		capExec:     &capture{},
 		breaker:     breaker,
+		symbols:     symbols,
 	}
 
-	analyst, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt, emitter, 40,
+	analyst, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40,
 		customTool(tool.BinancePriceToolName, func() pkgtools.Tool { return tool.NewBinancePrice() }),
 		customTool(tool.BinanceTickerToolName, func() pkgtools.Tool { return tool.NewBinanceTicker() }),
 		customTool(tool.BinanceKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceKlines() }),
@@ -84,24 +93,24 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker) 
 		// hypothesis validation (sandbox backtest) before forming a bias.
 		customTool(tool.RecallTradesToolName, func() pkgtools.Tool { return tool.NewRecallTrades() }),
 		customTool(tool.RunBacktestToolName, func() pkgtools.Tool { return tool.NewRunBacktest() }),
-		submitOption(submitAnalysisName, submitAnalysisDesc, submitAnalysisSchema, o.capAnalysis),
+		submitOption(submitAnalysisName, submitAnalysisDesc, submitAnalysisSchema(len(symbols)), o.capAnalysis),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("build analyst: %w", err)
 	}
 
-	risk, err := buildAgent(cfg, "friday-risk", roleRisk, riskSystemPrompt, emitter, 30,
+	risk, err := buildAgent(cfg, "friday-risk", roleRisk, riskSystemPrompt(symbols), emitter, 30,
 		customTool(tool.BinanceBalanceToolName, func() pkgtools.Tool { return tool.NewBinanceBalance() }),
 		customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
 		customTool(tool.BinancePriceToolName, func() pkgtools.Tool { return tool.NewBinancePrice() }),
 		customTool(tool.BinanceFeeToolName, func() pkgtools.Tool { return tool.NewBinanceFee() }),
-		submitOption(submitRiskName, submitRiskDesc, submitRiskSchema, o.capRisk),
+		submitOption(submitRiskName, submitRiskDesc, submitRiskSchema(len(symbols)), o.capRisk),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("build risk manager: %w", err)
 	}
 
-	executor, err := buildAgent(cfg, "friday-executor", roleExec, executorSystemPrompt, emitter, 40,
+	executor, err := buildAgent(cfg, "friday-executor", roleExec, executorSystemPrompt(symbols), emitter, 40,
 		customTool(tool.BinanceLeverageToolName, func() pkgtools.Tool { return tool.NewBinanceLeverage() }),
 		customTool(tool.BinanceOrderToolName, func() pkgtools.Tool { return tool.NewBinanceOrder() }),
 		customTool(tool.BinanceCloseAllToolName, func() pkgtools.Tool { return tool.NewBinanceCloseAll() }),
@@ -217,15 +226,15 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 
 func (o *Orchestrator) analystPrompt(round int, carry string) string {
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\nAnalyse BTCUSDT, ETHUSDT, and SOLUSDT from fresh data now, then call submit_analysis with all three.",
-		round, orFlat(carry), o.breakerLine())
+		"Round %d. Previous state: %s%s\n\nAnalyse %s from fresh data now, then call submit_analysis with all of them.",
+		round, orFlat(carry), o.breakerLine(), symbolNames(o.symbols))
 }
 
 func (o *Orchestrator) riskPrompt(round int, carry string, r AnalystReport) string {
 	j, _ := json.MarshalIndent(r, "", "  ")
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\nThe Analyst submitted this report:\n%s\n\nCompute caps from the live balance, run the mandatory risk checks on open positions, and call submit_risk_decisions with a decision for each of the three symbols.",
-		round, orFlat(carry), o.breakerLine(), string(j))
+		"Round %d. Previous state: %s%s\n\nThe Analyst submitted this report:\n%s\n\nCompute caps from the live balance, run the mandatory risk checks on open positions, and call submit_risk_decisions with a decision for each symbol (%s).",
+		round, orFlat(carry), o.breakerLine(), string(j), symbolNames(o.symbols))
 }
 
 // breakerLine renders the circuit-breaker status as a prompt fragment, or
