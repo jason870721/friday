@@ -1,16 +1,23 @@
 # Friday Roadmap
 
-Three tranches of work. The **4-phase upgrade** (PRD-001..004) from
-[`plan.md`](./plan.md) and the **P0 safety/strategy** tranche (PRD-005..006)
-from the P0/P1 plans in [`.evva/plans/`](../.evva/plans/), and the **P1**
-tranche (PRD-007..009) are all complete. Together they push Friday from "LLM as
-trader" toward "LLM as supervisor over deterministic Go strategy + hard safety
-rails". A separate **operational-hardening** tranche (PRD-010..012, PRD-019)
-captures fixes that came out of running real testnet sessions.
+The index of Friday's deliverables — one PRD per row in [`docs/PRD/`](./PRD/).
+The arc pushes Friday from "LLM as trader" toward "LLM as supervisor over a
+deterministic Go strategy engine behind hard, code-enforced safety rails":
+
+- **4-phase upgrade** (PRD-001..004) — semantic data + ReAct, sentiment + margin guardrail, the multi-agent refactor, vector memory + backtest. *(plan: [`plan.md`](./plan.md))*
+- **P0 safety/strategy** (PRD-005..006) — circuit breakers + the deterministic strategy layer.
+- **P1 volatility/stops/MTF** (PRD-007..009) — ATR sizing, multi-timeframe reads, the stop-loss monitor.
+- **Operational hardening** (PRD-010..012, 019) — fixes surfaced by real testnet sessions.
+- **P2 strategy-engine hardening** (PRD-013..018) — portfolio expansion, per-strategy tracking, confidence calibration, regime detection, MTF consensus, strategy-aware exits.
+- **P3 production + operations** (PRD-020..023) — native stops / fee budget / portfolio caps / online re-calibration / paper mode / observability, plus PnL-analysis-driven signal (022) and Analyst (023) hardening.
+
+**Status: PRD-001–023 are all implemented** (PRD-023's testnet-session
+acceptance item awaits a live run). Per-PRD detail and deferred follow-ups live
+in each `docs/PRD/PRD-NNN.md`; the sections below track them with checkboxes.
 
 ---
 
-## ⚠️ Architecture-alignment note (read before implementing PRD-007+)
+## ⚠️ Architecture-alignment note (when reading the old P0/P1 plan docs)
 
 The P0/P1 plans were written against the **pre-refactor single-agent**
 codebase. PRD-003 has since replaced that with the multi-agent
