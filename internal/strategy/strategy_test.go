@@ -98,6 +98,36 @@ func TestEMACross(t *testing.T) {
 	}
 }
 
+func TestBollinger_MeanReversionLong(t *testing.T) {
+	// 20 flat closes at 100 then a sharp drop to 95: the last close gaps below
+	// the lower band and RSI collapses (<35) → mean-reversion LONG, TP = MA20.
+	closes := append(repeat(100, 20), 95)
+	sig := Bollinger{}.Analyze("BTCUSDT", candlesFromCloses(closes...))
+	if sig.Direction != Long {
+		t.Fatalf("bollinger on a band-tag oversold = %v (%s); want Long", sig.Direction, sig.Reason)
+	}
+	if sig.TakeProfit == 0 {
+		t.Errorf("mean-reversion LONG should carry a TP (the mean), got 0")
+	}
+	if sig.Invalidation == 0 {
+		t.Errorf("mean-reversion LONG should carry an invalidation (the lower band), got 0")
+	}
+}
+
+func TestBollinger_FlatIsNeutral(t *testing.T) {
+	// A perfectly flat series sits inside the bands with no band-walk → Neutral.
+	sig := Bollinger{}.Analyze("BTCUSDT", candlesFromCloses(repeat(100, 30)...))
+	if sig.Direction != Neutral {
+		t.Errorf("flat series → %v (%s); want Neutral", sig.Direction, sig.Reason)
+	}
+}
+
+func TestBollinger_ShortSeriesNeutral(t *testing.T) {
+	if sig := (Bollinger{}).Analyze("BTCUSDT", candlesFromCloses(repeat(100, 10)...)); sig.Direction != Neutral {
+		t.Errorf("short series → %v; want Neutral", sig.Direction)
+	}
+}
+
 func TestRegistry_AppliesCalibratedConfidence(t *testing.T) {
 	// PRD-015: a calibrated base REPLACES the hardcoded 0.6, with ADX boost
 	// added on top — so a momentum Long here reads ≥0.9, not 0.6.
@@ -134,8 +164,8 @@ func TestAnalyzeAll_ExcludesZeroCalibratedStrategy(t *testing.T) {
 			t.Fatal("momentum calibrated to 0 should be absent from the signal list")
 		}
 	}
-	if len(sigs) != 3 { // 4 default strategies minus the disabled momentum
-		t.Errorf("got %d signals; want 3 (momentum disabled)", len(sigs))
+	if len(sigs) != 4 { // 5 default strategies minus the disabled momentum
+		t.Errorf("got %d signals; want 4 (momentum disabled)", len(sigs))
 	}
 }
 
@@ -151,13 +181,13 @@ func TestAggregate_IgnoresZeroConfidence(t *testing.T) {
 	}
 }
 
-func TestDefaultRegistry_HasFourStrategies(t *testing.T) {
-	// PRD-013: momentum, breakout, mean-reversion, ema_cross.
+func TestDefaultRegistry_HasFiveStrategies(t *testing.T) {
+	// PRD-013: momentum, breakout, mean-reversion, ema_cross. PRD-020 §7: bollinger.
 	sigs := DefaultRegistry().AnalyzeAll("BTCUSDT", candlesFromCloses(repeat(100, 60)...))
-	if len(sigs) != 4 {
-		t.Fatalf("DefaultRegistry produced %d signals; want 4", len(sigs))
+	if len(sigs) != 5 {
+		t.Fatalf("DefaultRegistry produced %d signals; want 5", len(sigs))
 	}
-	want := map[string]bool{"momentum": true, "breakout": true, "mean_reversion": true, "ema_cross": true}
+	want := map[string]bool{"momentum": true, "breakout": true, "mean_reversion": true, "ema_cross": true, "bollinger": true}
 	for _, s := range sigs {
 		delete(want, s.Strategy)
 	}

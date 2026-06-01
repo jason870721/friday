@@ -61,6 +61,14 @@ func main() {
 		monitor := risk.NewStopMonitor(tool.NewBinanceStopBroker(cli), time.Second, slog.Default())
 		tool.SetStopMonitor(monitor)
 		go monitor.Start(monitorCtx)
+
+		// PRD-020 §2 R5: cancel any server-side STOP_MARKET / TAKE_PROFIT_MARKET
+		// orders orphaned by a previous session (position no longer exists), so a
+		// stale stop can't fire against a position friday no longer holds. Skipped
+		// in paper mode — it queries real account endpoints (PRD-021 §4).
+		if !tool.PaperEnabled() {
+			go tool.CleanupOrphanStops(monitorCtx, slog.Default())
+		}
 	}
 
 	// 3. Bubbletea program. Alt-screen + mouse support is plenty for v1;

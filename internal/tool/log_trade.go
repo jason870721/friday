@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/johnny1110/evva/pkg/tools"
@@ -91,6 +92,7 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 		Strategy:    in.Strategy,
 		PnL:         in.PnL,
 		PnLSource:   "reported",
+		Paper:       globalPaper != nil,
 		Features: memory.Features{
 			RSI:       in.RSI,
 			PriceVsMA: in.PriceVsMA,
@@ -104,7 +106,12 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 	// unreliable (it logged WINs on losing closes). The income endpoint is
 	// ground truth: realised PnL net of commission and funding. Fall back to
 	// the reported value only if reconciliation is unavailable.
-	if cli, cerr := sharedBinanceClient(); cerr == nil {
+	// PRD-021 §4: in paper mode there is no exchange ledger to reconcile against
+	// (and account endpoints must not be called) — keep the reported figure and
+	// tag the source "paper".
+	if globalPaper != nil {
+		rec.PnLSource = "paper"
+	} else if cli, cerr := sharedBinanceClient(); cerr == nil {
 		end := time.Now()
 		start := end.Add(-reconcileWindow)
 		if sum, rerr := cli.RecentRealized(ctx, in.Symbol, start.UnixMilli(), end.UnixMilli()); rerr != nil {
@@ -125,12 +132,44 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 	// Feed the session circuit breaker (PRD-005) the TRUE net wallet impact —
 	// daily-loss and consecutive-loss tracking must reflect reality, not a
 	// reported figure that may be wrong.
-	effective := rec.PnL
-	if rec.PnLSource == "exchange" {
-		effective = rec.NetPnL
-	}
+	effective := rec.EffectivePnL()
 	if globalBreaker != nil {
 		globalBreaker.RecordTrade(effective)
+	}
+
+	// Live wallet balance: needed by the fee budget AND the large-PnL alert. In
+	// paper mode it is the virtual balance; otherwise the real account (skipped
+	// when unavailable).
+	var balance float64
+	if globalPaper != nil {
+		balance = globalPaper.Balance()
+	} else if cli, cerr := sharedBinanceClient(); cerr == nil {
+		if bal, berr := cli.USDTBalance(ctx); berr == nil {
+			balance, _ = strconv.ParseFloat(bal.Balance, 64)
+		}
+	}
+
+	// Feed the fee-budget guardrail (PRD-020 §3) the reconciled fee SPEND for the
+	// rolling-window anti-overtrading cap. Commission/Funding are signed costs
+	// (negative when paid); the budget tracks the positive magnitude paid out.
+	if globalFeeBudget != nil && rec.PnLSource == "exchange" {
+		globalFeeBudget.Record(-(rec.Commission + rec.Funding), balance)
+	}
+
+	// Large-PnL alert (PRD-021 §3): notify when this close's net wallet impact
+	// exceeds ±FRIDAY_NOTIFY_PNL_PCT of balance — a significant move the operator
+	// should know about without watching the TUI.
+	if globalNotifier != nil && balance > 0 && abs(effective) >= notifyPnLPct*balance {
+		tag := ""
+		if rec.Paper {
+			tag = " [PAPER]"
+		}
+		title := fmt.Sprintf("📊 Friday: large %s on %s%s", outcomeWord(effective), in.Symbol, tag)
+		body := fmt.Sprintf("%s %s net %+.4f USDT (%.1f%% of $%.2f balance), strategy=%s",
+			in.Bias, in.Symbol, effective, effective/balance*100, balance, orNone(in.Strategy))
+		if nerr := globalNotifier.Notify(title, body); nerr != nil {
+			logger.Warn("log_trade.notify_failed", "err", nerr)
+		}
 	}
 
 	logger.Debug("log_trade.stored", "symbol", in.Symbol, "pnl", rec.PnL,
@@ -141,7 +180,28 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 			"Logged %s %s — exchange realised %+.4f, fees %+.4f, funding %+.4f → NET %+.4f USDT (you reported %+.2f). Memory now holds %d records.",
 			in.Symbol, in.Bias, rec.PnL, rec.Commission, rec.Funding, rec.NetPnL, in.PnL, store.Len())}, nil
 	}
+	if rec.PnLSource == "paper" {
+		return tools.Result{Content: fmt.Sprintf(
+			"Logged %s %s [PAPER] (reported PnL %+.2f; virtual). Memory now holds %d records.",
+			in.Symbol, in.Bias, in.PnL, store.Len())}, nil
+	}
 	return tools.Result{Content: fmt.Sprintf(
 		"Logged %s %s trade (reported PnL %+.2f; exchange reconciliation unavailable). Memory now holds %d records.",
 		in.Symbol, in.Bias, in.PnL, store.Len())}, nil
+}
+
+// outcomeWord renders a PnL sign as a word for notification titles.
+func outcomeWord(pnl float64) string {
+	if pnl >= 0 {
+		return "WIN"
+	}
+	return "LOSS"
+}
+
+// orNone returns s, or "n/a" when blank.
+func orNone(s string) string {
+	if s == "" {
+		return "n/a"
+	}
+	return s
 }

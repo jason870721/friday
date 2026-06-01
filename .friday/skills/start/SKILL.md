@@ -58,8 +58,9 @@ prompt: 開始交易。立即分析所有已設定的市場（見啟動時印出
   - 當日已實現虧損 ≤ 餘額 −10%，或連續 5 筆虧損 → **PAUSED**（只准平倉/WAIT，冷卻後恢復）。
   - 總回撤 ≤ 起始餘額 −20% → **HALTED**（停止新倉，需手動重置）。
   - 熔斷狀態會注入風控的提示，風控在非 NORMAL 時只會輸出 CLOSE/WAIT。
-- **策略訊號層**（`internal/strategy`）—— 五個確定性策略：動量、突破、均值回歸、
-  EMA 交叉（PRD-013）四個單一標的策略，加上跨標的「背離」（BTC 平盤時某標的單獨走強/弱，PRD-013）。
+- **策略訊號層**（`internal/strategy`）—— 六個確定性策略：動量、突破、均值回歸、
+  EMA 交叉（PRD-013）、布林通道（PRD-020：均值回歸 ＋ band-walk 兩種模式）五個單一標的策略，
+  加上跨標的「背離」（BTC 平盤時某標的單獨走強/弱，PRD-013）。
   訊號彙總成共識後附在 `binance_klines` 的 Summary 行，供分析師驗證（而非自行臆測方向）；
   背離提示也會附在 `binance_klines` / `binance_mtf_klines` 輸出。
 - **啟動信心校準**（PRD-015，`backtest.RunStrategy` / `Calibrate`）—— 啟動時用各標的近 33 天
@@ -71,8 +72,22 @@ prompt: 開始交易。立即分析所有已設定的市場（見啟動時印出
   動量/突破/EMA、降低均值回歸；盤整市相反；過渡市不調整）。`binance_mtf_klines` 會輸出 `Regime:` 行。
 - **多時間框架策略共識**（PRD-017，`strategy.AggregateMTF`）—— 把校準＋市況加權後的策略引擎
   分別跑在 5m/1h/4h，再合成一個跨時框加權票（5m×1.0、1h×1.5、4h×2.0，衝突時高時框主導；
-  含 ±0.1 遲滯帶避免抖動）。`binance_mtf_klines` 輸出 `MTF Strategy:` 行，是分析師的**主要方向訊號**
+  含遲滯帶避免抖動）。`binance_mtf_klines` 輸出 `MTF Strategy:` 行，是分析師的**主要方向訊號**
   （與較粗略的 `Cross-TF:` 行衝突時以 MTF 為準）。
+- **RSI 極端區過濾 ＋ MTF 反應度調校**（PRD-022，`strategy.RSIFilter`）—— 兩項由 12 筆實盤虧損
+  （1勝11敗）分析驅動的訊號層修正：(1) 全域 RSI 閘門——任一時框 RSI(14) ≥75 或 ≤25 時，
+  該時框的方向共識直接降為 NEUTRAL（不在峰頂做多、不在谷底做空），可用 `FRIDAY_RSI_FILTER=false` 停用；
+  (2) MTF 反應度——遲滯帶由 0.1 降到 0.05（`FRIDAY_MTF_HYSTERESIS`），並加入「5m+1h 覆寫」：當 4h 為
+  NEUTRAL 且 5m 與 1h 同向且信心各 ≥0.5 時，採其平均信心的方向（`FRIDAY_MTF_5M1H_OVERRIDE`），
+  解決 149 輪僅 0.48% 出手的過度過濾。**4h 反向仍是硬否決**（5m/1h 做多但 4h 做空 → NEUTRAL）。
+- **分析師決策品質**（PRD-023，純提示層 ＋ 記憶體）—— 由 12 筆實盤虧損分析驅動的三項修正：
+  (1) **市況偏多閘門**——當 `Regime:` 為 TRENDING 且 4h 價格在 4h MA20 之下（空頭趨勢），做多偏向
+  必須同時具備「`MTF Strategy:` 明確為 LONG」＋「恐懼貪婪 ≤25」，否則一律 NEUTRAL（禁止僅憑恐慌指數逆勢做多）；
+  (2) **手續費感知**——每筆交易的預期波動須 ≥3× 來回手續費（~0.24%），ATR%/策略 TP 不足就不出手，
+  並在理由中寫出「預期波動 / 手續費」倍數；(3) **回溯樣本門檻**——`recall_trades` 在相似交易 <5 筆時
+  輸出「insufficient data (<5 similar trades) — do not use this to veto」，分析師不得以「回溯全虧」否決進場
+  （打破 虧損→回溯全虧→不敢交易→無法翻身 的負回饋循環）。此外手續費預算接近上限時，會把警示注入下一輪的
+  carry，分析師與風控都看得到（PRD-020 R9 接線）。
 - **多時間框架分析**（PRD-008，`binance_mtf_klines`）—— 一次併發抓 5m/1h/4h，
   各自分類方向後給出 ALIGNED / CONFLICT / NO-EDGE 跨框架對齊判斷（衝突時以較高框架為準，
   避免拿 5m 多單去對抗 4h 空頭）；分析師的主要讀盤工具。
@@ -83,9 +98,28 @@ prompt: 開始交易。立即分析所有已設定的市場（見啟動時印出
   均值回歸 = 進場價×0.99/1.01、EMA 交叉 = EMA21），會以 `inval=…` 顯示在共識行與 `MTF Strategy:` 行。
   風控設停損時：失效價比 2×ATR **更貼近進場**就用失效價（更緊的結構性保護），否則用 2×ATR 並把失效價
   記為心理硬停損；多策略一致時取**最近**的失效價。失效價為 0（不適用）則回退 2×ATR。
+- **策略專屬停利**（PRD-020 §6）—— 部分策略另帶「停利目標」（突破 = 測量目標 entry±區間高度、
+  均值回歸/布林 = 均值 MA20；動量/EMA 交叉刻意不設、靠移動停損），以 `tp=…` 顯示在共識行與
+  `MTF Strategy:` 行。風控有 `tp=…` 時就以它作為**第一階停利**（取代固定 +10% 規則），移動停損與
+  第二階（+20%）仍作為安全網。`backtest.BestTakeProfit` 提供逐策略停利百分比的粗掃描（校準輔助）。
 - **停損/停利即時監控**（PRD-009，`risk.StopMonitor`）—— 背景 goroutine 每秒輪詢標記價，
   觸及停損/停利立即以 reduce-only 市價平倉，是獨立於 15 秒迴圈的快速保護網；Executor 開倉後
   以 `binance_stop_monitor` 註冊風控算出的 2×ATR 停損。僅存記憶體（重啟不保留）。
+- **原生交易所停損**（PRD-020 §2）—— `binance_stop_monitor` 現在會「雙重保護」：除了上面的記憶體
+  輪詢監控，同時在幣安掛上伺服器端的 `STOP_MARKET`（停損）＋ `TAKE_PROFIT_MARKET`（停利）reduce-only
+  掛單（`timeInForce=GTC`、`workingType=MARK_PRICE`）。這些**原生掛單在 friday 當掉/重啟後仍存活**，
+  補上記憶體監控重啟即消失的缺口。對同一標的再次註冊會先撤掉舊掛單；清除（stop/tp=0）會撤單。
+  啟動時 `tool.CleanupOrphanStops` 會撤掉上一個 session 遺留、但部位已不存在的孤兒停損單。
+- **手續費預算（防過度交易）**（PRD-020 §3，`risk.FeeBudget`）—— 滾動 30 分鐘視窗的手續費花費；
+  一旦視窗內手續費超過餘額的 `FRIDAY_FEE_BUDGET_PCT`（預設 0.5%），`binance_order` 就擋下新開倉
+  （平倉不受限），由 `log_trade` 以交易所對帳後的手續費＋資金費餵入。接近上限時風控提示會出現一行狀態。
+- **投資組合相關性分組上限**（PRD-020 §4，`risk.PortfolioGroupValidator`）—— 把相關標的的**合計保證金**
+  設上限（`crypto` BTC/ETH/SOL 30%、`stocks` NVDA/GOOGL/AMZN/META 40%，可用 `FRIDAY_GROUP_LIMITS` 調整），
+  避免「7 個部位」其實只是兩個高度集中的賭注。`binance_order` 會把同組已開倉的保證金加總，
+  超過上限的開倉直接擋下；同一份分組設定也會注入風控提示。平倉與不屬任何組的標的放行。
+- **線上重新校準**（PRD-020 §5，`strategy.Recalibrator`）—— 背景 goroutine 每隔
+  `FRIDAY_RECALIBRATE_HOURS`（預設 4 小時；設 0 停用）用最新 4h K 線重跑 PRD-015 信心校準，
+  讓信心值跟得上市況轉變；任何一輪失敗就保留現有信心，不清空。
 - **逐標的槓桿上限**（PRD-012，`binance.MaxLeverages`）—— 各標的最大槓桿不同
   （BTC 125x、ETH 100x、SOL 50x、美股永續僅 10x）。啟動時抓 leverageBracket，
   注入風控提示（每個標的顯示「≤Nx」），並在 `binance_leverage` 內把超過上限的請求自動夾到上限，
@@ -112,6 +146,26 @@ prompt: 開始交易。立即分析所有已設定的市場（見啟動時印出
 
 ---
 
+## 維運與可觀測性（PRD-021）
+
+- **盤後分析工具** `cmd/analyze` —— 讀 `rounds.jsonl` ＋ `trades.jsonl`，印出 6 段報告：
+  session 總覽、逐策略／逐標的／逐市況（含勝率、總/平均損益、獲利因子 profit factor）、
+  分析師方向準確率、熔斷時間線。`go run ./cmd/analyze`（純文字）或加 `-json`（結構化），
+  可用 `-rounds`／`-trades` 指定路徑；檔案不存在/為空時優雅地顯示 0，不會崩。每筆交易會依
+  其**開倉當輪**的市況歸類（round log 現在會記每個標的的市況）。
+- **外部通知** `internal/notify` —— Discord／Telegram webhook（`FRIDAY_DISCORD_WEBHOOK_URL`
+  或 `FRIDAY_TELEGRAM_BOT_TOKEN`＋`FRIDAY_TELEGRAM_CHAT_ID`，未設則停用）。只在重大事件推播：
+  session 啟動/停止、熔斷 PAUSED/HALTED **狀態轉換**（每次轉換只推一則，非每輪）、
+  以及單筆平倉淨損益超過餘額 `FRIDAY_NOTIFY_PNL_PCT`（預設 ±5%）。
+- **紙上交易模式** `FRIDAY_PAPER=true` —— 不下任何真實單，改用虛擬帳本
+  （`risk.PaperPortfolio`，初始餘額 `FRIDAY_PAPER_BALANCE` 預設 1000 USDT）。交易工具
+  （`binance_order`/`binance_leverage`/`binance_close_all`/`binance_stop_monitor`）變成記錄
+  「PAPER: would have…」並更新虛擬部位的 no-op；`binance_position`/`binance_balance` 回傳虛擬狀態；
+  **絕不呼叫真實帳戶端點**；行情資料仍取自真實交易所。停損監控以紙上 broker 運作（真實標記價、虛擬平倉）。
+  round/trade log 會標記 `paper:true`，啟動時印出醒目橫幅。安全驗證策略、不耗測試網餘額的首選。
+
+---
+
 ## 啟動前檢查（**先用測試網**）
 
 1. `~/.friday/.env` 已填：`DEEPSEEK_API_KEY`、`BINANCE_API_KEY`、`BINANCE_SECRET_KEY`，
@@ -123,7 +177,16 @@ prompt: 開始交易。立即分析所有已設定的市場（見啟動時印出
 4. （可選）熔斷門檻環境變數，不設則用預設：
    `FRIDAY_DAILY_LOSS_PCT`(0.10)、`FRIDAY_MAX_CONSEC_LOSSES`(5)、
    `FRIDAY_DRAWDOWN_HALT_PCT`(0.20)、`FRIDAY_COOLDOWN_CYCLES`(20)。
-5. `go build ./...` 與 `go test ./...` 通過。
+5. （可選）PRD-020 生產強化環境變數，不設則用預設：
+   `FRIDAY_FEE_BUDGET_PCT`(0.005，手續費預算上限)、
+   `FRIDAY_GROUP_LIMITS`（相關性分組上限，格式 `name:pct:SYM1,SYM2;…`，不設用內建 crypto/stocks 組）、
+   `FRIDAY_RECALIBRATE_HOURS`(4，線上重新校準間隔；0 停用)。
+6. （可選）PRD-021 維運環境變數：`FRIDAY_PAPER`(true 開紙上交易)、`FRIDAY_PAPER_BALANCE`(1000)、
+   `FRIDAY_DISCORD_WEBHOOK_URL` / `FRIDAY_TELEGRAM_BOT_TOKEN`＋`FRIDAY_TELEGRAM_CHAT_ID`(通知)、
+   `FRIDAY_NOTIFY_PNL_PCT`(0.05，大額損益通知門檻)。
+7. （可選）PRD-022 訊號調校環境變數：`FRIDAY_RSI_FILTER`(true，RSI 極端區過濾)、
+   `FRIDAY_MTF_HYSTERESIS`(0.05，MTF 遲滯帶)、`FRIDAY_MTF_5M1H_OVERRIDE`(true，5m+1h 覆寫)。
+8. `go build ./...` 與 `go test ./...` 通過。
 
 ---
 

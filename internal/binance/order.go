@@ -72,6 +72,87 @@ func (c *Client) MarketOrder(ctx context.Context, symbol string, side OrderSide,
 	return &out, nil
 }
 
+// StopMarketOrder places a server-side STOP_MARKET order (PRD-020 §2) — a
+// crash-survivable stop-loss that executes on the exchange even if friday is
+// killed, OOMs, or hangs (unlike the in-memory StopMonitor). stopPrice is the
+// trigger (mark) price; on trigger a MARKET order of `quantity` fills at
+// side. timeInForce=GTC so it survives until explicitly cancelled. reduceOnly
+// guarantees it can only flatten, never flip. Used for the stop-loss leg.
+func (c *Client) StopMarketOrder(ctx context.Context, symbol string, side OrderSide, quantity, stopPrice float64, reduceOnly bool) (*OrderResponse, error) {
+	return c.triggerOrder(ctx, symbol, side, "STOP_MARKET", quantity, stopPrice, reduceOnly)
+}
+
+// TakeProfitMarketOrder places a server-side TAKE_PROFIT_MARKET order (PRD-020
+// §2) — the profit-side twin of StopMarketOrder. The distinct type is required
+// because the trigger fires from the FAVOURABLE side of the mark price (a
+// STOP_MARKET on the same side would be rejected with -2021 "would immediately
+// trigger"). Used for the take-profit leg.
+func (c *Client) TakeProfitMarketOrder(ctx context.Context, symbol string, side OrderSide, quantity, stopPrice float64, reduceOnly bool) (*OrderResponse, error) {
+	return c.triggerOrder(ctx, symbol, side, "TAKE_PROFIT_MARKET", quantity, stopPrice, reduceOnly)
+}
+
+// triggerOrder is the shared POST for STOP_MARKET / TAKE_PROFIT_MARKET orders.
+func (c *Client) triggerOrder(ctx context.Context, symbol string, side OrderSide, orderType string, quantity, stopPrice float64, reduceOnly bool) (*OrderResponse, error) {
+	params := url.Values{
+		"symbol":      {symbol},
+		"side":        {string(side)},
+		"type":        {orderType},
+		"timeInForce": {"GTC"},
+		"quantity":    {strconv.FormatFloat(quantity, 'f', -1, 64)},
+		"stopPrice":   {strconv.FormatFloat(stopPrice, 'f', -1, 64)},
+		"workingType": {"MARK_PRICE"},
+	}
+	if reduceOnly {
+		params.Set("reduceOnly", "true")
+	}
+	var out OrderResponse
+	if err := c.postSigned(ctx, "/fapi/v1/order", params, &out); err != nil {
+		return nil, fmt.Errorf("%s: %w", strings.ToLower(orderType), err)
+	}
+	return &out, nil
+}
+
+// CancelOrder cancels a single open order by ID on a symbol (PRD-020 §2) —
+// used to clear a native STOP_MARKET / TAKE_PROFIT_MARKET once its position is
+// closed or replaced.
+func (c *Client) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
+	params := url.Values{
+		"symbol":  {symbol},
+		"orderId": {strconv.FormatInt(orderID, 10)},
+	}
+	if err := c.do(ctx, "DELETE", "/fapi/v1/order", params, true, nil); err != nil {
+		return fmt.Errorf("cancelOrder %s #%d: %w", symbol, orderID, err)
+	}
+	return nil
+}
+
+// OpenOrder is one row of the open-orders endpoint — the fields friday needs to
+// reconcile orphaned native stops at startup (PRD-020 §2 R5).
+type OpenOrder struct {
+	OrderID       int64  `json:"orderId"`
+	Symbol        string `json:"symbol"`
+	Type          string `json:"type"` // STOP_MARKET, TAKE_PROFIT_MARKET, LIMIT, …
+	Side          string `json:"side"`
+	StopPrice     string `json:"stopPrice"`
+	ReduceOnly    bool   `json:"reduceOnly"`
+	ClosePosition bool   `json:"closePosition"`
+}
+
+// OpenOrders lists the account's currently-open (unfilled) orders. When symbol
+// is "" every symbol's open orders are returned (the form startup orphan
+// discovery uses); otherwise only the given symbol's.
+func (c *Client) OpenOrders(ctx context.Context, symbol string) ([]OpenOrder, error) {
+	params := url.Values{}
+	if symbol != "" {
+		params.Set("symbol", symbol)
+	}
+	var out []OpenOrder
+	if err := c.getSigned(ctx, "/fapi/v1/openOrders", params, &out); err != nil {
+		return nil, fmt.Errorf("openOrders: %w", err)
+	}
+	return out, nil
+}
+
 // CloseAllPositions cancels every open order on the account and then
 // places a reduce-only market order to flatten each non-zero position.
 // Returns a slice of human-readable lines describing what happened.

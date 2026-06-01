@@ -35,6 +35,7 @@ type Signal struct {
 	Confidence   float64 // 0.0–1.0
 	Reason       string  // human-readable, surfaced to the LLM
 	Invalidation float64 // price level at which this signal is void (0 = n/a)
+	TakeProfit   float64 // strategy-specific take-profit target (0 = n/a, rely on trailing) — PRD-020 §6
 	Strategy     string  // which strategy produced this
 }
 
@@ -50,6 +51,7 @@ type Consensus struct {
 	Symbol     string
 	Direction  Direction
 	Confidence float64
+	RSI        float64  // RSI(14) on this consensus's timeframe (0 = unavailable) — drives the RSI extreme-zone filter (PRD-022)
 	Signals    []Signal // all inputs (for LLM context)
 	Summary    string   // natural-language summary for the LLM
 }

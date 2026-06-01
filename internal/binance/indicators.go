@@ -12,9 +12,10 @@ import (
 // overbought") than from a wall of OHLCV numbers. These helpers are pure
 // and deterministic so they can be unit-tested against fixed fixtures.
 
-// closesOf extracts the close price from each candle, oldest-first
-// (matching the order Klines returns).
-func closesOf(ks []Kline) []float64 {
+// ClosesOf extracts the close price from each candle, oldest-first
+// (matching the order Klines returns). Exported (PRD-022 R6) so the strategy
+// package can compute RSI over a candle series via binance.RSI(binance.ClosesOf(…)).
+func ClosesOf(ks []Kline) []float64 {
 	out := make([]float64, len(ks))
 	for i, k := range ks {
 		out[i] = k.Close
@@ -54,6 +55,31 @@ func EMA(values []float64, period int) (ema float64, ok bool) {
 		ema = (v-ema)*alpha + ema
 	}
 	return ema, true
+}
+
+// BollingerBands returns the Bollinger Bands over `closes` for the given period
+// (20 conventional) and standard-deviation multiplier (2.0 conventional):
+// the middle band (SMA), the upper/lower bands (mid ± multiplier×σ), and the
+// bandwidth ((upper−lower)/mid) — a normalised volatility measure that widens
+// in high vol and narrows in low vol. The standard deviation is the population
+// σ over the last `period` closes. ok is false when there are fewer than
+// `period` values (or mid is 0, so bandwidth is undefined).
+func BollingerBands(closes []float64, period int, multiplier float64) (mid, upper, lower, bandwidth float64, ok bool) {
+	mid, ok = SMA(closes, period)
+	if !ok || mid == 0 {
+		return 0, 0, 0, 0, false
+	}
+	window := closes[len(closes)-period:]
+	var variance float64
+	for _, v := range window {
+		d := v - mid
+		variance += d * d
+	}
+	sd := math.Sqrt(variance / float64(period))
+	upper = mid + multiplier*sd
+	lower = mid - multiplier*sd
+	bandwidth = (upper - lower) / mid
+	return mid, upper, lower, bandwidth, true
 }
 
 // RSI returns Wilder's Relative Strength Index over `closes` for the given
@@ -214,7 +240,7 @@ const (
 // The RSI bands deliberately exclude the extremes (>70 / <30) so an
 // overbought/oversold exhaustion move is not read as trend confirmation.
 func ClassifyDirection(ks []Kline) string {
-	cs := closesOf(ks)
+	cs := ClosesOf(ks)
 	if len(cs) < 3 {
 		return DirectionNeutral
 	}
@@ -248,7 +274,7 @@ func SemanticSummary(ks []Kline) string {
 		return "No candle data available."
 	}
 
-	cs := closesOf(ks)
+	cs := ClosesOf(ks)
 	last := cs[len(cs)-1]
 	parts := []string{fmt.Sprintf("Current close %.4f.", last)}
 

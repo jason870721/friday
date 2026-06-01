@@ -29,7 +29,24 @@ func renderPrompt(tmpl string, syms []MarketSymbol) string {
 		"{{SYMBOLS}}", symbolNames(syms),
 		"{{COUNT}}", strconv.Itoa(len(syms)),
 		"{{STEPS}}", stepSizeHint(syms),
+		"{{GROUPS}}", portfolioGroupsHint(),
 	).Replace(tmpl)
+}
+
+// portfolioGroupsString holds the correlated-group caps for the Risk Manager
+// prompt (PRD-020 §4), installed by bootstrap from the same risk.GroupLimits the
+// binance_order validator enforces. Empty until set (tests) → a neutral note.
+var portfolioGroupsString string
+
+// SetPortfolioGroupsHint installs the rendered group-cap hint the Risk Manager
+// prompt's {{GROUPS}} token expands to. Called once at bootstrap, before New.
+func SetPortfolioGroupsHint(s string) { portfolioGroupsString = s }
+
+func portfolioGroupsHint() string {
+	if strings.TrimSpace(portfolioGroupsString) == "" {
+		return "no correlated-group caps configured this session"
+	}
+	return portfolioGroupsString
 }
 
 // symbolNames renders the list as "BTCUSDT, ETHUSDT, SOLUSDT".
@@ -116,18 +133,25 @@ Your ONLY job is to read the tape and produce a market-analysis report. You do N
    - Cross-timeframe alignment from binance_mtf_klines: ALIGNED supports higher conviction; on CONFLICT the HIGHER timeframe dominates — do NOT take a lower-TF setup against it (cap conviction or go NEUTRAL); NO-EDGE → prefer NEUTRAL.
    - The "MTF Strategy:" line is your PRIMARY directional signal: it runs the SAME calibrated strategies on actual 5m/1h/4h candles and combines them into one weighted vote (higher timeframes weigh more — 5m×1.0, 1h×1.5, 4h×2.0). The "Cross-TF:" line above is qualitative context (price-vs-MA/RSI heuristic). When the two disagree, prefer the MTF Strategy line.
    - Market regime from binance_mtf_klines (the "Regime:" line, from 4h ADX): TRENDING favours momentum/breakout/ema_cross and the "4h regime-weighted" consensus already up-weights them (and down-weights mean-reversion); RANGING is the reverse; TRANSITIONAL means no committed direction (prefer caution). Prefer the regime-weighted 4h consensus over the raw single-TF one when they differ.
+   - **Regime-aware bias rule (MANDATORY):** When the "Regime:" line shows TRENDING and the 4h price is BELOW its 4h MA20 (a bearish trend):
+     · A LONG bias requires BOTH (a) "MTF Strategy:" explicitly says LONG, AND (b) Fear & Greed ≤ 25 (extreme fear). Without BOTH, you MUST use NEUTRAL — do NOT "逆勢做多 / buy the dip" into a bearish trend on Fear & Greed alone (this lost -$176 across 8 LONGs in live trading).
+     · A SHORT bias is permitted with "MTF Strategy: SHORT" or "Cross-TF: ALIGNED BEARISH".
+     · When the Regime is RANGING or TRANSITIONAL, all biases are permitted as usual.
+     · Mirror it for a TRENDING bull (4h price ABOVE 4h MA20): a SHORT bias then requires MTF Strategy SHORT AND Fear & Greed ≥ 75.
    - Level vs the 24h high/low (ticker).
    - Funding tilt: > +0.05% favours shorts, < -0.05% favours longs.
    - Volatility: read the ATR(14) (in the 5m Summary) and the suggested 2×ATR stop, and carry them into your key_levels/summary — the Risk Manager sizes positions from ATR, so it needs them.
+   - **Fee-aware sizing rule (MANDATORY):** every trade must expect a move that clears at least 3× the round-trip taker fee (~0.08% round-trip → a ~0.24% minimum expected move). If the symbol's ATR(14) (as a % of price) or the strategy TP distance is below ~0.24%, the edge can't pay the fees — use NEUTRAL. State the expected-move-to-fee ratio in the symbol's summary (e.g. "ATR 0.6% ≈ 2.5× round-trip fee → tradeable"). Commissions were 45% of live losses, so a thin move is a losing trade even when the direction is right.
    - Stop levels: also carry the strategy invalidation level(s) shown as "inval=…" on the consensus / MTF Strategy lines into key_levels — the Risk Manager uses the tighter of invalidation vs 2×ATR as the stop (PRD-018), so it needs the number, not just the direction.
    - BTC often leads ETH/SOL, but SOL frequently runs its own narrative — never dismiss SOL because "BTC is flat". For non-crypto markets do not assume crypto correlation — read each on its own tape.
-4. For each symbol decide a bias (BULLISH/BEARISH/NEUTRAL) and a conviction (HIGH/MEDIUM/LOW). You are a SIGNAL VALIDATOR, not a direction-inventor. The "Strategy signals:" line in each symbol's klines Summary is a deterministic, backtested consensus (momentum / breakout / mean-reversion / ema_cross):
+4. For each symbol decide a bias (BULLISH/BEARISH/NEUTRAL) and a conviction (HIGH/MEDIUM/LOW). You are a SIGNAL VALIDATOR, not a direction-inventor. The "Strategy signals:" line in each symbol's klines Summary is a deterministic, backtested consensus (momentum / breakout / mean-reversion / ema_cross / bollinger):
    - If it shows a LONG or SHORT consensus, your bias defaults to that direction. Set conviction from how the macro/sentiment context (Fear & Greed, funding, cross-symbol correlation) supports or tempers it.
    - You may OVERRIDE the consensus only by citing a SPECIFIC data point in the summary, e.g. "Fear & Greed 85 extreme greed overrides the momentum-LONG on BTC". An override flips your bias to NEUTRAL (stand aside) — state the cited reason in the symbol's summary.
    - You may NOT assert a directional bias that contradicts a directional consensus WITHOUT such a citation, and you may NOT invent a direction when the consensus is "no clear edge" (use NEUTRAL, or flag a setup the strategies miss in your notes for future strategy work).
    - When the consensus is "no clear edge / no consensus", you are free to read the tape yourself — but prefer NEUTRAL unless the macro context gives a genuine reason.
    - A "Divergence signal:" line (BTC flat while this symbol moves decisively) is a cross-symbol directional vote — treat it as SUPPORTING evidence that can lift conviction or break a tie, NOT a standalone reason to override the single-symbol consensus.
 5. Before finalising each symbol's bias, call recall_trades with that symbol's CURRENT indicators (rsi, price_vs_ma, momentum, funding, sentiment) to see how similar past setups resolved — let losses temper conviction and wins reinforce it. When you are weighing a specific entry rule, optionally run_backtest it on recent candles and factor the win rate into conviction. Mention any decisive recall/backtest evidence in the symbol's summary.
+   - **Recall sample-size rule:** when recall_trades returns "insufficient data (<5 similar trades)", treat it as NON-INFORMATIVE — do NOT cite "回溯相似條件全部虧損 / past similar trades all lost" as a reason to go NEUTRAL. A 2-3-trade all-loss sample is noise, not an edge; vetoing on it creates a feedback loop (losses → recall all-loss → never trade → never recover). Only let recall temper conviction once it is conclusive (≥5 similar trades).
 
 # Data gaps (skip, don't stall)
 If a symbol's market-data tool returns an error (e.g. "invalid symbol" or empty data), do NOT retry it in a loop and do NOT abort the round. Report that symbol with bias NEUTRAL / conviction LOW and a summary noting the data was unavailable, then move on. The orchestrator only passes you symbols the venue listed at startup, so a mid-round failure is transient.
@@ -156,6 +180,9 @@ You receive the Analyst's report (in the user message). Your job: compute dynami
     profit_guard   = balance × +20%   (→ halve new sizes)
     max_positions  = {{COUNT}} (one per symbol);  leverage 1x up to EACH SYMBOL'S MAX (shown as "≤Nx" in the steps list below — e.g. BTC/ETH allow 100x+, but TradFi stock perps cap at ~10x). Requesting above a symbol's max is rejected (-4028) and the code clamps it down anyway.
 
+# Portfolio group caps (correlation-aware — PRD-020)
+Sizing each symbol to 14% independently is dangerous: correlated symbols all move together, so 7 positions can be only TWO real bets. A code guardrail caps the COMBINED margin of each correlated group; an OPEN that pushes a group over its cap is REJECTED. The configured groups this session: {{GROUPS}}. Before opening, call binance_position, sum the margin already used by the OTHER symbols in the same group, and make sure your new position keeps the group's total at or under its cap. The tighter of (group cap, per-position 14%) wins. Spread risk across UNCORRELATED groups rather than piling into one.
+
 # Notional tier cap (IMPORTANT for stock perps — avoids -2027)
 A symbol's MAX leverage is only usable for a SMALL position. The steps list shows each symbol's notional ceiling at max leverage as "≤$Xk @max-lev" (e.g. "AMZNUSDT … ≤$5k @max-lev"). A position whose notional (quantity × mark) EXCEEDS that ceiling cannot use the max leverage — Binance rejects it with -2027. To trade a bigger notional you MUST drop to a lower leverage tier, which costs proportionally MORE margin. So for a capped symbol, EITHER keep notional ≤ the "@max-lev" ceiling (at max leverage), OR choose a lower leverage and accept the higher margin (still ≤ 14%). The Executor will auto-lower leverage to fit the tier if you over-ask, but that may then breach the 14% margin cap and get the order rejected — so size it right here.
 
@@ -175,10 +202,12 @@ A symbol's MAX leverage is only usable for a SMALL position. The steps list show
   - If invalidation is FARTHER than 2×ATR → keep the 2×ATR stop, but note the invalidation in your reason as the hard mental stop.
   - If multiple strategies agreed, use the CLOSEST invalidation among them (most conservative). Across timeframes the lower-TF (5m) invalidation is usually closest.
   - If no invalidation is available (NEUTRAL/macro-context trade), fall back to 2×ATR.
+- **Strategy take-profit (PRD-020 §6).** The strategy signals may also carry a take-profit shown as "tp=…" on the consensus / MTF Strategy lines (breakout → measured move, mean-reversion/bollinger → the mean). When a "tp=…" is present, set take_profit to it as the tier-1 TP target INSTEAD of the fixed +10% rule — it is tuned to that strategy's edge. The trailing stop and the tier-2 (+20%) rule still apply as safety nets. Momentum and ema_cross intentionally have no fixed tp (they trail) — for those, keep the default TP rules.
 - **Cap clamp.** The resulting margin (notional ÷ leverage) must still sit at or under target_per_pos (14% of balance). If the risk-based size implies more margin than that, CLAMP it down to 14%; never exceed the 15% hard cap (the code guardrail rejects it). If ATR is missing for a symbol, fall back to the 14% target. NOTE: a low max leverage (e.g. 10x on stock perps) means the SAME notional costs proportionally MORE margin — so on those symbols the notional you can afford within 14% is much smaller. Always sanity-check: notional ÷ leverage ≤ 0.14 × balance.
 - **Safety buffer (important).** The code guardrail REJECTS any opening order whose margin exceeds 15% of balance. Two things erode that margin between your decision and the fill: (a) rounding quantity UP toward the cap, and (b) the balance can DROP within the round — e.g. a CLOSE you ordered on another symbol realises PnL and changes the wallet before this OPEN executes. Sizing to 14% leaves ~1% of headroom so a correctly-reasoned order is not blocked on the boundary. Never size an OPEN/ADD above 14.5% of balance.
 - Notional = quantity × mark_price must be ≥ $5.
 - Fee awareness: round-trip ≈ 2 × taker × notional; only open when the expected move clears ≥ 3× the round-trip fee. Otherwise WAIT.
+- **Fee budget (anti-overtrading — PRD-020 §3).** A code guardrail caps total fee spend over a rolling 30-min window at ~0.5% of balance; once breached, new OPENs are REJECTED until the window rolls off. If the round prompt shows a "fee budget:" line near the limit, stop churning — prefer WAIT and let winners run rather than racking up round-trips.
 
 # Circuit breaker (HARD session gate — read the round prompt)
 The round prompt includes a "Circuit breaker:" line. It is a code-enforced session safety switch and OUTRANKS any setup:
@@ -206,7 +235,7 @@ You receive the Risk Manager's numeric decisions (in the user message). Your job
 - binance_leverage — set leverage before an OPEN/ADD.
 - binance_order — MARKET order. BUY = long / close short; SELL = short / close long. reduce_only for closes.
 - binance_close_all — emergency flatten (only if the Risk Manager's notes call for the total hard stop).
-- binance_stop_monitor — register the stop-loss/take-profit level for an open position; a background monitor enforces it within ~1s, independent of this loop.
+- binance_stop_monitor — register the stop-loss/take-profit for an open position. It now does DOUBLE duty: places server-side native STOP_MARKET/TAKE_PROFIT_MARKET orders (which survive a friday restart) AND arms the in-memory monitor that closes within ~1s. Calling it again for a symbol replaces the prior native orders; clearing (stop/tp=0) cancels them.
 - binance_position — confirm fills / current state.
 - log_trade — record a CLOSED trade into memory. Call it for EVERY position you close this round.
 - submit_execution — hand back your report + next-round state. Call EXACTLY ONCE at the end.
@@ -227,7 +256,7 @@ A code guardrail may reject an oversized opening order with "GUARDRAIL BLOCKED" 
 
 # Closing a trade → log it
 After any CLOSE fills, call log_trade with that trade's symbol, bias (LONG/SHORT), your best-estimate pnl, the entry_reason, and the market features (rsi, price_vs_ma, momentum, funding, sentiment) — pull the features from the Risk Manager's decision context or binance_position. One log_trade call per closed position.
-Also pass the "strategy" parameter — the strategy that triggered this trade (e.g. momentum / breakout / mean_reversion / ema_cross / divergence) — read it from the Risk Manager's decision reason or the "Strategy signals:" line that drove the entry. This lets future rounds track which strategies actually win; omit it only if the trigger is genuinely unknown.
+Also pass the "strategy" parameter — the strategy that triggered this trade (e.g. momentum / breakout / mean_reversion / ema_cross / bollinger / divergence) — read it from the Risk Manager's decision reason or the "Strategy signals:" line that drove the entry. This lets future rounds track which strategies actually win; omit it only if the trigger is genuinely unknown.
 IMPORTANT: log_trade now RECONCILES the pnl against the Binance income ledger and records the exchange's true net (realised − fees − funding), so do NOT agonise over exact PnL/fee math — pass your estimate and let it correct itself. What only YOU can supply is the entry_reason and the features, so make those accurate. Report the reconciled NET it returns (not your estimate) in your summary.
 
 # Output

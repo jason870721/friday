@@ -20,11 +20,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/johnny1110/evva/pkg/config"
 	"github.com/johnny1110/evva/pkg/constant"
 	_ "github.com/johnny1110/evva/pkg/llm/builtins"
 
+	"github.com/johnny1110/friday/internal/notify"
 	"github.com/johnny1110/friday/internal/orchestrator"
 	"github.com/johnny1110/friday/internal/risk"
 	fridaytool "github.com/johnny1110/friday/internal/tool"
@@ -56,6 +58,38 @@ BINANCE_BASE_URL=https://testnet.binancefuture.com
 # below depend on the endpoint — ones the venue doesn't list are skipped until
 # it does. Watch the "friday: trading N symbol(s)" log line for the live set.
 FRIDAY_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,NVDAUSDT,GOOGLUSDT,AMZNUSDT,METAUSDT
+
+# Production hardening (PRD-020).
+# Fee-budget guardrail: blocks new OPENs once fee spend over a rolling 30-min
+# window exceeds this fraction of balance (anti-overtrading). 0.005 = 0.5%.
+FRIDAY_FEE_BUDGET_PCT=0.005
+# Portfolio correlation-group caps: "name:pct:SYM1,SYM2;…" — combined margin per
+# group is capped at pct% of balance. Empty = the built-in crypto/stocks groups.
+# FRIDAY_GROUP_LIMITS=crypto:30:BTCUSDT,ETHUSDT,SOLUSDT;stocks:40:NVDAUSDT,GOOGLUSDT,AMZNUSDT,METAUSDT
+# Online re-calibration: re-run the strategy-confidence backtest sweep this often
+# (hours) so confidences track regime shifts. 0 disables (startup calibration only).
+FRIDAY_RECALIBRATE_HOURS=4
+
+# Operations & observability (PRD-021).
+# Paper trading: no real orders — a virtual book trades against live market data.
+# FRIDAY_PAPER=true
+# FRIDAY_PAPER_BALANCE=1000
+# External notifications (significant events only): configure either/both.
+# FRIDAY_DISCORD_WEBHOOK_URL=
+# FRIDAY_TELEGRAM_BOT_TOKEN=
+# FRIDAY_TELEGRAM_CHAT_ID=
+# Notify on a closed trade whose net PnL exceeds this fraction of balance (±5%).
+FRIDAY_NOTIFY_PNL_PCT=0.05
+
+# Signal-quality tuning (PRD-022).
+# RSI extreme-zone filter: block any directional MTF consensus when the
+# timeframe's RSI(14) is ≥75 or ≤25 (don't long a peak / short a trough).
+FRIDAY_RSI_FILTER=true
+# MTF hysteresis dead-band (raw weighted net below this reads NEUTRAL).
+FRIDAY_MTF_HYSTERESIS=0.05
+# 5m+1h override: when 4h is NEUTRAL and 5m+1h agree (≥0.5 each), adopt their
+# direction at the average confidence (4h opposition stays a hard veto).
+FRIDAY_MTF_5M1H_OVERRIDE=true
 `
 
 // New loads friday's config and builds the PRD-003 multi-agent
@@ -134,10 +168,49 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 			"no tradable symbols resolved from FRIDAY_SYMBOLS — set it to symbols listed on %s", binanceBaseURL())
 	}
 
+	// PRD-021 §4: paper-trading mode. A virtual book replaces real order
+	// placement; market data stays live. Install BEFORE the orchestrator so the
+	// trading tools intercept from round one. Printed prominently below.
+	paper := strings.EqualFold(os.Getenv("FRIDAY_PAPER"), "true")
+	if paper {
+		pp := risk.NewPaperPortfolio(envFloat("FRIDAY_PAPER_BALANCE", 1000))
+		fridaytool.SetPaperPortfolio(pp)
+		fmt.Fprintf(os.Stderr,
+			"\n=== PAPER TRADING MODE ===\nNo real orders will be placed. Virtual balance %.2f USDT. Market data is live.\n==========================\n\n",
+			pp.Balance())
+	}
+
+	// PRD-021 §3: external notifications (Discord/Telegram). nil when none
+	// configured. The tool layer fires large-PnL close alerts; the orchestrator
+	// fires session + breaker-transition alerts.
+	notifier := notify.NewFromEnv()
+	fridaytool.SetNotifier(notifier, envFloat("FRIDAY_NOTIFY_PNL_PCT", 0.05))
+
+	// PRD-020 §3: fee-budget guardrail (rolling-window anti-overtrading). Install
+	// on the tool package (binance_order checks it, log_trade feeds it).
+	feeBudget := risk.NewFeeBudget(
+		risk.DefaultFeeWindow,
+		envFloat("FRIDAY_FEE_BUDGET_PCT", risk.DefaultMaxFeePct),
+	)
+	fridaytool.SetFeeBudget(feeBudget)
+
+	// PRD-020 §4: portfolio correlation-group caps. The SAME GroupLimits feeds
+	// both the binance_order validator AND the Risk Manager prompt, so the cap
+	// the model is told about is exactly the cap the code enforces.
+	groups := risk.ParseGroupLimits(os.Getenv("FRIDAY_GROUP_LIMITS"))
+	portfolioValidator := risk.NewPortfolioGroupValidator(groups)
+	fridaytool.SetPortfolioValidator(&portfolioValidator)
+	orchestrator.SetPortfolioGroupsHint(groups.PromptHint())
+
 	// PRD-015: calibrate strategy confidences from a startup backtest sweep over
 	// recent 4h candles, so each strategy votes with its real per-symbol win rate
 	// this session. Best-effort: on failure the hardcoded confidences stand.
 	calibrateStrategies(symbols)
+
+	// PRD-020 §5: keep calibration fresh — re-run the sweep every
+	// FRIDAY_RECALIBRATE_HOURS (default 4) on a background goroutine so stale
+	// confidences don't persist all session as the regime shifts. 0 disables.
+	startRecalibrator(symbols)
 
 	// PRD-003: build the three-agent orchestrator (Analyst → Risk
 	// Manager → Executor). Tool wiring, profiles, and the round loop all
@@ -147,6 +220,11 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 	if err != nil {
 		return nil, nil, fmt.Errorf("orchestrator.New: %w", err)
 	}
+	orch.SetFeeBudget(feeBudget)
+	orch.SetNotifier(notifier)
+	orch.SetPaper(paper)
+	orch.SetEndpoint(binanceBaseURL())
+	orch.SetRegimeSource(fridaytool.RegimeFor)
 
 	// Per-round analysis log: append each round's full Analyst→Risk→Executor
 	// outcome to ~/.friday/memory/rounds.jsonl (alongside the trade log) for

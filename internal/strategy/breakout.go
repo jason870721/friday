@@ -43,17 +43,22 @@ func (Breakout) Analyze(symbol string, ks []binance.Kline) Signal {
 	volSurge := avgVol > 0 && last.Volume > avgVol*1.5
 
 	conf := 0.65 + adxBoost(ks)
+	// PRD-020 §6: the classic breakout target is a "measured move" — project the
+	// broken range's height (priorHigh−priorLow) from the breakout point.
+	rangeHeight := priorHigh - priorLow
 
 	switch {
 	case last.Close > priorHigh && volSurge:
 		sig.Direction = Long
 		sig.Confidence = clamp01(conf)
 		sig.Invalidation = priorHigh
+		sig.TakeProfit = last.Close + rangeHeight
 		sig.Reason = fmt.Sprintf("close %.4f broke range high %.4f on %.1f× avg volume", last.Close, priorHigh, last.Volume/avgVol)
 	case last.Close < priorLow && volSurge:
 		sig.Direction = Short
 		sig.Confidence = clamp01(conf)
 		sig.Invalidation = priorLow
+		sig.TakeProfit = last.Close - rangeHeight
 		sig.Reason = fmt.Sprintf("close %.4f broke range low %.4f on %.1f× avg volume", last.Close, priorLow, last.Volume/avgVol)
 	default:
 		sig.Reason = fmt.Sprintf("no breakout (close %.4f in range %.4f–%.4f, volSurge=%v)", last.Close, priorLow, priorHigh, volSurge)

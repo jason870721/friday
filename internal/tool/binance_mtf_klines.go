@@ -135,7 +135,12 @@ func (BinanceMTFKlinesTool) Execute(ctx context.Context, logger *slog.Logger, ra
 
 	// PRD-016: classify the market regime from the 4h candles (slow-moving,
 	// structural) so the Analyst knows which strategy type the regime favours.
+	// PRD-021 §2: stash the regime per symbol so the orchestrator can record it
+	// in the round log (the post-mortem tool attributes trades to their regime).
 	if fourH := reads[2]; fourH.err == nil && fourH.interval == "4h" && len(fourH.ks) > 0 {
+		if _, ok := binance.ADX(fourH.ks, 14); ok {
+			recordRegime(in.Symbol, strategy.DetectRegime(fourH.ks).String())
+		}
 		if line := regimeLine(fourH.ks); line != "" {
 			fmt.Fprintf(&b, "%s\n", line)
 		}

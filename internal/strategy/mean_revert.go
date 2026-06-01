@@ -39,11 +39,13 @@ func (MeanReversion) Analyze(symbol string, ks []binance.Kline) Signal {
 		sig.Direction = Long
 		sig.Confidence = 0.6
 		sig.Invalidation = last * 0.99 // a touch below; further breakdown invalidates the fade
+		sig.TakeProfit = ma            // PRD-020 §6: revert to the mean (MA20)
 		sig.Reason = fmt.Sprintf("oversold: %.2f%% below MA20, RSI %.0f — fade back up", -devPct, rsi)
 	case devPct >= 2 && rsi > 70:
 		sig.Direction = Short
 		sig.Confidence = 0.6
 		sig.Invalidation = last * 1.01
+		sig.TakeProfit = ma // PRD-020 §6: revert to the mean (MA20)
 		sig.Reason = fmt.Sprintf("overbought: %.2f%% above MA20, RSI %.0f — fade back down", devPct, rsi)
 	default:
 		sig.Reason = fmt.Sprintf("not stretched (%.2f%% from MA20, RSI %.0f)", devPct, rsi)

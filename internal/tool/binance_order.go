@@ -84,6 +84,13 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: quantity=%g must be > 0", in.Quantity)}, nil
 	}
 
+	// Paper-trading mode (PRD-021 §4): no real order. Fetch the mark (real
+	// market data), update the virtual book, and report what WOULD have happened.
+	// The exchange's account endpoints are never touched.
+	if globalPaper != nil {
+		return paperOrder(ctx, logger, in, side)
+	}
+
 	// Circuit breaker (PRD-005): session-level gate, BEFORE the per-trade
 	// margin guardrail. Blocks new entries when the session is paused/halted.
 	// Reduce-only closes always bypass — flattening risk is never blocked.
@@ -139,13 +146,38 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		}
 	}
 
+	// Fee-budget guardrail (PRD-020 §3): block a new OPENING when fee spend over
+	// the rolling window has exceeded the cap (anti-overtrading). Needs the live
+	// balance, so it runs after the snapshot. Reduce-only closes bypass.
+	if !in.ReduceOnly && snapErr == nil && globalFeeBudget != nil {
+		if ferr := globalFeeBudget.Check(acct.WalletBalance); ferr != nil {
+			logger.Info("binance_order.fee_budget_blocked", "symbol", in.Symbol, "reason", ferr.Error())
+			return tools.Result{IsError: true, Content: ferr.Error()}, nil
+		}
+	}
+
+	ro := risk.Order{
+		Symbol:     in.Symbol,
+		Side:       in.Side,
+		Quantity:   in.Quantity,
+		ReduceOnly: in.ReduceOnly,
+	}
+
+	// Portfolio-group guardrail (PRD-020 §4): block an OPENING that pushes a
+	// correlated group's COMBINED margin over its cap. Needs the margin already
+	// committed by the group's OTHER open positions, so fetch them and sum.
+	if !in.ReduceOnly && snapErr == nil && globalPortfolioValidator != nil {
+		if _, cfg, ok := globalPortfolioValidator.Limits.GroupFor(in.Symbol); ok {
+			acct.GroupUsedMargin = groupUsedMargin(ctx, cli, cfg, in.Symbol, logger)
+			if perr := globalPortfolioValidator.Validate(ro, acct); perr != nil {
+				logger.Info("binance_order.portfolio_blocked", "symbol", in.Symbol, "reason", perr.Error())
+				return tools.Result{IsError: true, Content: perr.Error()}, nil
+			}
+		}
+	}
+
 	if snapErr == nil {
-		if verr := orderValidator.Validate(risk.Order{
-			Symbol:     in.Symbol,
-			Side:       in.Side,
-			Quantity:   in.Quantity,
-			ReduceOnly: in.ReduceOnly,
-		}, acct); verr != nil {
+		if verr := orderValidator.Validate(ro, acct); verr != nil {
 			logger.Info("binance_order.guardrail_blocked", "symbol", in.Symbol, "reason", verr.Error())
 			return tools.Result{IsError: true, Content: verr.Error()}, nil
 		}
@@ -156,6 +188,76 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: %v", err)}, nil
 	}
 	return tools.Result{Content: guardNote + binance.FormatOrder(ord)}, nil
+}
+
+// groupUsedMargin sums the margin (|notional| ÷ leverage) committed by the
+// OTHER open positions in a correlated group (PRD-020 §4) — the exposure the
+// PortfolioGroupValidator adds to this order's margin before checking the group
+// cap. The order's own symbol is excluded (its fresh margin is added by the
+// validator). Best-effort: a fetch failure logs and returns 0 (the group gate
+// then only sees this order, never over-counting).
+func groupUsedMargin(ctx context.Context, cli *binance.Client, cfg risk.GroupConfig, excludeSymbol string, logger *slog.Logger) float64 {
+	members := make(map[string]bool, len(cfg.Symbols))
+	for _, s := range cfg.Members(excludeSymbol) {
+		members[s] = true
+	}
+	if len(members) == 0 {
+		return 0
+	}
+	open, err := cli.OpenPositions(ctx)
+	if err != nil {
+		logger.Warn("binance_order.group_exposure_failed", "err", err)
+		return 0
+	}
+	var used float64
+	for _, p := range open {
+		if !members[p.Symbol] {
+			continue
+		}
+		amt, _ := strconv.ParseFloat(p.PositionAmt, 64)
+		mark, _ := strconv.ParseFloat(p.MarkPrice, 64)
+		lev, _ := strconv.ParseFloat(p.Leverage, 64)
+		notional := abs(amt) * mark
+		if lev > 0 {
+			used += notional / lev
+		} else {
+			used += notional
+		}
+	}
+	return used
+}
+
+func abs(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// paperOrder applies a market order to the virtual book at the live mark price
+// (PRD-021 §4) — market data is real, the fill is virtual. Reduce-only reduces
+// the position (realising virtual PnL); otherwise it opens/adds.
+func paperOrder(ctx context.Context, logger *slog.Logger, in binanceOrderInput, side binance.OrderSide) (tools.Result, error) {
+	cli, err := sharedBinanceClient()
+	if err != nil {
+		return tools.Result{IsError: true, Content: err.Error()}, nil
+	}
+	mp, err := cli.Price(ctx, in.Symbol)
+	if err != nil {
+		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order (paper): price: %v", err)}, nil
+	}
+	mark, _ := strconv.ParseFloat(mp.MarkPrice, 64)
+	if mark <= 0 {
+		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order (paper): no mark price for %s", in.Symbol)}, nil
+	}
+	realised := globalPaper.Trade(in.Symbol, string(side), in.Quantity, mark, in.ReduceOnly)
+	logger.Info("binance_order.paper", "symbol", in.Symbol, "side", side, "qty", in.Quantity,
+		"mark", mark, "reduce_only", in.ReduceOnly, "realised", realised)
+	msg := fmt.Sprintf("PAPER: would have placed %s %s qty=%g @ ~%.4f (no real order).", in.Symbol, side, in.Quantity, mark)
+	if in.ReduceOnly {
+		msg += fmt.Sprintf(" Virtual realised PnL %+.4f USDT. Virtual balance now %.2f.", realised, globalPaper.Balance())
+	}
+	return tools.Result{Content: msg}, nil
 }
 
 // orderGuardSnapshot pulls the live wallet balance, mark price, and

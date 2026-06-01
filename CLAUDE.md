@@ -53,15 +53,17 @@ order, breaker awareness) lives in the **three role system prompts** in
 ```
 cmd/friday/main.go            entry point: sink → bootstrap → stop monitor → bubbletea TUI
 cmd/reconcile-memory/         one-off tool: rewrite trades.jsonl PnL/outcome from the exchange income ledger
-internal/bootstrap/           config load, env, symbol resolution + exchangeInfo preflight, builds the orchestrator + circuit breaker
-internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop, per-round analysis log (roundlog.go)
+cmd/analyze/                  post-mortem analyser (PRD-021): reads rounds.jsonl + trades.jsonl → 6-section text/JSON report
+internal/bootstrap/           config load, env, symbol resolution + exchangeInfo preflight, builds the orchestrator + circuit breaker + guards/notifier/paper
+internal/orchestrator/        the 3-role pipeline, prompts, typed handoffs, round loop, per-round analysis log (roundlog.go), session/breaker notifications
 internal/tui/                 bubbletea Model + role-tagged event rendering + "/<name>" slash-skill commands (skills.go)
-internal/binance/             Binance Futures REST client (klines, orders, exchangeInfo, income ledger, leverage brackets, TradFi-Perps sign) + indicators (SMA, EMA, RSI, ADX, ATR, ClassifyDirection, SemanticSummary)
-internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, ema_cross, cross-symbol divergence) + aggregator (single-TF + MTF cross-timeframe vote) + startup confidence calibration store (PRD-015) + ADX regime detection & regime-weighted consensus (PRD-016) + MTF strategy consensus (PRD-017)
-internal/risk/                MarginCapValidator (15% guardrail), CircuitBreaker (session safety), SuggestedSize (ATR sizing), StopMonitor (SL/TP poller)
-internal/memory/              embedded vector trade-memory (file-backed, cosine similarity); PnL reconciled against the exchange ledger; per-strategy outcome stats (PRD-014)
-internal/backtest/            sandbox simulator: rule-based (run_backtest) + strategy-aware RunStrategy/Calibrate for startup confidence calibration (PRD-015)
-internal/tool/                friday's custom tools (binance_*, fear_greed_index, recall_trades, run_backtest, log_trade, submit_* via orchestrator)
+internal/binance/             Binance Futures REST client (klines, orders incl. STOP_MARKET/TAKE_PROFIT_MARKET/cancel/openOrders, exchangeInfo, income ledger, leverage brackets, TradFi-Perps sign) + indicators (SMA, EMA, RSI, ADX, ATR, BollingerBands, ClassifyDirection, SemanticSummary)
+internal/strategy/            deterministic signal engine (momentum, breakout, mean-reversion, ema_cross, bollinger, cross-symbol divergence) + aggregator (single-TF + MTF cross-timeframe vote) + startup confidence calibration store (PRD-015) + ADX regime detection & regime-weighted consensus (PRD-016) + MTF strategy consensus (PRD-017) + online recalibration goroutine (PRD-020) + RSI extreme-zone filter & MTF tuning (PRD-022, rsi_filter.go)
+internal/risk/                MarginCapValidator (15% guardrail), CircuitBreaker (session safety), FeeBudget (anti-overtrading), PortfolioGroupValidator (correlation-group caps), SuggestedSize (ATR sizing), StopMonitor (SL/TP poller), PaperPortfolio (paper-trading book, PRD-021)
+internal/notify/              external notifications (PRD-021): Notifier interface + Discord/Telegram/Multi + NewFromEnv
+internal/memory/              embedded vector trade-memory (file-backed, cosine similarity); PnL reconciled against the exchange ledger; per-strategy outcome stats (PRD-014); recall conclusiveness threshold (PRD-023, SimilarConclusive)
+internal/backtest/            sandbox simulator: rule-based (run_backtest) + strategy-aware RunStrategy/Calibrate for startup confidence calibration (PRD-015) + per-strategy TP sweep (PRD-020)
+internal/tool/                friday's custom tools (binance_*, fear_greed_index, recall_trades, run_backtest, log_trade, submit_* via orchestrator); paper-mode interception + notifier/guard globals (guards.go)
 docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the index
 .friday/skills/<name>/SKILL.md startup/kickoff docs (Mandarin); the TUI turns each into a "/<name>" command — frontmatter `prompt:` is what it sends (e.g. `/start`)
 ```
@@ -83,8 +85,32 @@ docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the in
   in `main.go` polling mark price ~every 1s, firing reduce-only closes the
   instant a registered level breaks — a fast backstop independent of the 15s
   loop. The Executor registers levels via `binance_stop_monitor` after each
-  OPEN (using PRD-007's 2×ATR stop). In-memory only (no persistence across
-  restarts); bypasses the gates so flattening always succeeds.
+  OPEN (using PRD-007's 2×ATR stop). In-memory only; bypasses the gates so
+  flattening always succeeds.
+- **Native exchange stops** — `binance_stop_monitor` ALSO places server-side
+  `STOP_MARKET` (stop-loss) + `TAKE_PROFIT_MARKET` (take-profit) reduce-only
+  orders (PRD-020 §2: `binance.StopMarketOrder`/`TakeProfitMarketOrder`,
+  `timeInForce=GTC`, `workingType=MARK_PRICE`) — these survive a friday crash/
+  restart, unlike the in-memory monitor. Dual protection: native order + local
+  poller. Re-arming a symbol cancels its prior native orders; clearing
+  (stop/tp=0) cancels them. `main` runs `tool.CleanupOrphanStops` at startup to
+  cancel native stops left by a previous session whose position is gone.
+- **Fee budget (anti-overtrading)** — `risk.FeeBudget` (PRD-020 §3): a rolling
+  30-min window of fee spend; `binance_order` blocks a new OPEN once windowed
+  fees exceed `FRIDAY_FEE_BUDGET_PCT` (default 0.5%) of balance, fed by
+  `log_trade` with the exchange-reconciled commission+funding. Reduce-only
+  closes bypass. The Risk Manager round prompt surfaces a status line when near.
+- **Portfolio correlation-group caps** — `risk.PortfolioGroupValidator`
+  (PRD-020 §4): caps the COMBINED margin of correlated symbols (`crypto`
+  BTC/ETH/SOL 30%, `stocks` NVDA/GOOGL/AMZN/META 40%, tunable via
+  `FRIDAY_GROUP_LIMITS`) so "7 positions" aren't really two concentrated bets.
+  `binance_order` sums the group's existing open margin and blocks an OPEN that
+  breaches the cap; the same `GroupLimits` is rendered into the Risk Manager
+  prompt. Reduce-only and ungrouped symbols pass.
+- **Online re-calibration** — `strategy.Recalibrator` (PRD-020 §5): a goroutine
+  that re-runs the PRD-015 confidence sweep on fresh 4h candles every
+  `FRIDAY_RECALIBRATE_HOURS` (default 4; 0 disables) so confidences track regime
+  shifts. Failures keep the existing confidences.
 - **Per-symbol leverage caps** — `binance.MaxLeverages` (leverageBracket) is
   resolved at startup, shown to the Risk Manager in-prompt as each symbol's
   `≤Nx`, and `binance_leverage` clamps an over-cap request down to the symbol's
@@ -113,6 +139,29 @@ docs/PRD/                     one PRD per deliverable; docs/roadmap.md is the in
   was unreliable). `cmd/reconcile-memory` backfills the same correction onto an
   existing `trades.jsonl`.
 
+## Operations & observability (PRD-021)
+
+- **Post-mortem tool** — `cmd/analyze` reads `rounds.jsonl` + `trades.jsonl` and
+  prints a 6-section report (session overview; per-strategy / per-symbol /
+  per-regime stats with win rate, total/avg PnL and profit factor; Analyst
+  directional accuracy; breaker timeline). `-json` for structured output,
+  `-rounds`/`-trades` to override paths; missing/empty files degrade to zeros.
+  Trades are attributed to a regime via the round they were OPENED in (the round
+  log now records each symbol's regime, sourced from `binance_mtf_klines`).
+- **External notifications** — `internal/notify` (`Notifier` + Discord/Telegram/
+  Multi + `NewFromEnv`). The orchestrator fires session start/stop and
+  breaker PAUSED↔HALTED↔NORMAL **transitions** (deduped via `lastBreakerState`,
+  once per transition); `log_trade` fires a large-PnL alert when a close's net
+  ≥ `FRIDAY_NOTIFY_PNL_PCT` (default 5%) of balance. nil notifier = no-op.
+- **Paper trading** — `FRIDAY_PAPER=true` installs a `risk.PaperPortfolio`
+  (virtual balance `FRIDAY_PAPER_BALANCE`, default 1000). The trading tools
+  (`binance_order`/`binance_leverage`/`binance_close_all`/`binance_stop_monitor`)
+  become no-ops that log "PAPER: would have…" and update the virtual book;
+  `binance_position`/`binance_balance` return virtual state; **account endpoints
+  are never called**; market-data tools stay live. The StopMonitor runs against
+  a paper broker (real mark price, virtual close). Round/trade logs are tagged
+  `paper:true`. A banner prints at startup.
+
 ## Roadmap status (see docs/roadmap.md)
 
 Implemented & verified: **PRD-001** (semantic klines + ReAct),
@@ -131,10 +180,24 @@ strategy consensus — the strategy engine on 5m/1h/4h, combined into one weight
 cross-timeframe vote), and **PRD-018** (strategy-aware exits — each strategy's
 invalidation level surfaced as a candidate stop).
 
-All PRDs (001–019) are implemented; the P2 strategy-engine tranche (013–018) is
-complete. Future work lives in the Out-of-Scope sections of the individual PRDs
-(e.g. per-TF calibration, strategy-specific take-profits, exchange-native
-STOP_MARKET orders, fee/churn budgeting).
+All PRDs (001–022) are implemented; the P2 strategy-engine tranche (013–018)
+and the P3 tranche (020 production hardening + 021 operations & observability)
+are complete. **PRD-020** added native exchange STOP_MARKET/TAKE_PROFIT_MARKET
+stops, a fee-budget guardrail, portfolio correlation-group caps, online
+re-calibration, strategy-specific take-profits, and a Bollinger Band strategy
+(now 5 single-symbol votes). **PRD-021** added the `cmd/analyze` post-mortem
+tool, Discord/Telegram notifications, and a `FRIDAY_PAPER` paper-trading mode.
+**PRD-022** (PnL-analysis-driven signal hardening) added a global RSI
+extreme-zone filter and tuned the MTF vote (lower hysteresis, a 5m+1h override,
+and a 4h hard veto). **PRD-023** (Analyst decision quality) added three
+Analyst-prompt rules (regime-aware bias clamp, fee-aware sizing, recall
+sample-size), surfaced the fee budget into the round carry when near the cap,
+and added a recall minimum-sample threshold (`memory.SimilarConclusive` /
+`ConclusiveMinSamples`; `recall_trades` reports "insufficient data" on a thin
+pool so a 2-3-trade all-loss sample can't veto entries). Future work lives in
+the Out-of-Scope sections of the individual PRDs (e.g. OCO orders, dynamic
+correlation clustering, Brier-score conviction scoring, recall time-decay
+weighting, regime-aware sizing, a real-time dashboard).
 
 ## Build / run / test
 

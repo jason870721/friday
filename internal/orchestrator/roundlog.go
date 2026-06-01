@@ -15,18 +15,20 @@ import (
 // numeric decisions, and what the Executor did — so a session can be replayed
 // and the analysis quality scored against the trades it produced.
 type RoundRecord struct {
-	Round        int              `json:"round"`
-	Time         string           `json:"time"` // RFC3339 (UTC)
-	Sentiment    string           `json:"sentiment"`
-	Analysis     []SymbolAnalysis `json:"analysis"`
-	AnalystNotes string           `json:"analyst_notes,omitempty"`
-	Balance      float64          `json:"balance"`
-	Decisions    []RiskDecision   `json:"decisions"`
-	RiskNotes    string           `json:"risk_notes,omitempty"`
-	Breaker      string           `json:"breaker,omitempty"`
-	Executed     bool             `json:"executed"` // did the Executor run (vs. an all-WAIT/VETO short-circuit)
-	Report       string           `json:"report,omitempty"`
-	Carry        string           `json:"carry,omitempty"`
+	Round        int               `json:"round"`
+	Time         string            `json:"time"` // RFC3339 (UTC)
+	Sentiment    string            `json:"sentiment"`
+	Analysis     []SymbolAnalysis  `json:"analysis"`
+	AnalystNotes string            `json:"analyst_notes,omitempty"`
+	Balance      float64           `json:"balance"`
+	Decisions    []RiskDecision    `json:"decisions"`
+	RiskNotes    string            `json:"risk_notes,omitempty"`
+	Breaker      string            `json:"breaker,omitempty"`
+	Regimes      map[string]string `json:"regimes,omitempty"` // symbol → TRENDING/RANGING/TRANSITIONAL at this round (PRD-021 §2)
+	Paper        bool              `json:"paper,omitempty"`   // true when the round ran in paper-trading mode (PRD-021 §4)
+	Executed     bool              `json:"executed"`          // did the Executor run (vs. an all-WAIT/VETO short-circuit)
+	Report       string            `json:"report,omitempty"`
+	Carry        string            `json:"carry,omitempty"`
 }
 
 // RoundRecorder appends RoundRecords to a JSONL file, one record per line —
@@ -88,12 +90,25 @@ func (o *Orchestrator) recordRound(report AnalystReport, decisions RiskDecisions
 		Balance:      decisions.Balance,
 		Decisions:    decisions.Decisions,
 		RiskNotes:    decisions.RiskNotes,
+		Paper:        o.paper,
 		Executed:     executed,
 		Report:       execRes.Report,
 		Carry:        execRes.Carry,
 	}
 	if o.breaker != nil {
 		rec.Breaker = o.breaker.Status()
+	}
+	// PRD-021 §2: snapshot each analysed symbol's latest regime so the
+	// post-mortem tool can group trades by the regime they were opened under.
+	if o.regimeFor != nil {
+		for _, s := range report.Symbols {
+			if r := o.regimeFor(s.Symbol); r != "" {
+				if rec.Regimes == nil {
+					rec.Regimes = make(map[string]string, len(report.Symbols))
+				}
+				rec.Regimes[s.Symbol] = r
+			}
+		}
 	}
 	if err := o.recorder.Log(rec); err != nil {
 		o.narrate(roleOrch, fmt.Sprintf("round-log write failed: %v", err))

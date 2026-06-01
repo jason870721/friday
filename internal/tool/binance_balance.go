@@ -37,6 +37,15 @@ func (BinanceBalanceTool) Description() string     { return binanceBalanceDescri
 func (BinanceBalanceTool) Schema() json.RawMessage { return json.RawMessage(binanceBalanceSchema) }
 
 func (BinanceBalanceTool) Execute(ctx context.Context, logger *slog.Logger, _ json.RawMessage) (tools.Result, error) {
+	// Paper-trading mode (PRD-021 §4): return the virtual wallet, never the real
+	// account endpoint.
+	if globalPaper != nil {
+		bal := globalPaper.Balance()
+		logger.Debug("binance_balance.paper", "balance", bal)
+		return tools.Result{Content: fmt.Sprintf(
+			"USDT balance=%.2f available=%.2f crossWallet=%.2f crossUnPnl=0 [PAPER]", bal, bal, bal)}, nil
+	}
+
 	cli, err := sharedBinanceClient()
 	if err != nil {
 		return tools.Result{IsError: true, Content: err.Error()}, nil

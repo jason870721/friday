@@ -81,11 +81,16 @@ func names(sigs []Signal) []string {
 		// PRD-018: surface each strategy's invalidation level (the price at which
 		// its thesis is void) so the Risk Manager can use it as the stop. Omitted
 		// when 0 (n/a) rather than printed as inval=0.00.
+		// PRD-020 §6: also surface the strategy-specific take-profit (tp=…) when
+		// non-zero, so the Risk Manager can use it as the tier-1 TP target.
+		extra := ""
 		if s.Invalidation != 0 {
-			out = append(out, fmt.Sprintf("%s(%.0f%% inval=%.2f)", s.Strategy, s.Confidence*100, s.Invalidation))
-		} else {
-			out = append(out, fmt.Sprintf("%s(%.0f%%)", s.Strategy, s.Confidence*100))
+			extra += fmt.Sprintf(" inval=%.2f", s.Invalidation)
 		}
+		if s.TakeProfit != 0 {
+			extra += fmt.Sprintf(" tp=%.2f", s.TakeProfit)
+		}
+		out = append(out, fmt.Sprintf("%s(%.0f%%%s)", s.Strategy, s.Confidence*100, extra))
 	}
 	return out
 }
@@ -109,21 +114,31 @@ var (
 	mtfTFOrder   = []string{"5m", "1h", "4h"}
 )
 
-// mtfHysteresis is the dead-band around 0 in which the weighted net score is
-// read as NEUTRAL, so the MTF direction doesn't flip on tiny round-to-round
-// changes.
-const mtfHysteresis = 0.1
-
 // AggregateMTF combines per-timeframe consensuses into one cross-timeframe vote
-// (PRD-017). Each TF contributes `±Confidence × tfWeight` (+ for LONG, − for
-// SHORT, 0 for NEUTRAL); the net decides direction (with a ±0.1 hysteresis
-// band) and `abs(net) / Σweights` the confidence. Higher timeframes dominate on
-// conflict but a lower TF still moves the final confidence. With a single TF
-// present it degrades to that TF's consensus unchanged.
+// (PRD-017, tuned by PRD-022). Each TF is first passed through the RSI
+// extreme-zone filter (using that TF's own RSI), then contributes
+// `±Confidence × tfWeight` (+ for LONG, − for SHORT, 0 for NEUTRAL); the net
+// decides direction (within a ±hysteresis dead-band, default 0.05) and
+// `abs(net) / Σweights` the confidence. Two PRD-022 refinements then apply:
+//
+//   - 5m+1h override: when the 4h is NEUTRAL (or absent) and the 5m and 1h agree
+//     with confidence ≥0.5 each, adopt their shared direction at the average of
+//     their confidences — so aligned lower-timeframe signals aren't drowned out
+//     by a perpetually-NEUTRAL 4h.
+//   - 4h hard veto: when the 4h is directional and OPPOSES the weighted result,
+//     force NEUTRAL — never trade a lower-TF setup against the 4h trend.
+//
+// With a single TF present it degrades to that TF's (RSI-filtered) consensus.
 func AggregateMTF(consensusByTF map[string]Consensus) Consensus {
+	// PRD-022 R5: filter each TF by its OWN RSI before it can vote.
+	filtered := make(map[string]Consensus, len(consensusByTF))
+	for tf, c := range consensusByTF {
+		filtered[tf] = RSIFilter(c, c.RSI)
+	}
+
 	present := make([]string, 0, len(mtfTFOrder))
 	for _, tf := range mtfTFOrder {
-		if _, ok := consensusByTF[tf]; ok {
+		if _, ok := filtered[tf]; ok {
 			present = append(present, tf)
 		}
 	}
@@ -132,13 +147,13 @@ func AggregateMTF(consensusByTF map[string]Consensus) Consensus {
 	case 0:
 		return Consensus{Direction: Neutral, Summary: "no timeframe data for an MTF vote."}
 	case 1:
-		return consensusByTF[present[0]] // graceful degrade: one TF → its own consensus
+		return filtered[present[0]] // graceful degrade: one TF → its own (filtered) consensus
 	}
 
 	var net, sumW float64
 	parts := make([]string, 0, len(present))
 	for _, tf := range present {
-		c := consensusByTF[tf]
+		c := filtered[tf]
 		w := mtfTFWeights[tf]
 		if w == 0 {
 			w = 1.0
@@ -153,30 +168,73 @@ func AggregateMTF(consensusByTF map[string]Consensus) Consensus {
 		parts = append(parts, mtfPart(tf, c))
 	}
 
-	out := Consensus{Symbol: consensusByTF[present[0]].Symbol}
+	hyst := mtfHysteresisValue()
+	out := Consensus{Symbol: filtered[present[0]].Symbol}
 	switch {
-	case net > mtfHysteresis:
+	case net > hyst:
 		out.Direction = Long
-	case net < -mtfHysteresis:
+	case net < -hyst:
 		out.Direction = Short
 	default:
 		out.Direction = Neutral
 	}
 	out.Confidence = clamp01(math.Abs(net) / sumW)
-	out.Summary = fmt.Sprintf("(%s) → weighted %s %.2f", strings.Join(parts, " + "), out.Direction, out.Confidence)
+
+	note := ""
+	four, has4h := filtered["4h"]
+	fourNeutral := !has4h || four.Direction == Neutral
+
+	switch {
+	case mtf5m1hOverrideEnabled() && fourNeutral && lowerTFOverride(filtered) != Neutral:
+		// PRD-022 R8: aligned 5m+1h with a non-opposing 4h → adopt their direction
+		// at the average of their confidences.
+		five, oneH := filtered["5m"], filtered["1h"]
+		out.Direction = five.Direction
+		out.Confidence = clamp01((five.Confidence + oneH.Confidence) / 2)
+		note = " [5m+1h override]"
+	case has4h && four.Direction != Neutral && out.Direction != Neutral && four.Direction != out.Direction:
+		// PRD-022 R8: 4h opposition is a hard veto — never trade against the 4h.
+		out.Direction = Neutral
+		out.Confidence = 0
+		note = " [4h veto]"
+	}
+
+	out.Summary = fmt.Sprintf("(%s) → weighted %s %.2f%s", strings.Join(parts, " + "), out.Direction, out.Confidence, note)
 	return out
 }
 
-// mtfPart renders one timeframe's contribution: "4h:LONG 0.71 inval=96100.50",
-// "4h:LONG 0.71" (no invalidation), or "1h:NEUTRAL".
+// lowerTFOverride returns the shared 5m+1h direction when both are present,
+// agree on a non-NEUTRAL direction, and each has confidence ≥0.5 — else Neutral
+// (no override). The 4h-neutrality precondition is checked by the caller.
+func lowerTFOverride(filtered map[string]Consensus) Direction {
+	five, ok5 := filtered["5m"]
+	oneH, ok1 := filtered["1h"]
+	if !ok5 || !ok1 {
+		return Neutral
+	}
+	if five.Direction == Neutral || five.Direction != oneH.Direction {
+		return Neutral
+	}
+	if five.Confidence < 0.5 || oneH.Confidence < 0.5 {
+		return Neutral
+	}
+	return five.Direction
+}
+
+// mtfPart renders one timeframe's contribution: "4h:LONG 0.71 inval=96100.50
+// tp=98500.00", "4h:LONG 0.71" (no levels), or "1h:NEUTRAL".
 func mtfPart(tf string, c Consensus) string {
 	if c.Direction == Neutral {
 		return tf + ":NEUTRAL"
 	}
+	out := fmt.Sprintf("%s:%s %.2f", tf, c.Direction, c.Confidence)
 	if inval := c.Invalidation(); inval != 0 {
-		return fmt.Sprintf("%s:%s %.2f inval=%.2f", tf, c.Direction, c.Confidence, inval)
+		out += fmt.Sprintf(" inval=%.2f", inval)
 	}
-	return fmt.Sprintf("%s:%s %.2f", tf, c.Direction, c.Confidence)
+	if tp := c.TakeProfit(); tp != 0 {
+		out += fmt.Sprintf(" tp=%.2f", tp)
+	}
+	return out
 }
 
 // Invalidation returns the consensus's effective stop level (PRD-018): the
@@ -198,6 +256,30 @@ func (c Consensus) Invalidation() float64 {
 			best = s.Invalidation
 		case c.Direction == Short && s.Invalidation < best:
 			best = s.Invalidation
+		}
+	}
+	return best
+}
+
+// TakeProfit returns the consensus's effective take-profit target (PRD-020 §6):
+// the CLOSEST-to-entry take-profit among the signals that agree with the
+// consensus direction — the most conservative (nearest) target, so a winner is
+// banked rather than held for the most optimistic strategy. For LONG that is the
+// lowest TP (nearest above price); for SHORT the highest (nearest below). 0 when
+// no agreeing signal carries one, or the consensus is NEUTRAL.
+func (c Consensus) TakeProfit() float64 {
+	best := 0.0
+	for _, s := range c.Signals {
+		if s.Direction != c.Direction || s.TakeProfit == 0 {
+			continue
+		}
+		switch {
+		case best == 0:
+			best = s.TakeProfit
+		case c.Direction == Long && s.TakeProfit < best:
+			best = s.TakeProfit
+		case c.Direction == Short && s.TakeProfit > best:
+			best = s.TakeProfit
 		}
 	}
 	return best

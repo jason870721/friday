@@ -55,6 +55,34 @@ func TestEMA(t *testing.T) {
 	}
 }
 
+func TestBollingerBands(t *testing.T) {
+	// Period 5 over [2,4,4,4,5,5,7,9]: last 5 = [4,5,5,7,9].
+	// mid = 30/5 = 6; variance = ((4-6)^2+(5-6)^2+(5-6)^2+(7-6)^2+(9-6)^2)/5
+	//      = (4+1+1+1+9)/5 = 16/5 = 3.2; σ = sqrt(3.2) ≈ 1.788854.
+	closes := []float64{2, 4, 4, 4, 5, 5, 7, 9}
+	mid, upper, lower, bw, ok := BollingerBands(closes, 5, 2.0)
+	if !ok {
+		t.Fatal("BollingerBands ok=false on sufficient data")
+	}
+	wantSD := math.Sqrt(3.2)
+	if math.Abs(mid-6) > 1e-9 {
+		t.Errorf("mid = %v; want 6", mid)
+	}
+	if math.Abs(upper-(6+2*wantSD)) > 1e-9 {
+		t.Errorf("upper = %v; want %v", upper, 6+2*wantSD)
+	}
+	if math.Abs(lower-(6-2*wantSD)) > 1e-9 {
+		t.Errorf("lower = %v; want %v", lower, 6-2*wantSD)
+	}
+	if math.Abs(bw-((upper-lower)/mid)) > 1e-9 {
+		t.Errorf("bandwidth = %v; want %v", bw, (upper-lower)/mid)
+	}
+	// Too few values → not ok.
+	if _, _, _, _, ok := BollingerBands([]float64{1, 2}, 5, 2.0); ok {
+		t.Error("BollingerBands with fewer values than period: want ok=false")
+	}
+}
+
 func TestRSI_MonotonicEdges(t *testing.T) {
 	rising := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	if got, ok := RSI(rising, 14); !ok || got != 100 {

@@ -94,3 +94,33 @@ func TestCalibrate_MapsWinRateAndOmitsThin(t *testing.T) {
 		t.Error("momentum had <5 trades on RISEUSDT; it should be omitted (fallback), not calibrated")
 	}
 }
+
+func TestBestTakeProfit_PicksFromGrid(t *testing.T) {
+	// Momentum on a clean uptrend trades; the sweep must return a TP from the
+	// grid with ok=true.
+	tp, ret, ok := BestTakeProfit(strategy.Momentum{}, "BTCUSDT", risingPullbackCandles(40))
+	if !ok {
+		t.Fatal("expected a rankable TP (momentum trades on this uptrend)")
+	}
+	inGrid := false
+	for _, g := range tpSweepGrid {
+		if tp == g {
+			inGrid = true
+		}
+	}
+	if !inGrid {
+		t.Errorf("BestTakeProfit returned TP %.2f not in the sweep grid %v", tp, tpSweepGrid)
+	}
+	_ = ret
+}
+
+func TestBestTakeProfit_NoTrades(t *testing.T) {
+	// A flat series never triggers momentum → nothing to rank.
+	flat := make([]binance.Kline, 40)
+	for i := range flat {
+		flat[i] = binance.Kline{Close: 100, High: 100.1, Low: 99.9, Volume: 100}
+	}
+	if _, _, ok := BestTakeProfit(strategy.Momentum{}, "BTCUSDT", flat); ok {
+		t.Error("expected ok=false when the strategy never trades")
+	}
+}

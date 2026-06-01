@@ -111,7 +111,13 @@ func applyRegimeWeights(signals []Signal, regime Regime) []Signal {
 func (r *Registry) ConsensusWithRegime(symbol string, candles []binance.Kline) Consensus {
 	regime := DetectRegime(candles)
 	weighted := applyRegimeWeights(r.AnalyzeAll(symbol, candles), regime)
-	return Aggregate(symbol, weighted)
+	c := Aggregate(symbol, weighted)
+	// PRD-022 R4: carry this timeframe's RSI(14) so AggregateMTF can apply the
+	// extreme-zone entry filter (≥15 closes required; else left 0 = unavailable).
+	if rsi, ok := binance.RSI(binance.ClosesOf(candles), 14); ok {
+		c.RSI = rsi
+	}
+	return c
 }
 
 // ConsensusForWithRegime is the package-level convenience used by

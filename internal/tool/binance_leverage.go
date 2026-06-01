@@ -109,6 +109,17 @@ func (BinanceLeverageTool) Execute(ctx context.Context, logger *slog.Logger, raw
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_leverage: leverage=%d out of range [1,125]", in.Leverage)}, nil
 	}
 
+	// Paper-trading mode (PRD-021 §4): record on the virtual book, no API call.
+	if globalPaper != nil {
+		lev := in.Leverage
+		if max, ok := maxLeverageFor(in.Symbol); ok && lev > max {
+			lev = max
+		}
+		globalPaper.SetLeverage(in.Symbol, float64(lev))
+		logger.Info("binance_leverage.paper", "symbol", in.Symbol, "leverage", lev)
+		return tools.Result{Content: fmt.Sprintf("PAPER: would have set %s leverage to %dx (no real change).", in.Symbol, lev)}, nil
+	}
+
 	cli, err := sharedBinanceClient()
 	if err != nil {
 		return tools.Result{IsError: true, Content: err.Error()}, nil

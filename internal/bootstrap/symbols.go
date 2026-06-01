@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -171,6 +172,37 @@ func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
 	}
 	fmt.Fprintf(os.Stderr,
 		"friday: calibrated %d strategy×symbol confidence(s) from 4h backtests (the rest fall back to defaults)\n", calibrated)
+}
+
+// startRecalibrator launches the PRD-020 §5 online re-calibration goroutine: it
+// re-runs the PRD-015 confidence sweep every FRIDAY_RECALIBRATE_HOURS (default
+// 4) on fresh 4h candles so the strategies don't vote at stale confidences all
+// session as the regime drifts. FRIDAY_RECALIBRATE_HOURS=0 disables it. The
+// backtest.Calibrate function is injected (not imported by strategy) to avoid an
+// import cycle. Runs on a background context for the life of the process.
+func startRecalibrator(symbols []orchestrator.MarketSymbol) {
+	hours := envFloat("FRIDAY_RECALIBRATE_HOURS", 4)
+	if hours <= 0 {
+		fmt.Fprintln(os.Stderr, "friday: online re-calibration disabled (FRIDAY_RECALIBRATE_HOURS=0)")
+		return
+	}
+	names := make([]string, len(symbols))
+	for i, s := range symbols {
+		names[i] = s.Name
+	}
+	cli := binance.New(binanceBaseURL(), os.Getenv("BINANCE_API_KEY"), os.Getenv("BINANCE_SECRET_KEY"))
+	rc := &strategy.Recalibrator{
+		Symbols:    names,
+		Strategies: strategy.DefaultStrategies(),
+		Interval:   time.Duration(hours * float64(time.Hour)),
+		Fetch:      cli.Klines,
+		CalibrateFn: func(strats []strategy.Strategy, candles map[string][]binance.Kline) map[string]map[string]float64 {
+			return backtest.Calibrate(strats, candles)
+		},
+		Logger: slog.Default(),
+	}
+	go rc.Run(context.Background())
+	fmt.Fprintf(os.Stderr, "friday: online re-calibration every %.1fh\n", hours)
 }
 
 // signTradFiAgreement signs the TradFi-Perps agreement so stock-perp orders are

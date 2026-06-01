@@ -63,7 +63,8 @@ type TradeRecord struct {
 	Commission  float64  `json:"commission,omitempty"`  // trading fees for the trade (negative)
 	Funding     float64  `json:"funding_fee,omitempty"` // funding paid (−) / received (+)
 	NetPnL      float64  `json:"net_pnl,omitempty"`     // PnL + Commission + Funding (true wallet impact)
-	PnLSource   string   `json:"pnl_source,omitempty"`  // "exchange" (reconciled) or "reported" (agent)
+	PnLSource   string   `json:"pnl_source,omitempty"`  // "exchange" (reconciled), "reported" (agent), or "paper"
+	Paper       bool     `json:"paper,omitempty"`       // true when logged in paper-trading mode (PRD-021 §4)
 	Outcome     string   `json:"outcome"`               // WIN / LOSS / FLAT (derived if empty)
 }
 
@@ -207,23 +208,44 @@ func (s *Store) Log(rec TradeRecord) error {
 	return nil
 }
 
+// ConclusiveMinSamples is the number of comparable trades a recall must have for
+// its WIN/LOSS record to be treated as statistically meaningful (PRD-023). Below
+// this, a (likely all-loss) 2-3-trade sample is noise — the Analyst is told not
+// to veto on it, which would otherwise create a losses→never-trade feedback loop.
+const ConclusiveMinSamples = 5
+
 // Similar returns the top-k records most similar to f, highest similarity
 // first. When symbol is non-empty, only records for that symbol are
 // considered. Ties and fewer-than-k cases are handled gracefully.
 func (s *Store) Similar(symbol string, f Features, k int) []Scored {
-	return s.similar(symbol, "", f, k)
+	top, _ := s.similar(symbol, "", f, k)
+	return top
 }
 
 // SimilarByStrategy is Similar restricted to records attributed to the given
 // strategy (PRD-014) — e.g. "how did momentum specifically do in conditions
 // like these?". An empty strategy matches everything (same as Similar).
 func (s *Store) SimilarByStrategy(symbol, strategy string, f Features, k int) []Scored {
-	return s.similar(symbol, strategy, f, k)
+	top, _ := s.similar(symbol, strategy, f, k)
+	return top
+}
+
+// SimilarConclusive returns the top-k similar records AND whether the recall is
+// statistically conclusive — true only when at least ConclusiveMinSamples
+// comparable trades exist for the symbol/strategy filter (PRD-023 R5). The
+// conclusiveness reflects the full candidate pool, not the k-capped slice, so a
+// small k can't make a rich history look thin. recall_trades uses the flag to
+// avoid presenting a thin sample as a veto-worthy result.
+func (s *Store) SimilarConclusive(symbol, strategy string, f Features, k int) ([]Scored, bool) {
+	top, pool := s.similar(symbol, strategy, f, k)
+	return top, pool >= ConclusiveMinSamples
 }
 
 // similar is the shared scoring core. symbol/strategy are optional filters
-// (empty = no filter).
-func (s *Store) similar(symbol, strategy string, f Features, k int) []Scored {
+// (empty = no filter). It returns the top-k scored records and the pool size —
+// the number of records that matched the filters BEFORE the k-cap (used to judge
+// conclusiveness).
+func (s *Store) similar(symbol, strategy string, f Features, k int) (top []Scored, pool int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -238,13 +260,14 @@ func (s *Store) similar(symbol, strategy string, f Features, k int) []Scored {
 		}
 		scored = append(scored, Scored{Record: rec, Similarity: cosine(q, rec.Features.vec())})
 	}
+	pool = len(scored)
 	sort.SliceStable(scored, func(i, j int) bool {
 		return scored[i].Similarity > scored[j].Similarity
 	})
 	if k > 0 && len(scored) > k {
 		scored = scored[:k]
 	}
-	return scored
+	return scored, pool
 }
 
 // OutcomeSummary returns the WIN/LOSS breakdown of the top-k trades most

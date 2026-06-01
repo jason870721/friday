@@ -25,6 +25,12 @@ type Account struct {
 	WalletBalance float64 // total USDT wallet balance
 	MarkPrice     float64 // current mark price for Order.Symbol
 	Leverage      float64 // configured leverage for Order.Symbol (0 = unknown)
+
+	// GroupUsedMargin is the margin (USDT) already committed by OTHER open
+	// positions in the same portfolio group as Order.Symbol (PRD-020 §4). The
+	// caller computes it; PortfolioGroupValidator adds this order's margin and
+	// checks the group cap. 0 when no group applies or no other position is open.
+	GroupUsedMargin float64
 }
 
 // Validator is the middleware contract: given a proposed order and the

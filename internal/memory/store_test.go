@@ -46,6 +46,31 @@ func TestStore_LogPersistsAndReloads(t *testing.T) {
 	}
 }
 
+func TestStore_SimilarConclusive(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "trades.jsonl"))
+	f := Features{RSI: 50, PriceVsMA: 0, Momentum: 0, Funding: 0, Sentiment: 50}
+
+	// 3 comparable trades → inconclusive (< ConclusiveMinSamples).
+	for range 3 {
+		_ = s.Log(TradeRecord{Symbol: "BTCUSDT", Bias: "LONG", PnL: -1, Features: f})
+	}
+	if top, ok := s.SimilarConclusive("BTCUSDT", "", f, 10); ok {
+		t.Errorf("3 matches → conclusive=%v (%d returned); want false", ok, len(top))
+	}
+
+	// Grow to 6 comparable trades → conclusive (≥5), even when k caps the slice.
+	for range 3 {
+		_ = s.Log(TradeRecord{Symbol: "BTCUSDT", Bias: "LONG", PnL: -1, Features: f})
+	}
+	top, ok := s.SimilarConclusive("BTCUSDT", "", f, 3)
+	if !ok {
+		t.Errorf("6 matches → conclusive=false; want true")
+	}
+	if len(top) != 3 {
+		t.Errorf("k=3 should cap the slice at 3, got %d (pool drives conclusiveness, not the slice)", len(top))
+	}
+}
+
 func TestStore_SimilarRanksClosestFirst(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trades.jsonl")
 	s, _ := Open(path)

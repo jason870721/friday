@@ -3,10 +3,13 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/johnny1110/evva/pkg/tools"
+	"github.com/johnny1110/friday/internal/binance"
 )
 
 const BinanceCloseAllToolName tools.ToolName = "binance_close_all"
@@ -45,6 +48,11 @@ func (BinanceCloseAllTool) Execute(ctx context.Context, logger *slog.Logger, _ j
 		return tools.Result{IsError: true, Content: err.Error()}, nil
 	}
 
+	// Paper-trading mode (PRD-021 §4): flatten the virtual book at live marks.
+	if globalPaper != nil {
+		return paperCloseAll(ctx, logger, cli), nil
+	}
+
 	logger.Warn("binance_close_all.dispatch")
 
 	lines, err := cli.CloseAllPositions(ctx)
@@ -52,4 +60,27 @@ func (BinanceCloseAllTool) Execute(ctx context.Context, logger *slog.Logger, _ j
 		return tools.Result{IsError: true, Content: "binance_close_all: " + err.Error()}, nil
 	}
 	return tools.Result{Content: strings.Join(lines, "\n")}, nil
+}
+
+// paperCloseAll flattens every virtual position at its live mark price.
+func paperCloseAll(ctx context.Context, logger *slog.Logger, cli *binance.Client) tools.Result {
+	logger.Warn("binance_close_all.paper")
+	positions := globalPaper.Positions()
+	if len(positions) == 0 {
+		return tools.Result{Content: "PAPER: no virtual positions to close."}
+	}
+	var lines []string
+	for _, p := range positions {
+		mark := p.Entry
+		if mp, err := cli.Price(ctx, p.Symbol); err == nil {
+			if m, _ := strconv.ParseFloat(mp.MarkPrice, 64); m > 0 {
+				mark = m
+			}
+		}
+		realised, _ := globalPaper.CloseAt(p.Symbol, mark)
+		lines = append(lines, fmt.Sprintf("PAPER: closed %s %s size=%g @ ~%.4f → realised %+.4f",
+			p.Symbol, p.Side(), abs(p.Amt), mark, realised))
+	}
+	lines = append(lines, fmt.Sprintf("PAPER: virtual balance now %.2f USDT.", globalPaper.Balance()))
+	return tools.Result{Content: strings.Join(lines, "\n")}
 }

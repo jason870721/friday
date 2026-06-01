@@ -28,7 +28,8 @@ func defaultStrategies() []Strategy {
 		Momentum{},
 		Breakout{},
 		MeanReversion{},
-		EMACross{}, // PRD-013: fourth single-symbol trend vote
+		EMACross{},  // PRD-013: fourth single-symbol trend vote
+		Bollinger{}, // PRD-020 §7: volatility-adaptive mean-reversion + band-walk
 	}
 }
 

@@ -42,7 +42,7 @@ type RecallTradesTool struct{}
 func NewRecallTrades() *RecallTradesTool { return &RecallTradesTool{} }
 
 func (RecallTradesTool) Name() string            { return string(RecallTradesToolName) }
-func (RecallTradesTool) Description() string      { return recallTradesDescription }
+func (RecallTradesTool) Description() string     { return recallTradesDescription }
 func (RecallTradesTool) Schema() json.RawMessage { return json.RawMessage(recallTradesSchema) }
 
 type recallTradesInput struct {
@@ -80,9 +80,11 @@ func (RecallTradesTool) Execute(_ context.Context, logger *slog.Logger, raw json
 	}
 	// PRD-014: an optional strategy filter — "how did momentum specifically do
 	// in conditions like these?". Omitted → all strategies (the original behaviour).
-	matches := store.SimilarByStrategy(in.Symbol, in.Strategy, f, k)
+	// PRD-023: conclusive is false when fewer than ConclusiveMinSamples comparable
+	// trades exist — a thin, likely all-loss sample the Analyst must NOT veto on.
+	matches, conclusive := store.SimilarConclusive(in.Symbol, in.Strategy, f, k)
 
-	logger.Debug("recall_trades.query", "symbol", in.Symbol, "strategy", in.Strategy, "k", k, "hits", len(matches))
+	logger.Debug("recall_trades.query", "symbol", in.Symbol, "strategy", in.Strategy, "k", k, "hits", len(matches), "conclusive", conclusive)
 
 	if len(matches) == 0 {
 		return tools.Result{Content: "No past trades logged yet — trade memory is empty. Decide on this round's data alone."}, nil
@@ -105,6 +107,14 @@ func (RecallTradesTool) Execute(_ context.Context, logger *slog.Logger, raw json
 		}
 		fmt.Fprintf(&b, "- %s %s | %s PnL %+.2f | RSI %.0f, price-vs-MA %+.2f%%, sentiment %.0f | sim %.2f%s | reason: %s\n",
 			r.Symbol, r.Bias, r.Outcome, r.EffectivePnL(), r.Features.RSI, r.Features.PriceVsMA, r.Features.Sentiment, m.Similarity, strat, r.EntryReason)
+	}
+
+	// PRD-023: a thin sample (<5 comparable trades) is not statistically
+	// meaningful — present it as non-informative so the Analyst won't cite an
+	// all-loss 2-3-trade recall to veto a setup (the negative feedback loop).
+	if !conclusive {
+		fmt.Fprintf(&b, "Outcome: insufficient data (<%d similar trades) — do not use this to veto.\n", memory.ConclusiveMinSamples)
+		return tools.Result{Content: strings.TrimRight(b.String(), "\n")}, nil
 	}
 
 	// PRD-014: outcome breakdown across the returned trades, with a per-strategy

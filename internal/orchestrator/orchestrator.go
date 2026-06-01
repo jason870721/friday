@@ -12,6 +12,7 @@ import (
 	"github.com/johnny1110/evva/pkg/event"
 	pkgtools "github.com/johnny1110/evva/pkg/tools"
 
+	"github.com/johnny1110/friday/internal/notify"
 	"github.com/johnny1110/friday/internal/risk"
 	"github.com/johnny1110/friday/internal/tool"
 )
@@ -70,6 +71,26 @@ type Orchestrator struct {
 	emitter  RoleEmitter
 	interval time.Duration
 	breaker  *risk.CircuitBreaker
+
+	// feeBudget surfaces a fee-spend status line in the Risk Manager round
+	// prompt when near the cap (PRD-020 §3). nil → no line. The hard gate lives
+	// in binance_order; this is just awareness.
+	feeBudget *risk.FeeBudget
+
+	// notify-related state (PRD-021 §3). notifier is nil when no external channel
+	// is configured. lastBreakerState dedups breaker alerts so each PAUSED/HALTED
+	// transition fires once, not every round.
+	notifier         notify.Notifier
+	lastBreakerState string
+
+	// paper marks the session as paper-trading (PRD-021 §4) — tagged into the
+	// round log and the session notifications. regimeFor returns a symbol's
+	// latest market regime for the round log (PRD-021 §2); nil → omit regimes.
+	paper     bool
+	regimeFor func(symbol string) string
+
+	// symbolCount/endpoint are captured for the session start/stop notifications.
+	endpoint string
 
 	// recorder appends each round's full pipeline outcome to a JSONL file for
 	// offline analysis (see roundlog.go). nil → round logging disabled.
@@ -154,6 +175,12 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 	carry := strings.TrimSpace(prompt)
 	var lastReport string
+	roundsRun := 0
+
+	// Session start / stop notifications (PRD-021 §3). Stop fires when Run
+	// returns (clean Ctrl+C shutdown is the only way out of the loop).
+	o.notifySessionStart()
+	defer func() { o.notifySessionStop(roundsRun, lastReport) }()
 
 	for round := 1; ; round++ {
 		if ctx.Err() != nil {
@@ -161,6 +188,7 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 		}
 
 		res, err := o.runRound(ctx, round, carry)
+		roundsRun = round
 		if err != nil {
 			if ctx.Err() != nil {
 				return lastReport, nil
@@ -172,6 +200,10 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 				carry = c
 			}
 		}
+
+		// PRD-023 R3: surface the fee-budget status into the carry so BOTH the
+		// Analyst and the Risk Manager see it next round when spend nears the cap.
+		carry = o.carryWithFeeWarning(carry)
 
 		// Periodic full compaction: prevent session bloat across
 		// hundreds of rounds (see compactEvery).
@@ -228,6 +260,8 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	if o.breaker != nil {
 		o.breaker.Observe(decisions.Balance)
 		o.narrate(roleOrch, "Breaker · "+o.breaker.Status())
+		// PRD-021 §3: alert once per PAUSED/HALTED transition (not every round).
+		o.notifyBreakerTransition()
 	}
 
 	// Deterministic short-circuit: no orders to place → skip the Executor.
@@ -263,8 +297,150 @@ func (o *Orchestrator) analystPrompt(round int, carry string) string {
 func (o *Orchestrator) riskPrompt(round int, carry string, r AnalystReport) string {
 	j, _ := json.MarshalIndent(r, "", "  ")
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\nThe Analyst submitted this report:\n%s\n\nCompute caps from the live balance, run the mandatory risk checks on open positions, and call submit_risk_decisions with a decision for each symbol (%s).",
-		round, orFlat(carry), o.breakerLine(), string(j), symbolNames(o.symbols))
+		"Round %d. Previous state: %s%s%s\n\nThe Analyst submitted this report:\n%s\n\nCompute caps from the live balance, run the mandatory risk checks on open positions, and call submit_risk_decisions with a decision for each symbol (%s).",
+		round, orFlat(carry), o.breakerLine(), o.feeBudgetLine(), string(j), symbolNames(o.symbols))
+}
+
+// SetFeeBudget installs the shared fee budget so the Risk Manager round prompt
+// can surface a status line when spend nears the cap (PRD-020 §3).
+func (o *Orchestrator) SetFeeBudget(fb *risk.FeeBudget) { o.feeBudget = fb }
+
+// SetNotifier installs the external notifier for session/breaker events
+// (PRD-021 §3). nil disables orchestrator-side notifications.
+func (o *Orchestrator) SetNotifier(n notify.Notifier) { o.notifier = n }
+
+// SetPaper marks this session as paper-trading (PRD-021 §4) — tagged into the
+// round log and session notifications.
+func (o *Orchestrator) SetPaper(paper bool) { o.paper = paper }
+
+// SetEndpoint records the venue endpoint for the session start notification.
+func (o *Orchestrator) SetEndpoint(endpoint string) { o.endpoint = endpoint }
+
+// SetRegimeSource installs the per-symbol regime lookup used to tag the round
+// log (PRD-021 §2). bootstrap passes tool.RegimeFor.
+func (o *Orchestrator) SetRegimeSource(fn func(symbol string) string) { o.regimeFor = fn }
+
+// notifyf sends a notification when a channel is configured (best-effort).
+func (o *Orchestrator) notifyf(title, body string) {
+	if o.notifier == nil {
+		return
+	}
+	if err := o.notifier.Notify(title, body); err != nil {
+		o.narrate(roleOrch, fmt.Sprintf("notify failed: %v", err))
+	}
+}
+
+// notifySessionStart announces the session (PRD-021 §3): how many symbols, on
+// which endpoint, and whether it is a paper run.
+func (o *Orchestrator) notifySessionStart() {
+	mode := "LIVE"
+	if o.paper {
+		mode = "PAPER"
+	}
+	ep := o.endpoint
+	if ep == "" {
+		ep = "the configured endpoint"
+	}
+	o.notifyf("🚀 Friday started",
+		fmt.Sprintf("%s mode — trading %d symbol(s) (%s) on %s", mode, len(o.symbols), symbolNames(o.symbols), ep))
+}
+
+// notifySessionStop sends a brief summary on clean shutdown (PRD-021 §3).
+func (o *Orchestrator) notifySessionStop(rounds int, lastReport string) {
+	body := fmt.Sprintf("Ran %d round(s).", rounds)
+	if o.breaker != nil {
+		body += " Breaker: " + o.breaker.Status() + "."
+	}
+	if r := strings.TrimSpace(lastReport); r != "" {
+		body += "\nLast: " + truncateLine(r, 300)
+	}
+	o.notifyf("🛑 Friday stopped", body)
+}
+
+// truncateLine caps s at n runes for a notification body.
+func truncateLine(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
+// notifyBreakerTransition fires ONE notification per transition into a
+// PAUSED/HALTED state (PRD-021 §3) — not every round — by tracking the last
+// state word it alerted on.
+func (o *Orchestrator) notifyBreakerTransition() {
+	if o.breaker == nil || o.notifier == nil {
+		return
+	}
+	state := o.breaker.State().String()
+	if state == o.lastBreakerState {
+		return
+	}
+	prev := o.lastBreakerState
+	o.lastBreakerState = state
+	// Only alert on entering a degraded state, or recovering to NORMAL from one.
+	switch state {
+	case "PAUSED", "HALTED":
+		o.notifyf("⚠️ Friday breaker "+state, o.breaker.Status())
+	case "NORMAL":
+		if prev == "PAUSED" || prev == "HALTED" {
+			o.notifyf("✅ Friday breaker recovered", o.breaker.Status())
+		}
+	}
+}
+
+// feeBudgetLine renders the fee-budget status as a prompt fragment, but ONLY
+// when spend is near the cap (≥50%) — otherwise empty, to avoid prompt noise.
+func (o *Orchestrator) feeBudgetLine() string {
+	if o.feeBudget == nil {
+		return ""
+	}
+	if line, near := o.feeBudget.Status(); near {
+		return "\n" + line
+	}
+	return ""
+}
+
+// feeWarningMarker tags the fee-budget warning line in the carry so it can be
+// stripped and refreshed each round (rather than accumulating).
+const feeWarningMarker = "⚠️ Fee budget:"
+
+// carryWithFeeWarning refreshes the fee-budget warning in the threaded carry
+// string (PRD-023 R3): it strips any prior warning, then appends a current one
+// when spend is near the cap (Status().near). Stripping-then-appending keeps the
+// carry from growing a warning line every round.
+func (o *Orchestrator) carryWithFeeWarning(carry string) string {
+	base := stripFeeWarning(carry)
+	if o.feeBudget == nil {
+		return base
+	}
+	line, near := o.feeBudget.Status()
+	if !near {
+		return base
+	}
+	warn := feeWarningMarker + " " + strings.TrimPrefix(line, "fee budget: ")
+	if base == "" {
+		return warn
+	}
+	return base + "\n" + warn
+}
+
+// stripFeeWarning removes any previously-appended fee-budget warning line(s)
+// from a carry string so the warning is refreshed, not duplicated.
+func stripFeeWarning(s string) string {
+	if !strings.Contains(s, feeWarningMarker) {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	kept := lines[:0]
+	for _, ln := range lines {
+		if strings.Contains(ln, feeWarningMarker) {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	return strings.TrimRight(strings.Join(kept, "\n"), "\n")
 }
 
 // breakerLine renders the circuit-breaker status as a prompt fragment, or
