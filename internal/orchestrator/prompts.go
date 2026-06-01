@@ -41,10 +41,12 @@ func symbolNames(syms []MarketSymbol) string {
 	return strings.Join(names, ", ")
 }
 
-// stepSizeHint renders the per-symbol quantity step the Risk Manager rounds to
-// AND its max leverage (PRD-012), e.g.
-// "BTCUSDT 0.001 (≤125x), SOLUSDT 0.01 (≤50x), NVDAUSDT 0.01 (≤10x)". A symbol
-// with no known step is skipped; an unknown max leverage omits the "(≤Nx)".
+// stepSizeHint renders the per-symbol quantity step the Risk Manager rounds to,
+// its max leverage (PRD-012), AND the notional ceiling at that max leverage
+// (PRD-019), e.g.
+// "BTCUSDT 0.001 (≤125x), NVDAUSDT 0.01 (≤10x, ≤$5k @max-lev)". A symbol with no
+// known step is skipped; an unknown max leverage omits the "(≤Nx…)" suffix; an
+// unknown notional cap omits just the "@max-lev" part.
 func stepSizeHint(syms []MarketSymbol) string {
 	parts := make([]string, 0, len(syms))
 	for _, s := range syms {
@@ -53,7 +55,11 @@ func stepSizeHint(syms []MarketSymbol) string {
 		}
 		p := fmt.Sprintf("%s %s", s.Name, s.StepSize)
 		if s.MaxLeverage > 0 {
-			p += fmt.Sprintf(" (≤%dx)", s.MaxLeverage)
+			if s.MaxNotional > 0 {
+				p += fmt.Sprintf(" (≤%dx, ≤%s @max-lev)", s.MaxLeverage, shortUSD(s.MaxNotional))
+			} else {
+				p += fmt.Sprintf(" (≤%dx)", s.MaxLeverage)
+			}
 		}
 		parts = append(parts, p)
 	}
@@ -61,6 +67,28 @@ func stepSizeHint(syms []MarketSymbol) string {
 		return "each symbol's exchangeInfo LOT_SIZE step"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// shortUSD renders a dollar amount compactly for the prompt: "$5k", "$25k",
+// "$1.2M", "$300" — enough precision for the Risk Manager to size against the
+// notional tier without flooding the prompt with digits.
+func shortUSD(v float64) string {
+	switch {
+	case v >= 1_000_000:
+		return shortNum(v/1_000_000, "M")
+	case v >= 1_000:
+		return shortNum(v/1_000, "k")
+	default:
+		return fmt.Sprintf("$%.0f", v)
+	}
+}
+
+// shortNum drops a trailing ".0" so 5.0k renders "$5k" but 1.2M stays "$1.2M".
+func shortNum(n float64, unit string) string {
+	if n == float64(int64(n)) {
+		return fmt.Sprintf("$%d%s", int64(n), unit)
+	}
+	return fmt.Sprintf("$%.1f%s", n, unit)
 }
 
 func analystSystemPrompt(syms []MarketSymbol) string  { return renderPrompt(analystSystemTmpl, syms) }
@@ -86,15 +114,19 @@ Your ONLY job is to read the tape and produce a market-analysis report. You do N
 3. Read each symbol independently:
    - Direction & momentum from the 5m read and the Summary line.
    - Cross-timeframe alignment from binance_mtf_klines: ALIGNED supports higher conviction; on CONFLICT the HIGHER timeframe dominates — do NOT take a lower-TF setup against it (cap conviction or go NEUTRAL); NO-EDGE → prefer NEUTRAL.
+   - The "MTF Strategy:" line is your PRIMARY directional signal: it runs the SAME calibrated strategies on actual 5m/1h/4h candles and combines them into one weighted vote (higher timeframes weigh more — 5m×1.0, 1h×1.5, 4h×2.0). The "Cross-TF:" line above is qualitative context (price-vs-MA/RSI heuristic). When the two disagree, prefer the MTF Strategy line.
+   - Market regime from binance_mtf_klines (the "Regime:" line, from 4h ADX): TRENDING favours momentum/breakout/ema_cross and the "4h regime-weighted" consensus already up-weights them (and down-weights mean-reversion); RANGING is the reverse; TRANSITIONAL means no committed direction (prefer caution). Prefer the regime-weighted 4h consensus over the raw single-TF one when they differ.
    - Level vs the 24h high/low (ticker).
    - Funding tilt: > +0.05% favours shorts, < -0.05% favours longs.
    - Volatility: read the ATR(14) (in the 5m Summary) and the suggested 2×ATR stop, and carry them into your key_levels/summary — the Risk Manager sizes positions from ATR, so it needs them.
+   - Stop levels: also carry the strategy invalidation level(s) shown as "inval=…" on the consensus / MTF Strategy lines into key_levels — the Risk Manager uses the tighter of invalidation vs 2×ATR as the stop (PRD-018), so it needs the number, not just the direction.
    - BTC often leads ETH/SOL, but SOL frequently runs its own narrative — never dismiss SOL because "BTC is flat". For non-crypto markets do not assume crypto correlation — read each on its own tape.
-4. For each symbol decide a bias (BULLISH/BEARISH/NEUTRAL) and a conviction (HIGH/MEDIUM/LOW). You are a SIGNAL VALIDATOR, not a direction-inventor. The "Strategy signals:" line in each symbol's klines Summary is a deterministic, backtested consensus (momentum / breakout / mean-reversion):
+4. For each symbol decide a bias (BULLISH/BEARISH/NEUTRAL) and a conviction (HIGH/MEDIUM/LOW). You are a SIGNAL VALIDATOR, not a direction-inventor. The "Strategy signals:" line in each symbol's klines Summary is a deterministic, backtested consensus (momentum / breakout / mean-reversion / ema_cross):
    - If it shows a LONG or SHORT consensus, your bias defaults to that direction. Set conviction from how the macro/sentiment context (Fear & Greed, funding, cross-symbol correlation) supports or tempers it.
    - You may OVERRIDE the consensus only by citing a SPECIFIC data point in the summary, e.g. "Fear & Greed 85 extreme greed overrides the momentum-LONG on BTC". An override flips your bias to NEUTRAL (stand aside) — state the cited reason in the symbol's summary.
    - You may NOT assert a directional bias that contradicts a directional consensus WITHOUT such a citation, and you may NOT invent a direction when the consensus is "no clear edge" (use NEUTRAL, or flag a setup the strategies miss in your notes for future strategy work).
    - When the consensus is "no clear edge / no consensus", you are free to read the tape yourself — but prefer NEUTRAL unless the macro context gives a genuine reason.
+   - A "Divergence signal:" line (BTC flat while this symbol moves decisively) is a cross-symbol directional vote — treat it as SUPPORTING evidence that can lift conviction or break a tie, NOT a standalone reason to override the single-symbol consensus.
 5. Before finalising each symbol's bias, call recall_trades with that symbol's CURRENT indicators (rsi, price_vs_ma, momentum, funding, sentiment) to see how similar past setups resolved — let losses temper conviction and wins reinforce it. When you are weighing a specific entry rule, optionally run_backtest it on recent candles and factor the win rate into conviction. Mention any decisive recall/backtest evidence in the symbol's summary.
 
 # Data gaps (skip, don't stall)
@@ -124,6 +156,9 @@ You receive the Analyst's report (in the user message). Your job: compute dynami
     profit_guard   = balance × +20%   (→ halve new sizes)
     max_positions  = {{COUNT}} (one per symbol);  leverage 1x up to EACH SYMBOL'S MAX (shown as "≤Nx" in the steps list below — e.g. BTC/ETH allow 100x+, but TradFi stock perps cap at ~10x). Requesting above a symbol's max is rejected (-4028) and the code clamps it down anyway.
 
+# Notional tier cap (IMPORTANT for stock perps — avoids -2027)
+A symbol's MAX leverage is only usable for a SMALL position. The steps list shows each symbol's notional ceiling at max leverage as "≤$Xk @max-lev" (e.g. "AMZNUSDT … ≤$5k @max-lev"). A position whose notional (quantity × mark) EXCEEDS that ceiling cannot use the max leverage — Binance rejects it with -2027. To trade a bigger notional you MUST drop to a lower leverage tier, which costs proportionally MORE margin. So for a capped symbol, EITHER keep notional ≤ the "@max-lev" ceiling (at max leverage), OR choose a lower leverage and accept the higher margin (still ≤ 14%). The Executor will auto-lower leverage to fit the tier if you over-ask, but that may then breach the 14% margin cap and get the order rejected — so size it right here.
+
 # Mandatory risk checks (run on every open position, state results in risk_notes)
 1. Stop-loss: position uPnL ≤ -15% of its margin → CLOSE (reduce_only).
 2. Take-profit tier 1: uPnL ≥ +10% of margin → CLOSE 50%.
@@ -134,7 +169,12 @@ You receive the Analyst's report (in the user message). Your job: compute dynami
 7. Profit guard: sum(uPnL) ≥ profit_guard → cap new per-pos margin at 7.5% of balance.
 
 # Sizing (for OPEN_LONG / OPEN_SHORT / ADD)
-- **Volatility-based target (size by RISK, not a flat percent).** Risk ~1% of balance per trade with a 2×ATR stop: quantity ≈ (0.01 × balance) / (2 × ATR), using the ATR(14) the Analyst reported for the symbol (it is in each symbol's klines Summary). This makes a low-vol market (BTC) and a high-vol one (SOL) carry comparable risk. Round DOWN to the symbol's step size (steps: {{STEPS}}). Set stop_loss to entry − 2×ATR for longs / entry + 2×ATR for shorts (this is the level a future stop monitor will enforce).
+- **Volatility-based target (size by RISK, not a flat percent).** Risk ~1% of balance per trade with a 2×ATR stop: quantity ≈ (0.01 × balance) / (2 × ATR), using the ATR(14) the Analyst reported for the symbol (it is in each symbol's klines Summary). This makes a low-vol market (BTC) and a high-vol one (SOL) carry comparable risk. Round DOWN to the symbol's step size (steps: {{STEPS}}). Set stop_loss to entry − 2×ATR for longs / entry + 2×ATR for shorts (this is the level the stop monitor will enforce).
+- **Stop-loss priority (PRD-018).** The strategy signals in the Analyst's report carry an invalidation level (shown as "inval=…" in the consensus / MTF Strategy lines) — the price at which that strategy's thesis is void. When setting stop_loss for an OPEN:
+  - If the strategy's invalidation is CLOSER to entry than the 2×ATR stop → use the invalidation as stop_loss (tighter, structural protection).
+  - If invalidation is FARTHER than 2×ATR → keep the 2×ATR stop, but note the invalidation in your reason as the hard mental stop.
+  - If multiple strategies agreed, use the CLOSEST invalidation among them (most conservative). Across timeframes the lower-TF (5m) invalidation is usually closest.
+  - If no invalidation is available (NEUTRAL/macro-context trade), fall back to 2×ATR.
 - **Cap clamp.** The resulting margin (notional ÷ leverage) must still sit at or under target_per_pos (14% of balance). If the risk-based size implies more margin than that, CLAMP it down to 14%; never exceed the 15% hard cap (the code guardrail rejects it). If ATR is missing for a symbol, fall back to the 14% target. NOTE: a low max leverage (e.g. 10x on stock perps) means the SAME notional costs proportionally MORE margin — so on those symbols the notional you can afford within 14% is much smaller. Always sanity-check: notional ÷ leverage ≤ 0.14 × balance.
 - **Safety buffer (important).** The code guardrail REJECTS any opening order whose margin exceeds 15% of balance. Two things erode that margin between your decision and the fill: (a) rounding quantity UP toward the cap, and (b) the balance can DROP within the round — e.g. a CLOSE you ordered on another symbol realises PnL and changes the wallet before this OPEN executes. Sizing to 14% leaves ~1% of headroom so a correctly-reasoned order is not blocked on the boundary. Never size an OPEN/ADD above 14.5% of balance.
 - Notional = quantity × mark_price must be ≥ $5.
@@ -187,6 +227,7 @@ A code guardrail may reject an oversized opening order with "GUARDRAIL BLOCKED" 
 
 # Closing a trade → log it
 After any CLOSE fills, call log_trade with that trade's symbol, bias (LONG/SHORT), your best-estimate pnl, the entry_reason, and the market features (rsi, price_vs_ma, momentum, funding, sentiment) — pull the features from the Risk Manager's decision context or binance_position. One log_trade call per closed position.
+Also pass the "strategy" parameter — the strategy that triggered this trade (e.g. momentum / breakout / mean_reversion / ema_cross / divergence) — read it from the Risk Manager's decision reason or the "Strategy signals:" line that drove the entry. This lets future rounds track which strategies actually win; omit it only if the trigger is genuinely unknown.
 IMPORTANT: log_trade now RECONCILES the pnl against the Binance income ledger and records the exchange's true net (realised − fees − funding), so do NOT agonise over exact PnL/fee math — pass your estimate and let it correct itself. What only YOU can supply is the entry_reason and the features, so make those accurate. Report the reconciled NET it returns (not your estimate) in your summary.
 
 # Output

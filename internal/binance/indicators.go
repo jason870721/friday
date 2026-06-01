@@ -35,6 +35,27 @@ func SMA(values []float64, period int) (avg float64, ok bool) {
 	return sum / float64(period), true
 }
 
+// EMA returns the exponential moving average of `values`, weighting recent
+// values more heavily than SMA. It seeds from the SMA of the first `period`
+// values, then applies α = 2/(period+1) smoothing across the remainder. ok is
+// false when there are fewer than `period` values. With exactly `period`
+// values it equals the SMA (no smoothing steps run).
+func EMA(values []float64, period int) (ema float64, ok bool) {
+	if period < 1 || len(values) < period {
+		return 0, false
+	}
+	var seed float64
+	for _, v := range values[:period] {
+		seed += v
+	}
+	ema = seed / float64(period)
+	alpha := 2.0 / (float64(period) + 1)
+	for _, v := range values[period:] {
+		ema = (v-ema)*alpha + ema
+	}
+	return ema, true
+}
+
 // RSI returns Wilder's Relative Strength Index over `closes` for the given
 // period (14 is conventional). It seeds the average gain/loss from the
 // first `period` deltas, then applies Wilder smoothing across the rest.

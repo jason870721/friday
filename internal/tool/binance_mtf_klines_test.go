@@ -9,6 +9,23 @@ import (
 
 func tf(interval, dir string) tfRead { return tfRead{interval: interval, dir: dir} }
 
+func TestRegimeLine(t *testing.T) {
+	// A strong, steady uptrend → high ADX → TRENDING (PRD-016).
+	ks := make([]binance.Kline, 40)
+	for i := range ks {
+		b := 100.0 + float64(i)*2
+		ks[i] = binance.Kline{High: b + 1, Low: b - 1, Close: b + 0.5}
+	}
+	line := regimeLine(ks)
+	if !strings.Contains(line, "Regime: TRENDING") || !strings.Contains(line, "ADX") {
+		t.Errorf("regimeLine = %q; want a TRENDING classification with ADX", line)
+	}
+	// Too few candles for ADX(14) → no regime line.
+	if got := regimeLine(ks[:10]); got != "" {
+		t.Errorf("regimeLine with <29 candles = %q; want empty", got)
+	}
+}
+
 func TestCrossTimeframeVerdict(t *testing.T) {
 	bull, bear, neut := binance.DirectionBullish, binance.DirectionBearish, binance.DirectionNeutral
 

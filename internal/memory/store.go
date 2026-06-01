@@ -58,6 +58,7 @@ type TradeRecord struct {
 	Features    Features `json:"features"`
 	EntryReason string   `json:"entry_reason"`
 	Bias        string   `json:"bias"`                  // LONG / SHORT
+	Strategy    string   `json:"strategy,omitempty"`    // triggering strategy, e.g. "momentum" (PRD-014); "" for pre-PRD-014 records
 	PnL         float64  `json:"pnl"`                   // realised price PnL in USDT
 	Commission  float64  `json:"commission,omitempty"`  // trading fees for the trade (negative)
 	Funding     float64  `json:"funding_fee,omitempty"` // funding paid (−) / received (+)
@@ -66,14 +67,21 @@ type TradeRecord struct {
 	Outcome     string   `json:"outcome"`               // WIN / LOSS / FLAT (derived if empty)
 }
 
+// EffectivePnL is the most authoritative PnL figure: the net wallet impact when
+// reconciled against the exchange (PRD-011), else the raw realised PnL. This is
+// the basis DeriveOutcome and OutcomeStats key off, so WIN/LOSS and the
+// per-strategy stats all reflect the true wallet impact.
+func (r TradeRecord) EffectivePnL() float64 {
+	if r.PnLSource == "exchange" {
+		return r.NetPnL
+	}
+	return r.PnL
+}
+
 // DeriveOutcome sets Outcome from the most authoritative figure available: the
 // net wallet impact when reconciled against the exchange, else the raw PnL.
 func (r *TradeRecord) DeriveOutcome() {
-	basis := r.PnL
-	if r.PnLSource == "exchange" {
-		basis = r.NetPnL
-	}
-	switch {
+	switch basis := r.EffectivePnL(); {
 	case basis > 0:
 		r.Outcome = "WIN"
 	case basis < 0:
@@ -81,6 +89,41 @@ func (r *TradeRecord) DeriveOutcome() {
 	default:
 		r.Outcome = "FLAT"
 	}
+}
+
+// OutcomeStats summarises the WIN/LOSS record of a set of trades (PRD-014).
+// AvgWin is the mean EffectivePnL of the winners (≥0); AvgLoss the mean of the
+// losers (≤0, so it reads as a negative number).
+type OutcomeStats struct {
+	Wins, Losses, Flats int
+	AvgWin, AvgLoss     float64
+}
+
+// OutcomeStatsOf tallies wins/losses/flats and the average win/loss across the
+// given scored trades, keying off each record's EffectivePnL (so the breakdown
+// reflects true wallet impact, consistent with DeriveOutcome — PRD-011/014).
+func OutcomeStatsOf(scored []Scored) OutcomeStats {
+	var st OutcomeStats
+	var winSum, lossSum float64
+	for _, m := range scored {
+		switch p := m.Record.EffectivePnL(); {
+		case p > 0:
+			st.Wins++
+			winSum += p
+		case p < 0:
+			st.Losses++
+			lossSum += p
+		default:
+			st.Flats++
+		}
+	}
+	if st.Wins > 0 {
+		st.AvgWin = winSum / float64(st.Wins)
+	}
+	if st.Losses > 0 {
+		st.AvgLoss = lossSum / float64(st.Losses)
+	}
+	return st
 }
 
 // Scored pairs a record with its similarity to a query (1 = identical
@@ -168,6 +211,19 @@ func (s *Store) Log(rec TradeRecord) error {
 // first. When symbol is non-empty, only records for that symbol are
 // considered. Ties and fewer-than-k cases are handled gracefully.
 func (s *Store) Similar(symbol string, f Features, k int) []Scored {
+	return s.similar(symbol, "", f, k)
+}
+
+// SimilarByStrategy is Similar restricted to records attributed to the given
+// strategy (PRD-014) — e.g. "how did momentum specifically do in conditions
+// like these?". An empty strategy matches everything (same as Similar).
+func (s *Store) SimilarByStrategy(symbol, strategy string, f Features, k int) []Scored {
+	return s.similar(symbol, strategy, f, k)
+}
+
+// similar is the shared scoring core. symbol/strategy are optional filters
+// (empty = no filter).
+func (s *Store) similar(symbol, strategy string, f Features, k int) []Scored {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -175,6 +231,9 @@ func (s *Store) Similar(symbol string, f Features, k int) []Scored {
 	scored := make([]Scored, 0, len(s.records))
 	for _, rec := range s.records {
 		if symbol != "" && rec.Symbol != symbol {
+			continue
+		}
+		if strategy != "" && rec.Strategy != strategy {
 			continue
 		}
 		scored = append(scored, Scored{Record: rec, Similarity: cosine(q, rec.Features.vec())})
@@ -186,6 +245,12 @@ func (s *Store) Similar(symbol string, f Features, k int) []Scored {
 		scored = scored[:k]
 	}
 	return scored
+}
+
+// OutcomeSummary returns the WIN/LOSS breakdown of the top-k trades most
+// similar to f (PRD-014), used by recall_trades to annotate its results.
+func (s *Store) OutcomeSummary(symbol string, f Features, k int) OutcomeStats {
+	return OutcomeStatsOf(s.Similar(symbol, f, k))
 }
 
 func cosine(a, b []float64) float64 {

@@ -59,22 +59,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshTranscript()
 			return m, nil
 		case tea.KeyEnter:
-			prompt := strings.TrimSpace(m.input.Value())
-			if prompt == "" {
+			raw := strings.TrimSpace(m.input.Value())
+			if raw == "" {
 				return m, nil
 			}
-			if m.busy {
-				// Agent is mid-Run — queue the prompt for delivery after
-				// the current Run finishes. We can't inject mid-Run on
-				// evva v0.2.4-alpha.3 (no public UserPromptQueue API),
-				// so the queue drains as a sequence of fresh Runs.
-				m.pendingPrompts = append(m.pendingPrompts, prompt)
-				m.appendLines(styleNotice.Render(
-					fmt.Sprintf("↳ queued (%d): %s", len(m.pendingPrompts), promptPreview(prompt))))
-				m.input.Reset()
-				return m, nil
+			// "/<name>" invokes a skill (see skills.go); "/" or "/help" lists
+			// them. Everything else is a normal prompt.
+			if strings.HasPrefix(raw, "/") {
+				return m.runSkillCommand(raw)
 			}
-			return m.startRun(prompt)
+			return m.submitPrompt(raw)
 		}
 
 	case AgentEventMsg:
@@ -106,6 +100,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.view, viewCmd = m.view.Update(msg)
 	}
 	return m, tea.Batch(inputCmd, viewCmd)
+}
+
+// submitPrompt either starts a fresh Run (when idle) or queues the prompt
+// (when the agent is mid-Run). Shared by normal Enter and skill invocation.
+func (m Model) submitPrompt(prompt string) (tea.Model, tea.Cmd) {
+	if m.busy {
+		// Agent is mid-Run — queue the prompt for delivery after the current
+		// Run finishes. We can't inject mid-Run on evva v0.2.4-alpha.3 (no
+		// public UserPromptQueue API), so the queue drains as fresh Runs.
+		m.pendingPrompts = append(m.pendingPrompts, prompt)
+		m.appendLines(styleNotice.Render(
+			fmt.Sprintf("↳ queued (%d): %s", len(m.pendingPrompts), promptPreview(prompt))))
+		m.input.Reset()
+		return m, nil
+	}
+	return m.startRun(prompt)
+}
+
+// runSkillCommand handles a "/..." input. "/" or "/help" lists the available
+// skills; "/<name>" runs that skill's prompt through the runner (queuing if
+// busy). Unknown or non-runnable skills report and do nothing.
+func (m Model) runSkillCommand(raw string) (tea.Model, tea.Cmd) {
+	name := strings.TrimSpace(strings.TrimPrefix(raw, "/"))
+	m.input.Reset()
+
+	if name == "" || strings.EqualFold(name, "help") {
+		m.appendLines(skillListLines(m.skills)...)
+		return m, nil
+	}
+
+	sk, ok := findSkill(m.skills, name)
+	if !ok {
+		m.appendLines(styleError.Render("! unknown skill: /" + name))
+		m.appendLines(skillListLines(m.skills)...)
+		return m, nil
+	}
+
+	prompt := strings.TrimSpace(sk.Prompt)
+	if prompt == "" {
+		m.appendLines(styleError.Render(
+			"! skill /" + sk.Name + " has no runnable prompt — add a 'prompt:' line to " + sk.Path))
+		return m, nil
+	}
+
+	m.appendLines(styleNotice.Render("↳ skill /" + sk.Name + ": " + promptPreview(prompt)))
+	return m.submitPrompt(prompt)
 }
 
 // startRun kicks off agent.Run() in a goroutine, drops a "> prompt"

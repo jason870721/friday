@@ -20,9 +20,10 @@ package orchestrator
 // then injected into every role prompt and submit schema, so adding or
 // removing a market is a config change (FRIDAY_SYMBOLS), not a code change.
 type MarketSymbol struct {
-	Name        string // e.g. "BTCUSDT"
-	StepSize    string // LOT_SIZE step from exchangeInfo, e.g. "0.001"; may be "" if unknown
-	MaxLeverage int    // max allowed leverage from leverageBracket (PRD-012); 0 = unknown
+	Name        string  // e.g. "BTCUSDT"
+	StepSize    string  // LOT_SIZE step from exchangeInfo, e.g. "0.001"; may be "" if unknown
+	MaxLeverage int     // max allowed leverage from leverageBracket (PRD-012); 0 = unknown
+	MaxNotional float64 // notional ceiling at MaxLeverage — the smallest tier's cap (PRD-019); 0 = unknown
 }
 
 // Bias / conviction enums are kept as plain strings (validated by the

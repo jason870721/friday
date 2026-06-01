@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/johnny1110/friday/internal/binance"
+	"github.com/johnny1110/friday/internal/strategy"
 )
 
 // Indicator selects the signal a Rule's entry condition tests.
@@ -128,6 +129,87 @@ func Run(rule Rule, candles []binance.Kline) (Result, error) {
 	}
 	res.MaxDrawdownPct = maxDD
 	return res, nil
+}
+
+// RunStrategy replays a deterministic strategy.Strategy over a candle series
+// (oldest-first) and reports its signal quality — win rate, avg/total PnL%, max
+// drawdown (PRD-015). Unlike Run (which tests a rule with fixed TP/SL), it uses
+// the STRATEGY'S OWN logic for entries and the strategy's Invalidation level as
+// the exit/stop; a position with no invalidation hit is marked to the last
+// close. Leverage is fixed at 1 — calibration measures raw signal quality, not
+// levered returns. No overlapping trades (re-entry only after the prior exit).
+func RunStrategy(s strategy.Strategy, symbol string, candles []binance.Kline) (Result, error) {
+	if len(candles) == 0 {
+		return Result{}, fmt.Errorf("RunStrategy: no candles")
+	}
+
+	var res Result
+	var cumulative, peak, maxDD float64
+
+	i := 0
+	for i < len(candles) {
+		sig := s.Analyze(symbol, candles[:i+1])
+		if sig.Direction == strategy.Neutral {
+			i++
+			continue
+		}
+
+		entry := candles[i].Close
+		long := sig.Direction == strategy.Long
+		pnlPct, exitIdx := simulateDirectional(candles, i, entry, long, sig.Invalidation)
+		res.Trades++
+		if pnlPct > 0 {
+			res.Wins++
+		}
+		res.TotalReturnPct += pnlPct
+
+		cumulative += pnlPct
+		if cumulative > peak {
+			peak = cumulative
+		}
+		if dd := peak - cumulative; dd > maxDD {
+			maxDD = dd
+		}
+
+		if exitIdx > i {
+			i = exitIdx + 1
+		} else {
+			i++
+		}
+	}
+
+	if res.Trades > 0 {
+		res.WinRate = float64(res.Wins) / float64(res.Trades)
+		res.AvgPnLPct = res.TotalReturnPct / float64(res.Trades)
+	}
+	res.MaxDrawdownPct = maxDD
+	return res, nil
+}
+
+// simulateDirectional exits a position the first candle whose range touches the
+// strategy's Invalidation level (stop), else marks to the last close. PnL% is
+// unlevered (leverage = 1). An invalidation of 0 means "no stop" → always marks
+// to the last close. Mirrors simulateTrade's conservative intrabar assumption.
+func simulateDirectional(candles []binance.Kline, entryIdx int, entry float64, long bool, invalidation float64) (float64, int) {
+	for j := entryIdx + 1; j < len(candles); j++ {
+		if invalidation <= 0 {
+			break
+		}
+		hi, lo := candles[j].High, candles[j].Low
+		if long && lo <= invalidation {
+			return (invalidation - entry) / entry * 100, j
+		}
+		if !long && hi >= invalidation {
+			return (entry - invalidation) / entry * 100, j
+		}
+	}
+
+	last := candles[len(candles)-1].Close
+	move := (last - entry) / entry
+	if !long {
+		move = -move
+	}
+	return move * 100, len(candles) - 1
 }
 
 // simulateTrade returns the leverage-applied PnL% and the candle index the

@@ -8,15 +8,18 @@ import (
 	"sync"
 
 	"github.com/johnny1110/evva/pkg/tools"
+	"github.com/johnny1110/friday/internal/binance"
 )
 
 // maxLeverages holds the per-symbol max leverage (from leverageBracket),
 // installed at startup by SetMaxLeverages. binance_leverage clamps requested
 // leverage to this so an over-cap request can't be rejected with -4028
-// (PRD-012). Empty when unset → no clamp (best-effort).
+// (PRD-012). leverageBrackets holds the full notional→leverage tier table for
+// the per-order notional clamp (PRD-019). Both empty when unset → no clamp.
 var (
-	maxLevMu     sync.RWMutex
-	maxLeverages = map[string]int{}
+	maxLevMu         sync.RWMutex
+	maxLeverages     = map[string]int{}
+	leverageBrackets = map[string][]binance.LeverageBracket{}
 )
 
 // SetMaxLeverages installs the per-symbol leverage caps (called from bootstrap
@@ -27,12 +30,35 @@ func SetMaxLeverages(m map[string]int) {
 	maxLeverages = m
 }
 
+// SetLeverageBrackets installs the per-symbol notional→leverage tier tables
+// (called from bootstrap after the leverageBracket preflight). These let
+// binance_order keep a position's notional inside the tier its leverage allows,
+// so an order can't be rejected with -2027 (PRD-019).
+func SetLeverageBrackets(m map[string][]binance.LeverageBracket) {
+	maxLevMu.Lock()
+	defer maxLevMu.Unlock()
+	leverageBrackets = m
+}
+
 // maxLeverageFor returns the cap for a symbol and whether one is known.
 func maxLeverageFor(symbol string) (int, bool) {
 	maxLevMu.RLock()
 	defer maxLevMu.RUnlock()
 	v, ok := maxLeverages[symbol]
 	return v, ok
+}
+
+// maxLeverageForNotional returns the highest leverage permitted for a position
+// of the given notional on the symbol (the tier its notional falls into), and
+// whether the symbol's bracket table is known.
+func maxLeverageForNotional(symbol string, notional float64) (int, bool) {
+	maxLevMu.RLock()
+	defer maxLevMu.RUnlock()
+	bs, ok := leverageBrackets[symbol]
+	if !ok {
+		return 0, false
+	}
+	return binance.MaxLeverageForNotional(bs, notional)
 }
 
 const BinanceLeverageToolName tools.ToolName = "binance_leverage"

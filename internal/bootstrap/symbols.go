@@ -7,8 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/johnny1110/friday/internal/backtest"
 	"github.com/johnny1110/friday/internal/binance"
 	"github.com/johnny1110/friday/internal/orchestrator"
+	"github.com/johnny1110/friday/internal/strategy"
 	fridaytool "github.com/johnny1110/friday/internal/tool"
 )
 
@@ -83,19 +85,36 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 		out = append(out, orchestrator.MarketSymbol{Name: sym, StepSize: step})
 	}
 
-	// PRD-012: per-symbol max leverage (signed leverageBracket). Attach it to
-	// the symbols (so the Risk Manager prompt shows each "≤Nx") and feed the
-	// binance_leverage clamp, so an over-cap request can't fail with -4028.
+	// PRD-012/019: per-symbol leverage brackets (signed leverageBracket), fetched
+	// once. We derive each symbol's max leverage (shown as "≤Nx" + fed to the
+	// binance_leverage clamp so an over-cap request can't fail with -4028) AND
+	// the full notional→leverage tier table (fed to binance_order so a position's
+	// notional can't exceed the tier its leverage allows — avoids -2027). We also
+	// attach each symbol's max-leverage notional ceiling to the prompt.
 	if os.Getenv("BINANCE_API_KEY") != "" && os.Getenv("BINANCE_SECRET_KEY") != "" {
-		if lev, lerr := cli.MaxLeverages(ctx); lerr != nil {
+		if brackets, lerr := cli.LeverageBrackets(ctx); lerr != nil {
 			fmt.Fprintf(os.Stderr, "friday: leverage preflight failed (%v) — per-symbol caps unknown this session\n", lerr)
 		} else {
-			for i := range out {
-				if mx, ok := lev[out[i].Name]; ok {
-					out[i].MaxLeverage = mx
+			maxLev := make(map[string]int, len(brackets))
+			for sym, bs := range brackets {
+				mx, mxCap := 0, 0.0
+				for _, b := range bs {
+					if b.InitialLeverage > mx {
+						mx, mxCap = b.InitialLeverage, b.NotionalCap
+					}
+				}
+				if mx > 0 {
+					maxLev[sym] = mx
+				}
+				for i := range out {
+					if out[i].Name == sym {
+						out[i].MaxLeverage = mx
+						out[i].MaxNotional = mxCap
+					}
 				}
 			}
-			fridaytool.SetMaxLeverages(lev)
+			fridaytool.SetMaxLeverages(maxLev)
+			fridaytool.SetLeverageBrackets(brackets)
 		}
 	}
 
@@ -115,6 +134,43 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 	}
 	fmt.Fprintf(os.Stderr, "friday: trading %d symbol(s): %s\n", len(out), strings.Join(names, ", "))
 	return out
+}
+
+// calibrateStrategies runs the PRD-015 startup backtest sweep: fetch recent 4h
+// candles for each symbol, replay every strategy, and install the win-rate →
+// confidence map so the strategies vote with their real per-symbol track record
+// for the session. Best-effort — any failure (no candles, network) logs a note
+// and leaves the hardcoded confidences in place; startup always proceeds.
+//
+// klines is a public endpoint, so calibration runs even without trading creds.
+func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
+	cli := binance.New(binanceBaseURL(), os.Getenv("BINANCE_API_KEY"), os.Getenv("BINANCE_SECRET_KEY"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	candles := make(map[string][]binance.Kline, len(symbols))
+	for _, s := range symbols {
+		ks, err := cli.Klines(ctx, s.Name, "4h", 200)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "friday: calibration klines fetch failed for %s (%v) — skipping it\n", s.Name, err)
+			continue
+		}
+		candles[s.Name] = ks
+	}
+	if len(candles) == 0 {
+		fmt.Fprintln(os.Stderr, "friday: strategy calibration skipped (no candles) — using hardcoded confidences")
+		return
+	}
+
+	cal := backtest.Calibrate(strategy.DefaultStrategies(), candles)
+	strategy.SetDefaultCalibration(cal)
+
+	calibrated := 0
+	for _, m := range cal {
+		calibrated += len(m)
+	}
+	fmt.Fprintf(os.Stderr,
+		"friday: calibrated %d strategy×symbol confidence(s) from 4h backtests (the rest fall back to defaults)\n", calibrated)
 }
 
 // signTradFiAgreement signs the TradFi-Perps agreement so stock-perp orders are
