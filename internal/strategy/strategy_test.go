@@ -229,15 +229,15 @@ func TestAggregateMTF(t *testing.T) {
 		t.Errorf("all-LONG → %v %.2f; want LONG >0", c.Direction, c.Confidence)
 	}
 
-	// 5m LONG 0.7 (+0.7), 1h NEUTRAL (0), 4h SHORT 0.6 (−1.2) → net −0.5 → SHORT.
-	// The weighted result follows the 4h, so the veto does NOT fire (PRD-022 R8).
+	// 5m LONG 0.7 (×2.0=+1.4), 1h NEUTRAL, 4h SHORT 0.6 (×0.5=−0.3) → net +1.1 →
+	// LONG, which opposes 4h → veto → NEUTRAL. With new weights 5m dominates.
 	c := AggregateMTF(map[string]Consensus{"5m": long(0.7), "1h": neutral, "4h": short(0.6)})
-	if c.Direction != Short {
-		t.Errorf("5m LONG / 4h SHORT → %v (%s); want SHORT (4h dominates)", c.Direction, c.Summary)
+	if c.Direction != Neutral {
+		t.Errorf("5m LONG / 4h SHORT → %v (%s); want NEUTRAL (4h veto, 5m dominates)", c.Direction, c.Summary)
 	}
 	// Summary carries every TF's contribution in canonical order (the tool prints
 	// it verbatim as the "MTF Strategy:" line).
-	for _, want := range []string{"5m:LONG 0.70", "1h:NEUTRAL", "4h:SHORT 0.60", "weighted SHORT"} {
+	for _, want := range []string{"5m:LONG 0.70", "1h:NEUTRAL", "4h:SHORT 0.60", "4h veto"} {
 		if !strings.Contains(c.Summary, want) {
 			t.Errorf("MTF summary %q missing %q", c.Summary, want)
 		}

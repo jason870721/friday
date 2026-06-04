@@ -113,10 +113,10 @@ func TestAggregateMTF_PRD024Quorum(t *testing.T) {
 		t.Errorf("5m LONG vs 1h SHORT + 4h NEUTRAL → %v (%s); want NEUTRAL", c.Direction, c.Summary)
 	}
 
-	// 4h directional with a lone 5m dissent: the weighted net follows the 4h, so
-	// the veto does NOT fire — a single noisy lower TF doesn't block the trade.
-	if c := AggregateMTF(map[string]Consensus{"5m": long(0.5), "1h": neutral, "4h": short(0.5)}); c.Direction != Short {
-		t.Errorf("5m LONG + 4h SHORT (weighted follows 4h) → %v (%s); want SHORT", c.Direction, c.Summary)
+	// 4h SHORT vs 5m LONG with new weights (5m×2.0, 4h×0.5): 5m dominates
+	// the weighted net → LONG → opposes 4h → veto → NEUTRAL.
+	if c := AggregateMTF(map[string]Consensus{"5m": long(0.5), "1h": neutral, "4h": short(0.5)}); c.Direction != Neutral {
+		t.Errorf("5m LONG + 4h SHORT (5m dominates) → %v (%s); want NEUTRAL (4h veto)", c.Direction, c.Summary)
 	}
 
 	// FRIDAY_MTF_QUORUM=false → no quorum; the override path still resolves the
@@ -165,9 +165,9 @@ func TestAggregateMTF_SignalDetails(t *testing.T) {
 }
 
 func TestAggregateMTF_HysteresisEnv(t *testing.T) {
-	// With a tiny net (0.04) and the default 0.05 band → NEUTRAL; lowering the
-	// band via env to 0.01 lets it through as LONG.
-	mk := map[string]Consensus{"5m": {Direction: Long, Confidence: 0.04, RSI: 50}, "1h": {Direction: Neutral, RSI: 50}}
+	// With a tiny net (0.02 × 5m weight 2.0 = 0.04) and the default 0.05 band → NEUTRAL;
+	// lowering the band via env to 0.01 lets it through as LONG.
+	mk := map[string]Consensus{"5m": {Direction: Long, Confidence: 0.02, RSI: 50}, "1h": {Direction: Neutral, RSI: 50}}
 	if c := AggregateMTF(mk); c.Direction != Neutral {
 		t.Errorf("net 0.04 under default 0.05 band → %v; want NEUTRAL", c.Direction)
 	}
