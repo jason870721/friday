@@ -201,7 +201,9 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 	if !strings.EqualFold(strings.TrimSpace(os.Getenv("FRIDAY_PARALLEL_ANALYST")), "false") {
 		for _, sym := range symbols {
 			cap := &capture{}
-			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}), emitter, 40, analystTools(cap, 1)...)
+			// maxIters 15 (not 40): with the data-complete prompt a per-symbol
+			// agent submits in ~1-2 turns, so 15 is a generous runaway fuse.
+			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}), emitter, 15, analystTools(cap, 1)...)
 			if err != nil {
 				return nil, fmt.Errorf("build analyst %s: %w", sym.Name, err)
 			}
@@ -240,6 +242,11 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 		return nil, fmt.Errorf("build executor: %w", err)
 	}
 
+	// NOTE: in the parallel path `analyst` is nil, so o.analyst / o.analystAg are
+	// nil — the live Analyst agents are in o.analystUnits. Only the fallback
+	// branch of runAnalystStage uses o.analyst, and compactAll nil-guards
+	// o.analystAg, so this is safe; any new code touching o.analystAg must guard
+	// for nil (or iterate o.analystUnits).
 	o.analyst, o.risk, o.executor = analyst, risk, executor
 	o.analystAg, o.riskAg, o.executorAg = analyst, risk, executor
 	return o, nil
