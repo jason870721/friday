@@ -26,7 +26,8 @@ Analyst → Risk Manager → Executor      (one round, every 15s)
   *validates* the deterministic strategy signal (overriding only with a cited
   reason) — it does not invent direction. No trading tools.
 - **Risk Manager** — computes dynamic caps, runs the mandatory risk checks, sizes
-  by ATR volatility (risk ÷ 2×ATR stop, within caps) and sets stops, or vetoes;
+  the quantity by ATR volatility (qty ≈ risk ÷ 2×ATR, within caps) and sets fixed
+  ±15%-of-margin stop-loss / take-profit prices, or vetoes;
   emits `RiskDecisions`. No trading tools.
 - **Executor** — places exactly the Risk Manager's orders, registers stops with
   the SL/TP monitor, logs closed trades; emits `ExecutionResult`.
