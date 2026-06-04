@@ -48,7 +48,7 @@ func main() {
 	feeFlag := flag.Float64("fee", 0.0004, "Taker fee rate per side (round-trip = 2×); 0.0004 = 4 bps")
 	endAgoFlag := flag.Int("end-days-ago", 0, "End the window this many days before now (0 = now); use with -days for an out-of-sample window, e.g. -days 40 -end-days-ago 40")
 	mtfFlag := flag.Bool("mtf", false, "Multi-timeframe mode: walk the 5m entry TF and combine 5m+1h+4h via AggregateMTF (the live signal path); -interval is ignored. Limited to ~5 days (5m 1500-candle cap).")
-	tpMultFlag := flag.Float64("tp-mult", 2.0, "Take-profit distance in ATR multiples (default 2.0 = symmetric 1:1).")
+	tpMultFlag := flag.Float64("tp-mult", 4.0, "Take-profit distance in ATR multiples (default 4.0 = 2:1 reward:risk).")
 	slMultFlag := flag.Float64("sl-mult", 2.0, "Stop-loss distance in ATR multiples (default 2.0).")
 	regimeGateFlag := flag.Bool("regime-gate", false, "Only open when the regime (4h in MTF mode, entry-TF in single) is TRENDING (ADX>25) — suppress RANGING/TRANSITIONAL chop.")
 	tieredFlag := flag.Bool("tiered", false, "Faithful tiered exit (mirrors the live prompt): tier-1 closes -tier1-frac at -tp1×R + moves stop to break-even, tier-2 closes the rest at -tp2×R, with a trailing stop. Overrides the single-TP exit. R = the stop distance.")
