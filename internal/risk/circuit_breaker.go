@@ -1,8 +1,11 @@
 package risk
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
+	"time"
 )
 
 // BreakerState is the session-level health of the trading system.
@@ -61,6 +64,25 @@ type CircuitBreaker struct {
 	state              BreakerState
 	pausedRemaining    int
 	reason             string
+
+	// Persistence (optional): when persistPath is set the breaker survives a
+	// restart WITHIN the same UTC day, so frequent restarts can't reset the
+	// consecutive-loss / daily-loss protection (the live failure mode). day is
+	// the UTC date the current metrics belong to; a restart on a new day starts
+	// fresh (a HALT is latched across the day boundary as a safety backstop).
+	persistPath string
+	day         string
+}
+
+// persistedBreaker is the on-disk snapshot of the breaker's live state.
+type persistedBreaker struct {
+	Day                string  `json:"day"`
+	StartingBalance    float64 `json:"starting_balance"`
+	SessionRealizedPnL float64 `json:"session_realized_pnl"`
+	ConsecutiveLosses  int     `json:"consecutive_losses"`
+	State              int     `json:"state"`
+	PausedRemaining    int     `json:"paused_remaining"`
+	Reason             string  `json:"reason"`
 }
 
 // NewCircuitBreaker builds a breaker. Non-positive config values fall back
@@ -85,6 +107,74 @@ func NewCircuitBreaker(dailyLossPct float64, maxConsec int, drawdownHaltPct floa
 		cooldownCycles:       cooldownCycles,
 		state:                StateNormal,
 	}
+}
+
+// EnablePersistence points the breaker at a JSON file and loads any same-day
+// snapshot from it, so state survives a restart within the trading day. Call
+// once right after construction, before the breaker is used.
+func (cb *CircuitBreaker) EnablePersistence(path string) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.persistPath = path
+	cb.load()
+}
+
+// utcDay is the current UTC calendar date — the key that decides whether a
+// persisted snapshot still applies (same day) or is stale (new day → reset).
+func utcDay() string { return time.Now().UTC().Format("2006-01-02") }
+
+// load restores a same-day snapshot from persistPath. A snapshot from an earlier
+// day is discarded (daily metrics reset) EXCEPT a HALT, which latches across the
+// boundary so an emergency stop isn't silently cleared by a date change. Caller
+// holds the lock.
+func (cb *CircuitBreaker) load() {
+	today := utcDay()
+	cb.day = today
+	data, err := os.ReadFile(cb.persistPath)
+	if err != nil {
+		return
+	}
+	var p persistedBreaker
+	if json.Unmarshal(data, &p) != nil {
+		return
+	}
+	if p.Day != today {
+		if BreakerState(p.State) == StateHalted {
+			cb.state = StateHalted
+			cb.reason = p.Reason
+		}
+		return
+	}
+	cb.startingBalance = p.StartingBalance
+	cb.sessionRealizedPnL = p.SessionRealizedPnL
+	cb.consecutiveLosses = p.ConsecutiveLosses
+	cb.state = BreakerState(p.State)
+	cb.pausedRemaining = p.PausedRemaining
+	cb.reason = p.Reason
+}
+
+// save writes the current state to persistPath (best-effort — a write error must
+// never break trading). Caller holds the lock.
+func (cb *CircuitBreaker) save() {
+	if cb.persistPath == "" {
+		return
+	}
+	if cb.day == "" {
+		cb.day = utcDay()
+	}
+	b, err := json.Marshal(persistedBreaker{
+		Day:                cb.day,
+		StartingBalance:    cb.startingBalance,
+		SessionRealizedPnL: cb.sessionRealizedPnL,
+		ConsecutiveLosses:  cb.consecutiveLosses,
+		State:              int(cb.state),
+		PausedRemaining:    cb.pausedRemaining,
+		Reason:             cb.reason,
+	})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(cb.persistPath, b, 0o644)
 }
 
 // pause moves to StatePaused with a cooldown (unless already Halted, which
@@ -116,6 +206,7 @@ func (cb *CircuitBreaker) RecordTrade(pnl float64) {
 	if cb.consecutiveLosses >= cb.maxConsecutiveLosses {
 		cb.pause(fmt.Sprintf("%d consecutive losses", cb.consecutiveLosses))
 	}
+	cb.save()
 }
 
 // Observe captures the starting balance (first non-zero observation) and
@@ -143,6 +234,7 @@ func (cb *CircuitBreaker) Observe(balance float64) {
 		cb.reason = fmt.Sprintf("drawdown %.1f%% (≥ %.0f%% halt) — balance $%.2f vs start $%.2f",
 			drawdownPct*100, cb.drawdownHaltPct*100, balance, cb.startingBalance)
 	}
+	cb.save()
 }
 
 // Tick advances the cooldown by one round; an expired cooldown returns a
@@ -162,6 +254,7 @@ func (cb *CircuitBreaker) Tick() {
 		cb.reason = ""
 		cb.consecutiveLosses = 0
 	}
+	cb.save()
 }
 
 // Check is called before an OPENING order. It returns a non-nil, actionable
@@ -197,6 +290,7 @@ func (cb *CircuitBreaker) Reset() {
 	cb.reason = ""
 	cb.pausedRemaining = 0
 	cb.consecutiveLosses = 0
+	cb.save()
 }
 
 // Status is a one-line natural-language summary for the agents' prompts.

@@ -122,6 +122,18 @@ type Orchestrator struct {
 	// from the first milestone. Per-instance (not a package global) so sessions
 	// don't share state.
 	lastNeutralNotified int
+
+	// mtfStreak tracks, per symbol, the current run of consecutive rounds the
+	// MTF Strategy has held the same non-NEUTRAL direction (the signal-
+	// persistence gate). Injected into the Analyst prompt so a fresh/flickering
+	// ×1 signal is held back until it confirms (×2+), killing flicker re-entries.
+	mtfStreak map[string]mtfStreakEntry
+}
+
+// mtfStreakEntry is one symbol's MTF-direction persistence run.
+type mtfStreakEntry struct {
+	dir   string // LONG / SHORT / NEUTRAL
+	count int    // consecutive rounds at this non-NEUTRAL direction (0 when NEUTRAL)
 }
 
 // New builds the three role agents (each with a disjoint tool set) and
@@ -264,7 +276,11 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	// candles AND runs the strategy engine). The prompt already contains this
 	// data; the Analyst only needs fast tools (price, funding, recall).
 	mtfData := o.preloadMTF(ctx)
-	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, mtfData)); err != nil {
+	// PRD-024 review fix: update the per-symbol MTF-direction persistence streaks
+	// from this round's data and inject them so the Analyst holds back fresh
+	// (×1) signals until they confirm (the signal-persistence gate).
+	o.updateMTFStreaks(parseMTFDirections(mtfData, o.symbols))
+	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, mtfData, o.persistenceLine())); err != nil {
 		return ExecutionResult{}, fmt.Errorf("analyst run: %w", err)
 	}
 	var report AnalystReport
@@ -326,10 +342,86 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 
 // --- prompt builders (inject upstream handoffs as JSON) ---
 
-func (o *Orchestrator) analystPrompt(round int, carry string, mtfData string) string {
+func (o *Orchestrator) analystPrompt(round int, carry, mtfData, persistence string) string {
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\n--- Pre-loaded MTF data (already fetched — do NOT call binance_mtf_klines) ---\n%s\n--- End MTF data ---\n\nAnalyse %s from the pre-loaded data above, using the other tools (price, ticker, funding, fear_greed_index, position, recall_trades) for supplementary data. Then call submit_analysis with all of them.",
-		round, orFlat(carry), o.breakerLine(), mtfData, symbolNames(o.symbols))
+		"Round %d. Previous state: %s%s\n\n--- Pre-loaded MTF data (already fetched — do NOT call binance_mtf_klines) ---\n%s\n%s\n--- End MTF data ---\n\nAnalyse %s from the pre-loaded data above, using the other tools (price, ticker, funding, fear_greed_index, position, recall_trades) for supplementary data. Then call submit_analysis with all of them.",
+		round, orFlat(carry), o.breakerLine(), mtfData, persistence, symbolNames(o.symbols))
+}
+
+// parseMTFDirections extracts each symbol's current MTF Strategy direction
+// (LONG/SHORT/NEUTRAL) from the pre-loaded MTF text block. Each symbol's section
+// starts with "<SYM> multi-timeframe read:" and carries a "MTF Strategy: <DIR> …"
+// line; a symbol with no such line (data unavailable) is reported NEUTRAL.
+func parseMTFDirections(mtfData string, symbols []MarketSymbol) map[string]string {
+	dirs := make(map[string]string, len(symbols))
+	cur := ""
+	for _, ln := range strings.Split(mtfData, "\n") {
+		if i := strings.Index(ln, " multi-timeframe read:"); i > 0 {
+			cur = strings.TrimSpace(ln[:i])
+			continue
+		}
+		trimmed := strings.TrimSpace(ln)
+		if cur != "" && strings.HasPrefix(trimmed, "MTF Strategy:") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "MTF Strategy:"))
+			switch {
+			case strings.HasPrefix(rest, "LONG"):
+				dirs[cur] = "LONG"
+			case strings.HasPrefix(rest, "SHORT"):
+				dirs[cur] = "SHORT"
+			default:
+				dirs[cur] = "NEUTRAL"
+			}
+			cur = ""
+		}
+	}
+	return dirs
+}
+
+// updateMTFStreaks advances each symbol's MTF-direction persistence run from this
+// round's parsed directions: a held non-NEUTRAL direction increments the count, a
+// flip restarts at 1, and NEUTRAL (or missing data) resets to 0.
+func (o *Orchestrator) updateMTFStreaks(dirs map[string]string) {
+	if o.mtfStreak == nil {
+		o.mtfStreak = make(map[string]mtfStreakEntry, len(o.symbols))
+	}
+	for _, s := range o.symbols {
+		d := dirs[s.Name]
+		if d == "" {
+			d = "NEUTRAL"
+		}
+		st := o.mtfStreak[s.Name]
+		switch {
+		case d == "NEUTRAL":
+			st = mtfStreakEntry{dir: "NEUTRAL", count: 0}
+		case st.dir == d:
+			st.count++
+		default:
+			st = mtfStreakEntry{dir: d, count: 1}
+		}
+		o.mtfStreak[s.Name] = st
+	}
+}
+
+// persistenceLine renders the "Signal persistence:" prompt line the
+// signal-persistence gate reads: one entry per symbol with an ACTIVE directional
+// streak, tagged "confirmed" at ≥2 rounds or "unconfirmed — WAIT" at ×1.
+func (o *Orchestrator) persistenceLine() string {
+	parts := make([]string, 0, len(o.symbols))
+	for _, s := range o.symbols {
+		st := o.mtfStreak[s.Name]
+		if st.count == 0 || st.dir == "" || st.dir == "NEUTRAL" {
+			continue
+		}
+		tag := "unconfirmed — WAIT"
+		if st.count >= 2 {
+			tag = "confirmed"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s ×%d (%s)", s.Name, st.dir, st.count, tag))
+	}
+	if len(parts) == 0 {
+		return "Signal persistence: all symbols NEUTRAL / no active MTF streak this round."
+	}
+	return "Signal persistence: " + strings.Join(parts, "; ")
 }
 
 // preloadMTF fetches the multi-timeframe read for every symbol concurrently in

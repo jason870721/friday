@@ -160,6 +160,10 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 		envFloat("FRIDAY_DRAWDOWN_HALT_PCT", 0.20),
 		envInt("FRIDAY_COOLDOWN_CYCLES", 20),
 	)
+	// Persist breaker state so a restart WITHIN the trading day keeps the
+	// consecutive-loss / daily-loss protection (frequent restarts otherwise reset
+	// it to NORMAL — observed live, 5 consec losses never tripped the pause).
+	breaker.EnablePersistence(filepath.Join(home, ".friday", "memory", "breaker.json"))
 	fridaytool.SetCircuitBreaker(breaker)
 
 	// Resolve the active trading pairs from FRIDAY_SYMBOLS and validate them

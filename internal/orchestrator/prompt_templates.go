@@ -44,17 +44,15 @@ Your ONLY job is to read the tape and produce a market-analysis report. You do N
 
    ## 3b. Mandatory entry gates — when one fails, the bias MUST be NEUTRAL
    - **Regime-aware bias rule (MANDATORY):** When the "Regime:" line shows TRENDING and the 4h price is BELOW its 4h MA20 (a bearish trend):
-     · **When Fear & Greed > 25** (ordinary fear or higher — trend is intact, no capitulation):
+     · **When Fear & Greed > 25** (ordinary fear — trend intact):
        - LONG requires "MTF Strategy:" LONG. Without it, MUST use NEUTRAL.
        - SHORT is permitted with "MTF Strategy: SHORT" or "Cross-TF: ALIGNED BEARISH".
-     · **When Fear & Greed ≤ 25** (extreme or high fear — deep capitulation zone where reversals are violent):
-       - Both LONG and SHORT require MTF Strategy confirmation. Cross-TF alone is NOT enough — in deep fear, a lone Cross-TF signal is a trap (the last 3 live SHORTs all lost money this way).
-       - **Capitulation LONG exception:** when Fear & Greed ≤ 15 AND Cross-TF ALIGNED BULLISH, a LONG bias IS permitted WITHOUT MTF Strategy LONG — extreme fear with aligned price action is the classic contrarian bottom. The MTF Strategy lags; Cross-TF ALIGNED BULLISH + extreme fear is the leading signal.
+     · **When Fear & Greed ≤ 25** (extreme/high fear — violent-reversal zone):
+       - BOTH LONG and SHORT require "MTF Strategy:" confirmation. Cross-TF alone is NOT enough, and there is NO capitulation/contrarian exception — buying a falling knife (or shorting a washout) on F&G + Cross-TF alone lost money on EVERY live attempt. If MTF Strategy is NEUTRAL, you WAIT, no matter how extreme the fear.
      · When the Regime is RANGING or TRANSITIONAL, all biases are permitted as usual.
-     · **Bull-market mirror:** when the 4h price is ABOVE its 4h MA20 (a bullish trend), apply the SAME rules inverted:
-       - When F&G < 75 (normal bull): LONG is permitted with MTF Strategy LONG or Cross-TF ALIGNED BULLISH (the with-trend direction); SHORT requires MTF Strategy SHORT (counter-trend).
-       - When F&G ≥ 75 (extreme greed): both LONG and SHORT require MTF Strategy confirmation — Cross-TF alone is a trap because tops are violent reversals.
-       - When F&G ≥ 85 AND Cross-TF ALIGNED BEARISH: a SHORT bias IS permitted WITHOUT MTF Strategy SHORT — extreme greed with aligned price action is the classic contrarian top, symmetric to the F&G ≤ 15 capitulation LONG rule.
+     · **Bull-market mirror** (4h price ABOVE 4h MA20): with F&G < 75, LONG needs MTF Strategy LONG or Cross-TF ALIGNED BULLISH and SHORT needs MTF Strategy SHORT; with F&G ≥ 75 (extreme greed), BOTH sides require MTF Strategy confirmation (no Cross-TF-only exception — tops reverse violently).
+   - **No-chop entry gate (MANDATORY):** do NOT open a position when price sits ON its MA20 with a neutral RSI — specifically when |price-vs-MA20| < 0.3% AND the 5m RSI is between 45 and 55. With no displacement there is no edge, and a 2×ATR stop sits inside the noise band and gets swept regardless of direction (this was the DOMINANT live loss: entries at price≈MA, immediately stopped out). Require a real pullback or breakout — price clearly displaced from MA20 and RSI out of the 45–55 dead zone — before any directional bias.
+   - **Signal-persistence gate (MANDATORY):** the round prompt carries a "Signal persistence:" line showing, per symbol, how many CONSECUTIVE rounds the MTF Strategy has held the same non-NEUTRAL direction. Only commit to a directional bias when that symbol shows persistence ≥ 2 (marked "confirmed"); a fresh or just-flipped signal (×1, "unconfirmed") → NEUTRAL, wait one more round to confirm. This kills the R2→R3→R4 flicker re-entries that churned fees on signals that never held.
    - **Fee-aware sizing rule (MANDATORY):** every trade must expect a move that clears at least 3× the round-trip taker fee (~0.08% round-trip → a ~0.24% minimum expected move). If the symbol's ATR(14) (as a % of price) or the strategy TP distance is below ~0.24%, the edge can't pay the fees — use NEUTRAL. State the expected-move-to-fee ratio in the symbol's summary (e.g. "ATR 0.6% ≈ 2.5× round-trip fee → tradeable"). Commissions were 45% of live losses, so a thin move is a losing trade even when the direction is right.
 
    ## 3c. Levels to hand the Risk Manager — put the numbers in key_levels
