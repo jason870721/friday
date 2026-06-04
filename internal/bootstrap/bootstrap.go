@@ -163,7 +163,14 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 	// Persist breaker state so a restart WITHIN the trading day keeps the
 	// consecutive-loss / daily-loss protection (frequent restarts otherwise reset
 	// it to NORMAL — observed live, 5 consec losses never tripped the pause).
-	breaker.EnablePersistence(filepath.Join(home, ".friday", "memory", "breaker.json"))
+	// Paper mode uses a SEPARATE file: its virtual wallet ($1000 default) must
+	// never inherit a live/testnet startingBalance, or the drawdown check sees a
+	// huge phantom drop and false-HALTs the session.
+	breakerFile := "breaker.json"
+	if strings.EqualFold(os.Getenv("FRIDAY_PAPER"), "true") {
+		breakerFile = "breaker.paper.json"
+	}
+	breaker.EnablePersistence(filepath.Join(home, ".friday", "memory", breakerFile))
 	fridaytool.SetCircuitBreaker(breaker)
 
 	// Resolve the active trading pairs from FRIDAY_SYMBOLS and validate them
