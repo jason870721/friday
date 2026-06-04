@@ -164,11 +164,22 @@ func (BinanceStopMonitorTool) Execute(ctx context.Context, logger *slog.Logger, 
 		return tools.Result{IsError: true, Content: "binance_stop_monitor: stop monitor is not running (no Binance credentials?)"}, nil
 	}
 
+	// Capture the position's entry price so a monitor-triggered close can ESTIMATE
+	// its PnL (LogStopClose needs entry vs mark). The tool isn't told the entry, so
+	// read it from the just-opened position here — without it event.EntryPrice is
+	// 0 and EVERY monitor close reports +0.00 PnL (a $0 LOSS), which is wrong and
+	// feeds the breaker garbage. Best-effort: a miss leaves entry 0 (old behaviour).
+	entry := 0.0
+	if in.Quantity > 0 && (in.StopPrice > 0 || in.TakeProfitPrice > 0) {
+		entry = stopEntryPrice(ctx, in.Symbol)
+	}
+
 	levels := risk.StopLevels{
 		StopPrice:    in.StopPrice,
 		TakeProfit:   in.TakeProfitPrice,
 		PositionQty:  in.Quantity,
 		PositionSide: in.PositionSide,
+		EntryPrice:   entry,
 	}
 	globalStopMonitor.SetLevels(in.Symbol, levels)
 
@@ -202,6 +213,32 @@ func (BinanceStopMonitorTool) Execute(ctx context.Context, logger *slog.Logger, 
 	return tools.Result{Content: fmt.Sprintf(
 		"Monitoring %s %s qty=%g: stop=%g take_profit=%g. Native exchange orders placed (survive restarts) + the background monitor will close within ~1s of a breach.%s",
 		in.Symbol, in.PositionSide, in.Quantity, in.StopPrice, in.TakeProfitPrice, nativeNote)}, nil
+}
+
+// stopEntryPrice resolves the entry price of the symbol's open position so the
+// StopMonitor can estimate PnL on a triggered close. In paper mode it reads the
+// virtual book; otherwise it queries the exchange position. Best-effort: any
+// miss (no client, no position, parse error) returns 0, and LogStopClose then
+// skips the estimate exactly as before.
+func stopEntryPrice(ctx context.Context, symbol string) float64 {
+	if globalPaper != nil {
+		for _, p := range globalPaper.Positions() {
+			if p.Symbol == symbol {
+				return p.Entry
+			}
+		}
+		return 0
+	}
+	cli, err := sharedBinanceClient()
+	if err != nil {
+		return 0
+	}
+	rows, err := cli.Positions(ctx, symbol)
+	if err != nil || len(rows) == 0 {
+		return 0
+	}
+	entry, _ := strconv.ParseFloat(rows[0].EntryPrice, 64)
+	return entry
 }
 
 // closeSideFor returns the order side that FLATTENS a position of the given

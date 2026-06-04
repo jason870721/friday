@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/johnny1110/friday/internal/memory"
@@ -29,6 +30,44 @@ func HasOpenPositions(ctx context.Context) bool {
 		return true
 	}
 	return len(open) > 0
+}
+
+// OpenPositionsBySymbol returns a ground-truth snapshot of the currently-held
+// positions keyed by symbol (e.g. "SHORT 0.4 @ 880.5000 uPnL +2.30"). The
+// orchestrator injects this authoritative state into the role prompts so the
+// Analyst/Risk Manager stop trusting the LLM-authored carry, which drifts when a
+// position is closed OUT-OF-BAND by the StopMonitor (the carry then keeps
+// asserting a holding that no longer exists). Paper mode reads the virtual book;
+// live mode does one positionRisk call. The bool is false when the real state
+// could NOT be determined (no client / query error) — the caller must then NOT
+// assert "flat" and should fall back to the carry.
+func OpenPositionsBySymbol(ctx context.Context) (map[string]string, bool) {
+	out := map[string]string{}
+	if globalPaper != nil {
+		for _, p := range globalPaper.Positions() {
+			out[p.Symbol] = fmt.Sprintf("%s %g @ %.4f", p.Side(), absf(p.Amt), p.Entry)
+		}
+		return out, true
+	}
+	cli, err := sharedBinanceClient()
+	if err != nil {
+		return nil, false
+	}
+	open, err := cli.OpenPositions(ctx)
+	if err != nil {
+		return nil, false
+	}
+	for _, p := range open {
+		amt, _ := strconv.ParseFloat(p.PositionAmt, 64)
+		dir := "LONG"
+		if amt < 0 {
+			dir = "SHORT"
+		}
+		entry, _ := strconv.ParseFloat(p.EntryPrice, 64)
+		upnl, _ := strconv.ParseFloat(p.UnRealizedProfit, 64)
+		out[p.Symbol] = fmt.Sprintf("%s %g @ %.4f uPnL %+.2f", dir, absf(amt), entry, upnl)
+	}
+	return out, true
 }
 
 // Process-wide pre-trade guards installed by bootstrap (PRD-020). Like

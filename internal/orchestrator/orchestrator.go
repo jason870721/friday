@@ -370,7 +370,14 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	// from this round's data and inject them so the Analyst holds back fresh
 	// (×1) signals until they confirm (the signal-persistence gate).
 	o.updateMTFStreaks(parseMTFDirections(combined, o.symbols))
-	report, err := o.runAnalystStage(ctx, round, carry, fearGreed, perSymbol, combined)
+
+	// Ground-truth position snapshot (fetched in Go) — injected as the
+	// AUTHORITATIVE position state into the Analyst & Risk prompts so they stop
+	// trusting the LLM-authored carry, which drifts when the StopMonitor closes a
+	// position out-of-band (the carry then keeps claiming a holding that is gone).
+	posBySym, posOK := tool.OpenPositionsBySymbol(ctx)
+
+	report, err := o.runAnalystStage(ctx, round, carry, fearGreed, perSymbol, combined, posBySym, posOK)
 	if err != nil {
 		return ExecutionResult{}, err
 	}
@@ -382,14 +389,21 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	// round-trips on the common idle round. Risk still runs whenever a position
 	// is open (it owns the mandatory stop/TP/trailing checks) or any bias is
 	// directional. HasOpenPositions fails safe (true) if the state is unknown.
-	if allNeutralBias(report) && !tool.HasOpenPositions(ctx) {
+	// Reuse the authoritative snapshot for the idle check (avoids a 2nd
+	// positionRisk call). When the snapshot is unreliable (posOK=false), fall back
+	// to HasOpenPositions, which also fails safe (true → never skip risk checks).
+	flat := posOK && len(posBySym) == 0
+	if !posOK {
+		flat = !tool.HasOpenPositions(ctx)
+	}
+	if allNeutralBias(report) && flat {
 		rep := "All symbols NEUTRAL and no open positions — skipped Risk Manager (idle round)."
 		return o.idleRound(report, RiskDecisions{}, carry, rep, round), nil
 	}
 
 	// 2. Risk Manager.
 	o.capRisk.reset()
-	if _, err := o.risk.Run(ctx, o.riskPrompt(round, carry, report)); err != nil {
+	if _, err := o.risk.Run(ctx, o.riskPrompt(round, carry, o.positionsLineAll(posBySym, posOK), report)); err != nil {
 		return ExecutionResult{}, fmt.Errorf("risk run: %w", err)
 	}
 	var decisions RiskDecisions
@@ -436,10 +450,10 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 // it runs one single-symbol agent per market CONCURRENTLY and merges the
 // results (wall-clock = one small DeepSeek call); with no fleet (tests, or
 // FRIDAY_PARALLEL_ANALYST=false) it runs the single multi-symbol analyst.
-func (o *Orchestrator) runAnalystStage(ctx context.Context, round int, carry, fearGreed string, perSymbol map[string]string, combined string) (AnalystReport, error) {
+func (o *Orchestrator) runAnalystStage(ctx context.Context, round int, carry, fearGreed string, perSymbol map[string]string, combined string, posBySym map[string]string, posOK bool) (AnalystReport, error) {
 	if len(o.analystUnits) == 0 {
 		o.capAnalysis.reset()
-		if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, combined, o.persistenceLine())); err != nil {
+		if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, o.positionsLineAll(posBySym, posOK), combined, o.persistenceLine())); err != nil {
 			return AnalystReport{}, fmt.Errorf("analyst run: %w", err)
 		}
 		var report AnalystReport
@@ -463,7 +477,7 @@ func (o *Orchestrator) runAnalystStage(ctx context.Context, round int, carry, fe
 			// one symbol's failure must never fail the round.
 			slots[i].sa = SymbolAnalysis{Symbol: u.symbol, Bias: "NEUTRAL", Conviction: "LOW", Summary: "analyst unavailable this round"}
 			u.cap.reset()
-			prompt := o.analystPromptForSymbol(round, carry, u.symbol, fearGreed, perSymbol[u.symbol])
+			prompt := o.analystPromptForSymbol(round, carry, o.positionLineForSymbol(u.symbol, posBySym, posOK), u.symbol, fearGreed, perSymbol[u.symbol])
 			if _, err := u.run.Run(ctx, prompt); err != nil {
 				return
 			}
@@ -490,22 +504,55 @@ func (o *Orchestrator) runAnalystStage(ctx context.Context, round int, carry, fe
 
 // --- prompt builders (inject upstream handoffs as JSON) ---
 
-func (o *Orchestrator) analystPrompt(round int, carry, marketData, persistence string) string {
+func (o *Orchestrator) analystPrompt(round int, carry, posLine, marketData, persistence string) string {
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\n--- Pre-loaded market data (Fear & Greed + per-symbol MTF block & snapshot, all fetched in Go) ---\n%s\n%s\n--- End pre-loaded data ---\n\nAnalyse %s from the pre-loaded data above — it already has price/24h/funding/sentiment, so you should not need any tool before submit_analysis. Then call submit_analysis with all of them.",
-		round, orFlat(carry), o.breakerLine(), marketData, persistence, symbolNames(o.symbols))
+		"Round %d. Previous state: %s%s%s\n\n--- Pre-loaded market data (Fear & Greed + per-symbol MTF block & snapshot, all fetched in Go) ---\n%s\n%s\n--- End pre-loaded data ---\n\nAnalyse %s from the pre-loaded data above — it already has price/24h/funding/sentiment, so you should not need any tool before submit_analysis. Then call submit_analysis with all of them.",
+		round, orFlat(carry), posLine, o.breakerLine(), marketData, persistence, symbolNames(o.symbols))
 }
 
 // analystPromptForSymbol is the single-symbol prompt for one fleet agent: just
 // that symbol's pre-loaded block + its persistence line + the global Fear & Greed.
-func (o *Orchestrator) analystPromptForSymbol(round int, carry, symbol, fearGreed, symBlock string) string {
+func (o *Orchestrator) analystPromptForSymbol(round int, carry, posLine, symbol, fearGreed, symBlock string) string {
 	persist := o.persistenceFor(symbol)
 	if persist != "" {
 		persist = "\n" + persist
 	}
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\n%s\n\n--- Pre-loaded data for %s (price/24h/funding/MTF, fetched in Go) ---\n%s%s\n--- End ---\n\nAnalyse %s ONLY, from the data above — you should need no tool before submit_analysis. Then call submit_analysis with this ONE symbol.",
-		round, orFlat(carry), o.breakerLine(), fearGreed, symbol, symBlock, persist, symbol)
+		"Round %d. Previous state: %s%s%s\n\n%s\n\n--- Pre-loaded data for %s (price/24h/funding/MTF, fetched in Go) ---\n%s%s\n--- End ---\n\nAnalyse %s ONLY, from the data above — you should need no tool before submit_analysis. Then call submit_analysis with this ONE symbol.",
+		round, orFlat(carry), posLine, o.breakerLine(), fearGreed, symbol, symBlock, persist, symbol)
+}
+
+// positionsLineAll renders an authoritative, exchange-sourced line listing every
+// open position for the multi-symbol Analyst / Risk prompts. It OVERRIDES the
+// LLM-authored carry, which drifts when the StopMonitor closes a position
+// out-of-band (the carry then keeps asserting a holding that is gone). When the
+// real state is unknown (ok=false) it returns "" so the carry stands.
+func (o *Orchestrator) positionsLineAll(posBySym map[string]string, ok bool) string {
+	if !ok {
+		return ""
+	}
+	if len(posBySym) == 0 {
+		return "\nACTUAL open positions (exchange, authoritative — trust this over Previous state): NONE, you are FLAT across all symbols."
+	}
+	var parts []string
+	for _, s := range o.symbols {
+		if p, held := posBySym[s.Name]; held {
+			parts = append(parts, s.Name+" "+p)
+		}
+	}
+	return "\nACTUAL open positions (exchange, authoritative — trust this over Previous state): " + strings.Join(parts, "; ") + "."
+}
+
+// positionLineForSymbol renders the authoritative state for ONE symbol (the
+// per-symbol fleet Analyst). Same override semantics as positionsLineAll.
+func (o *Orchestrator) positionLineForSymbol(symbol string, posBySym map[string]string, ok bool) string {
+	if !ok {
+		return ""
+	}
+	if p, held := posBySym[symbol]; held {
+		return fmt.Sprintf("\nACTUAL %s position (exchange, authoritative — trust this over Previous state): %s.", symbol, p)
+	}
+	return fmt.Sprintf("\nACTUAL %s position (exchange, authoritative — trust this over Previous state): FLAT, you hold NONE of it.", symbol)
 }
 
 // parseMTFDirections extracts each symbol's current MTF Strategy direction
@@ -653,11 +700,11 @@ func combineMarket(fearGreed string, symbols []MarketSymbol, perSymbol map[strin
 	return out.String()
 }
 
-func (o *Orchestrator) riskPrompt(round int, carry string, r AnalystReport) string {
+func (o *Orchestrator) riskPrompt(round int, carry, posLine string, r AnalystReport) string {
 	j, _ := json.MarshalIndent(r, "", "  ")
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s%s\n\nThe Analyst submitted this report:\n%s\n\nCompute caps from the live balance, run the mandatory risk checks on open positions, and call submit_risk_decisions with a decision for each symbol (%s).",
-		round, orFlat(carry), o.breakerLine(), o.feeBudgetLine(), string(j), symbolNames(o.symbols))
+		"Round %d. Previous state: %s%s%s%s\n\nThe Analyst submitted this report:\n%s\n\nCompute caps from the live balance, run the mandatory risk checks on open positions, and call submit_risk_decisions with a decision for each symbol (%s).",
+		round, orFlat(carry), posLine, o.breakerLine(), o.feeBudgetLine(), string(j), symbolNames(o.symbols))
 }
 
 // SetFeeBudget installs the shared fee budget so the Risk Manager round prompt
