@@ -182,7 +182,11 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 	// price/ticker/funding/fee/fear_greed tools are NOT registered — that's the
 	// data-complete-prompt optimisation that cut the Analyst from ~30 tool-call
 	// round-trips to ~1. It keeps only the OPTIONAL tools it occasionally needs.
-	analystTools := func(cap *capture, n int) []agent.Option {
+	// submitName is per-agent: evva dedups custom tools by NAME across agents, so
+	// the parallel fleet MUST use a unique submit tool name per symbol (else all 7
+	// collide on the first agent's capture — 6/7 results lost). The system prompt's
+	// {{SUBMIT}} token is rendered to the same name so the LLM calls the right one.
+	analystTools := func(cap *capture, n int, submitName string) []agent.Option {
 		return []agent.Option{
 			customTool(tool.BinanceKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceKlines() }),
 			customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
@@ -190,31 +194,32 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 			// hypothesis validation (sandbox backtest) when validating a directional bias.
 			customTool(tool.RecallTradesToolName, func() pkgtools.Tool { return tool.NewRecallTrades() }),
 			customTool(tool.RunBacktestToolName, func() pkgtools.Tool { return tool.NewRunBacktest() }),
-			submitOption(submitAnalysisName, submitAnalysisDesc, submitAnalysisSchema(n), cap),
+			submitOption(submitName, submitAnalysisDesc, submitAnalysisSchema(n), cap),
 		}
 	}
 
-	// Parallel analyst — DEFAULT OFF, EXPERIMENTAL/BROKEN. evva's WithCustomTool
-	// dedups custom tools by NAME across agents ("registers the factory once and
-	// reuses it"), so all per-symbol agents sharing the "submit_analysis" name
-	// collide on the FIRST agent's capture — 6 of 7 results are lost and the
-	// survivor is mislabelled. Until each agent gets a UNIQUE submit tool name,
-	// the single multi-symbol analyst (collision-free) is the default. Opt in
-	// with FRIDAY_PARALLEL_ANALYST=true only after that fix lands.
+	// Parallel analyst (DEFAULT ON): one single-symbol agent per market, each with
+	// a UNIQUE submit tool name + its own capture (so evva's by-name tool dedup
+	// can't make the fleet collide), run concurrently each round → wall-clock = one
+	// small DeepSeek call (~19s vs ~31s single / ~141s original). Verified: 7
+	// symbols, 0 fallbacks, correctly-scoped per-symbol output. Set
+	// FRIDAY_PARALLEL_ANALYST=false for the single multi-symbol analyst (also the
+	// path the tests use).
 	var analyst agent.Agent
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("FRIDAY_PARALLEL_ANALYST")), "true") {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("FRIDAY_PARALLEL_ANALYST")), "false") {
 		for _, sym := range symbols {
 			cap := &capture{}
+			submitName := submitAnalysisName + "_" + sym.Name // unique → no evva tool-name collision
 			// maxIters 15 (not 40): with the data-complete prompt a per-symbol
 			// agent submits in ~1-2 turns, so 15 is a generous runaway fuse.
-			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}), emitter, 15, analystModel(), analystEffort(), analystTools(cap, 1)...)
+			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}, submitName), emitter, 15, analystModel(), analystEffort(), analystTools(cap, 1, submitName)...)
 			if err != nil {
 				return nil, fmt.Errorf("build analyst %s: %w", sym.Name, err)
 			}
 			o.analystUnits = append(o.analystUnits, analystUnit{symbol: sym.Name, run: ag, agent: ag, cap: cap})
 		}
 	} else {
-		a, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40, analystModel(), analystEffort(), analystTools(o.capAnalysis, len(symbols))...)
+		a, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols, submitAnalysisName), emitter, 40, analystModel(), analystEffort(), analystTools(o.capAnalysis, len(symbols), submitAnalysisName)...)
 		if err != nil {
 			return nil, fmt.Errorf("build analyst: %w", err)
 		}

@@ -14,7 +14,7 @@ func twoSymbols() []MarketSymbol {
 }
 
 func TestRenderPrompt_SubstitutesTokensAndPreservesPercent(t *testing.T) {
-	got := analystSystemPrompt(twoSymbols())
+	got := analystSystemPrompt(twoSymbols(), submitAnalysisName)
 	if !strings.Contains(got, "BTCUSDT, NVDAUSDT") {
 		t.Errorf("missing rendered symbol list in:\n%s", got)
 	}

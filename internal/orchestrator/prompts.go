@@ -18,19 +18,29 @@ import (
 
 // --- entry points: a finished system prompt per role ---
 
-func analystSystemPrompt(syms []MarketSymbol) string  { return renderPrompt(analystSystemTmpl, syms) }
-func riskSystemPrompt(syms []MarketSymbol) string     { return renderPrompt(riskSystemTmpl, syms) }
-func executorSystemPrompt(syms []MarketSymbol) string { return renderPrompt(executorSystemTmpl, syms) }
+// analystSystemPrompt takes the submit tool's NAME so the parallel fleet can
+// give each per-symbol agent a UNIQUE submit tool (e.g. submit_analysis_BTCUSDT)
+// — evva dedups custom tools by name across agents, so a shared name would make
+// the whole fleet collide on one capture. The single-agent path passes
+// submitAnalysisName.
+func analystSystemPrompt(syms []MarketSymbol, submitName string) string {
+	return renderPrompt(analystSystemTmpl, syms, submitName)
+}
+func riskSystemPrompt(syms []MarketSymbol) string     { return renderPrompt(riskSystemTmpl, syms, submitRiskName) }
+func executorSystemPrompt(syms []MarketSymbol) string { return renderPrompt(executorSystemTmpl, syms, submitExecName) }
 
 // renderPrompt substitutes the per-session tokens in a prompt template. A
 // string replacer (not fmt) is used because the prompts are dense with literal
 // '%' signs (15%, RSI zones, funding thresholds) that fmt would misread.
-func renderPrompt(tmpl string, syms []MarketSymbol) string {
+// {{SUBMIT}} is the role's submit tool name (only the Analyst template uses it;
+// a no-op for the risk/exec templates, which name their submit tools inline).
+func renderPrompt(tmpl string, syms []MarketSymbol, submitName string) string {
 	return strings.NewReplacer(
 		"{{SYMBOLS}}", symbolNames(syms),
 		"{{COUNT}}", strconv.Itoa(len(syms)),
 		"{{STEPS}}", stepSizeHint(syms),
 		"{{GROUPS}}", portfolioGroupsHint(),
+		"{{SUBMIT}}", submitName,
 	).Replace(tmpl)
 }
 
