@@ -74,6 +74,9 @@ FRIDAY_RECALIBRATE_HOURS=4
 # Paper trading: no real orders — a virtual book trades against live market data.
 # FRIDAY_PAPER=true
 # FRIDAY_PAPER_BALANCE=1000
+# Analyst speed: run one per-symbol Analyst agent concurrently each round (default
+# on, ~2.5× faster than one big multi-symbol call). Set false for a single agent.
+FRIDAY_PARALLEL_ANALYST=true
 # External notifications (significant events only): configure either/both.
 # FRIDAY_DISCORD_WEBHOOK_URL=
 # FRIDAY_TELEGRAM_BOT_TOKEN=

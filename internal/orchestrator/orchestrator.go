@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/johnny1110/evva/pkg/agent"
@@ -52,10 +54,26 @@ type agentRunner interface {
 // fixed cadence, threading typed handoff structs between the three agents
 // and one carry-state line between rounds. It owns the loop — Run blocks
 // until the context is cancelled (Ctrl+C in the TUI).
+// analystUnit is one per-symbol Analyst agent + its structured-output capture,
+// used by the parallel-analyst path: N of these run concurrently each round,
+// each analysing a single symbol over a small prompt, so the stage's wall-clock
+// is one small DeepSeek call instead of one big 7-symbol call.
+type analystUnit struct {
+	symbol string
+	run    agentRunner
+	agent  agent.Agent
+	cap    *capture
+}
+
 type Orchestrator struct {
 	analyst  agentRunner
 	risk     agentRunner
 	executor agentRunner
+
+	// analystUnits is the per-symbol Analyst fleet (parallel path). When
+	// non-empty, runAnalystStage fans out over it; when empty (tests, or
+	// FRIDAY_PARALLEL_ANALYST=false), it falls back to the single `analyst`.
+	analystUnits []analystUnit
 
 	// Full agent references for lifecycle operations (compact, etc.).
 	// agentRunner is the narrow interface for Run() so tests can inject
@@ -163,17 +181,38 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 	// price/ticker/funding/fee/fear_greed tools are NOT registered — that's the
 	// data-complete-prompt optimisation that cut the Analyst from ~30 tool-call
 	// round-trips to ~1. It keeps only the OPTIONAL tools it occasionally needs.
-	analyst, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40,
-		customTool(tool.BinanceKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceKlines() }),
-		customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
-		// PRD-004: self-reflection (recall similar past trades) and
-		// hypothesis validation (sandbox backtest) when validating a directional bias.
-		customTool(tool.RecallTradesToolName, func() pkgtools.Tool { return tool.NewRecallTrades() }),
-		customTool(tool.RunBacktestToolName, func() pkgtools.Tool { return tool.NewRunBacktest() }),
-		submitOption(submitAnalysisName, submitAnalysisDesc, submitAnalysisSchema(len(symbols)), o.capAnalysis),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("build analyst: %w", err)
+	analystTools := func(cap *capture, n int) []agent.Option {
+		return []agent.Option{
+			customTool(tool.BinanceKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceKlines() }),
+			customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
+			// PRD-004: self-reflection (recall similar past trades) and
+			// hypothesis validation (sandbox backtest) when validating a directional bias.
+			customTool(tool.RecallTradesToolName, func() pkgtools.Tool { return tool.NewRecallTrades() }),
+			customTool(tool.RunBacktestToolName, func() pkgtools.Tool { return tool.NewRunBacktest() }),
+			submitOption(submitAnalysisName, submitAnalysisDesc, submitAnalysisSchema(n), cap),
+		}
+	}
+
+	// Parallel analyst (default): build one single-symbol agent per market so the
+	// stage fans out concurrently each round (wall-clock = one small DeepSeek call
+	// instead of one big 7-symbol call). FRIDAY_PARALLEL_ANALYST=false falls back
+	// to a single multi-symbol analyst.
+	var analyst agent.Agent
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("FRIDAY_PARALLEL_ANALYST")), "false") {
+		for _, sym := range symbols {
+			cap := &capture{}
+			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}), emitter, 40, analystTools(cap, 1)...)
+			if err != nil {
+				return nil, fmt.Errorf("build analyst %s: %w", sym.Name, err)
+			}
+			o.analystUnits = append(o.analystUnits, analystUnit{symbol: sym.Name, run: ag, agent: ag, cap: cap})
+		}
+	} else {
+		a, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40, analystTools(o.capAnalysis, len(symbols))...)
+		if err != nil {
+			return nil, fmt.Errorf("build analyst: %w", err)
+		}
+		analyst = a
 	}
 
 	risk, err := buildAgent(cfg, "friday-risk", roleRisk, riskSystemPrompt(symbols), emitter, 30,
@@ -286,24 +325,18 @@ func (o *Orchestrator) SetInterval(d time.Duration) { o.interval = d }
 func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (ExecutionResult, error) {
 	o.narrate(roleOrch, fmt.Sprintf("──────── Round %d ────────", round))
 
-	// 1. Analyst.
-	o.capAnalysis.reset()
-
-	// Preload ALL read-only market data in Go (Fear & Greed + per-symbol MTF +
-	// price/24h/funding snapshot) so the Analyst reads it from the prompt and
-	// makes ~1 LLM call instead of ~30 tool-call round-trips (mtf/price/ticker/
-	// funding/F&G were the Analyst-stage latency bottleneck).
-	marketData := o.preloadMarketData(ctx)
+	// 1. Analyst. Preload ALL read-only market data in Go (Fear & Greed +
+	// per-symbol MTF + price/24h/funding snapshot) so each Analyst call reads it
+	// from the prompt instead of spending ~30 tool-call round-trips.
+	fearGreed, perSymbol := o.preloadMarketData(ctx)
+	combined := combineMarket(fearGreed, o.symbols, perSymbol)
 	// PRD-024 review fix: update the per-symbol MTF-direction persistence streaks
 	// from this round's data and inject them so the Analyst holds back fresh
 	// (×1) signals until they confirm (the signal-persistence gate).
-	o.updateMTFStreaks(parseMTFDirections(marketData, o.symbols))
-	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, marketData, o.persistenceLine())); err != nil {
-		return ExecutionResult{}, fmt.Errorf("analyst run: %w", err)
-	}
-	var report AnalystReport
-	if err := o.capAnalysis.into(&report); err != nil {
-		return ExecutionResult{}, fmt.Errorf("analyst output: %w", err)
+	o.updateMTFStreaks(parseMTFDirections(combined, o.symbols))
+	report, err := o.runAnalystStage(ctx, round, carry, fearGreed, perSymbol, combined)
+	if err != nil {
+		return ExecutionResult{}, err
 	}
 	o.narrate(roleOrch, "Analyst → Risk Manager · "+summariseReport(report))
 
@@ -363,12 +396,80 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	return execRes, nil
 }
 
+// runAnalystStage produces the round's AnalystReport. With the per-symbol fleet
+// it runs one single-symbol agent per market CONCURRENTLY and merges the
+// results (wall-clock = one small DeepSeek call); with no fleet (tests, or
+// FRIDAY_PARALLEL_ANALYST=false) it runs the single multi-symbol analyst.
+func (o *Orchestrator) runAnalystStage(ctx context.Context, round int, carry, fearGreed string, perSymbol map[string]string, combined string) (AnalystReport, error) {
+	if len(o.analystUnits) == 0 {
+		o.capAnalysis.reset()
+		if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, combined, o.persistenceLine())); err != nil {
+			return AnalystReport{}, fmt.Errorf("analyst run: %w", err)
+		}
+		var report AnalystReport
+		if err := o.capAnalysis.into(&report); err != nil {
+			return AnalystReport{}, fmt.Errorf("analyst output: %w", err)
+		}
+		return report, nil
+	}
+
+	type slot struct {
+		sa        SymbolAnalysis
+		sentiment string
+	}
+	slots := make([]slot, len(o.analystUnits))
+	var wg sync.WaitGroup
+	for i, u := range o.analystUnits {
+		wg.Add(1)
+		go func(i int, u analystUnit) {
+			defer wg.Done()
+			// Default: NEUTRAL fallback if the agent errors or submits nothing —
+			// one symbol's failure must never fail the round.
+			slots[i].sa = SymbolAnalysis{Symbol: u.symbol, Bias: "NEUTRAL", Conviction: "LOW", Summary: "analyst unavailable this round"}
+			u.cap.reset()
+			prompt := o.analystPromptForSymbol(round, carry, u.symbol, fearGreed, perSymbol[u.symbol])
+			if _, err := u.run.Run(ctx, prompt); err != nil {
+				return
+			}
+			var rep AnalystReport
+			if err := u.cap.into(&rep); err != nil || len(rep.Symbols) == 0 {
+				return
+			}
+			sa := rep.Symbols[0]
+			sa.Symbol = u.symbol // pin the symbol — guard against the LLM renaming it
+			slots[i] = slot{sa: sa, sentiment: rep.Sentiment}
+		}(i, u)
+	}
+	wg.Wait()
+
+	report := AnalystReport{Symbols: make([]SymbolAnalysis, len(slots))}
+	for i, s := range slots {
+		report.Symbols[i] = s.sa
+		if report.Sentiment == "" && s.sentiment != "" {
+			report.Sentiment = s.sentiment
+		}
+	}
+	return report, nil
+}
+
 // --- prompt builders (inject upstream handoffs as JSON) ---
 
 func (o *Orchestrator) analystPrompt(round int, carry, marketData, persistence string) string {
 	return fmt.Sprintf(
 		"Round %d. Previous state: %s%s\n\n--- Pre-loaded market data (Fear & Greed + per-symbol MTF block & snapshot, all fetched in Go) ---\n%s\n%s\n--- End pre-loaded data ---\n\nAnalyse %s from the pre-loaded data above — it already has price/24h/funding/sentiment, so you should not need any tool before submit_analysis. Then call submit_analysis with all of them.",
 		round, orFlat(carry), o.breakerLine(), marketData, persistence, symbolNames(o.symbols))
+}
+
+// analystPromptForSymbol is the single-symbol prompt for one fleet agent: just
+// that symbol's pre-loaded block + its persistence line + the global Fear & Greed.
+func (o *Orchestrator) analystPromptForSymbol(round int, carry, symbol, fearGreed, symBlock string) string {
+	persist := o.persistenceFor(symbol)
+	if persist != "" {
+		persist = "\n" + persist
+	}
+	return fmt.Sprintf(
+		"Round %d. Previous state: %s%s\n\n%s\n\n--- Pre-loaded data for %s (price/24h/funding/MTF, fetched in Go) ---\n%s%s\n--- End ---\n\nAnalyse %s ONLY, from the data above — you should need no tool before submit_analysis. Then call submit_analysis with this ONE symbol.",
+		round, orFlat(carry), o.breakerLine(), fearGreed, symbol, symBlock, persist, symbol)
 }
 
 // parseMTFDirections extracts each symbol's current MTF Strategy direction
@@ -454,20 +555,35 @@ func (o *Orchestrator) persistenceLine() string {
 	return "Signal persistence: " + strings.Join(parts, "; ")
 }
 
+// persistenceFor renders the single-symbol "Signal persistence:" line for the
+// parallel path, or "" when that symbol has no active directional streak.
+func (o *Orchestrator) persistenceFor(symbol string) string {
+	st := o.mtfStreak[symbol]
+	if st.count == 0 || st.dir == "" || st.dir == "NEUTRAL" {
+		return ""
+	}
+	tag := "unconfirmed — WAIT"
+	if st.count >= 2 {
+		tag = "confirmed"
+	}
+	return fmt.Sprintf("Signal persistence: %s %s ×%d (%s)", symbol, st.dir, st.count, tag)
+}
+
 // preloadMarketData fetches, in Go before the Analyst runs, ALL the read-only
 // data the Analyst needs: the market-wide Fear & Greed line, and per symbol the
 // multi-timeframe read PLUS a price/24h/funding snapshot. Injected into the
 // Analyst prompt so the Analyst makes ~1 LLM call (read → submit) instead of the
 // ~30 tool-call round-trips it used to spend on mtf/price/ticker/funding/F&G.
-// Symbols are fetched concurrently; results are assembled in stable order.
-func (o *Orchestrator) preloadMarketData(ctx context.Context) string {
+// Returns the F&G line and a per-symbol block map (so the parallel analyst can
+// give each symbol only its own data); symbols are fetched concurrently.
+func (o *Orchestrator) preloadMarketData(ctx context.Context) (fearGreed string, perSymbol map[string]string) {
 	type result struct {
-		idx  int
-		text string
+		symbol string
+		text   string
 	}
 	ch := make(chan result, len(o.symbols))
-	for i, sym := range o.symbols {
-		go func(i int, s string) {
+	for _, sym := range o.symbols {
+		go func(s string) {
 			var b strings.Builder
 			if mtf, err := tool.FetchMTF(ctx, s); err != nil {
 				fmt.Fprintf(&b, "[%s] MTF data unavailable: %v\n", s, err)
@@ -476,19 +592,28 @@ func (o *Orchestrator) preloadMarketData(ctx context.Context) string {
 				b.WriteString(tool.FetchSnapshot(ctx, s))
 				b.WriteString("\n")
 			}
-			ch <- result{i, b.String()}
-		}(i, sym.Name)
+			ch <- result{s, b.String()}
+		}(sym.Name)
 	}
-	blocks := make([]string, len(o.symbols))
+	perSymbol = make(map[string]string, len(o.symbols))
 	for range o.symbols {
 		r := <-ch
-		blocks[r.idx] = r.text
+		perSymbol[r.symbol] = r.text
 	}
+	return tool.FetchFearGreed(ctx), perSymbol
+}
 
+// combineMarket joins the F&G line and per-symbol blocks (in stable symbol
+// order) into the single combined block used by the single-agent path and by
+// parseMTFDirections.
+func combineMarket(fearGreed string, symbols []MarketSymbol, perSymbol map[string]string) string {
 	var out strings.Builder
-	out.WriteString(tool.FetchFearGreed(ctx))
+	out.WriteString(fearGreed)
 	out.WriteString("\n\n")
-	out.WriteString(strings.Join(blocks, "\n"))
+	for _, s := range symbols {
+		out.WriteString(perSymbol[s.Name])
+		out.WriteString("\n")
+	}
 	return out.String()
 }
 
@@ -824,7 +949,11 @@ func (o *Orchestrator) narrate(role, msg string) {
 // Failures are logged but non-fatal — the next round will retry.
 func (o *Orchestrator) compactAll(ctx context.Context) {
 	o.narrate(roleOrch, "Compacting agent sessions (full) …")
-	for _, ag := range []agent.Agent{o.analystAg, o.riskAg, o.executorAg} {
+	agents := []agent.Agent{o.analystAg, o.riskAg, o.executorAg}
+	for _, u := range o.analystUnits { // parallel fleet (analystAg is nil then)
+		agents = append(agents, u.agent)
+	}
+	for _, ag := range agents {
 		if ag == nil {
 			continue
 		}
