@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -25,6 +26,7 @@ func main() {
 	balanceFlag := flag.Float64("balance", 5000, "Starting balance in USDT")
 	leverageFlag := flag.Int("leverage", 100, "Leverage")
 	riskFlag := flag.Float64("risk", 0.01, "Risk per trade as fraction of balance")
+	feeFlag := flag.Float64("fee", 0.0004, "Taker fee rate per side (round-trip = 2×); 0.0004 = 4 bps")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -54,20 +56,27 @@ func main() {
 	fmt.Printf("balance:  $%.0f\n", *balanceFlag)
 	fmt.Printf("leverage: %dx\n", *leverageFlag)
 	fmt.Printf("risk:     %.0f%% per trade\n", *riskFlag*100)
+	fmt.Printf("fee:      %.2f bps/side (%.2f bps round-trip)\n", *feeFlag*1e4, *feeFlag*2*1e4)
 	fmt.Println()
 
-	// Fetch klines.
+	// Fetch klines. Binance returns up to 1500 candles per request.
+	// For 5m that's ~5 days, 15m ~15 days, 1h ~62 days, 4h ~250 days.
 	endTime := time.Now()
 	startTime := endTime.Add(-time.Duration(days) * 24 * time.Hour)
 	limit := days * 24 * 60 / candleMinutes(interval)
 	if limit > 1500 {
-		limit = 1500 // Binance max
+		limit = 1500
+	}
+	maxDays := 1500 * candleMinutes(interval) / 60 / 24
+	if days > maxDays {
+		fmt.Printf("Note: %s interval maxes out at ~%d days with 1500 candles. Fetching %d candles.\n",
+			interval, maxDays, limit)
 	}
 
 	type symData struct {
-		symbol  string
-		klines  []binance.Kline
-		err     error
+		symbol string
+		klines []binance.Kline
+		err    error
 	}
 	results := make([]symData, len(symbols))
 	fmt.Printf("Fetching %s klines (%d candles, %s → %s)...\n", interval, limit,
@@ -84,7 +93,7 @@ func main() {
 	fmt.Println()
 
 	// Run the backtest.
-	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag)
+	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag)
 	for i, sd := range results {
 		if sd.err != nil {
 			continue
@@ -146,22 +155,49 @@ type trade struct {
 }
 
 type backtestEngine struct {
-	balance   float64
-	leverage  int
-	riskPct   float64
-	positions map[string]*position
-	trades    []trade
-	equityCurve []float64
+	balance      float64
+	startBalance float64
+	leverage     int
+	riskPct      float64
+	feeRate      float64 // taker rate per side; round-trip = 2×
+	positions    map[string]*position
+	trades       []trade
+	equityCurve  []float64
 }
 
-func newBacktest(balance float64, leverage int, riskPct float64) *backtestEngine {
+func newBacktest(balance float64, leverage int, riskPct, feeRate float64) *backtestEngine {
 	return &backtestEngine{
-		balance:    balance,
-		leverage:   leverage,
-		riskPct:    riskPct,
-		positions:  make(map[string]*position),
-		equityCurve: []float64{balance},
+		balance:      balance,
+		startBalance: balance,
+		leverage:     leverage,
+		riskPct:      riskPct,
+		feeRate:      feeRate,
+		positions:    make(map[string]*position),
+		equityCurve:  []float64{balance},
 	}
+}
+
+// closePosition books a position at exitPrice, deducting the round-trip taker
+// fee (entry side + exit side) so the simulated PnL is NET — matching how
+// friday's exchange-reconciled accounting works. Without this the backtest is
+// systematically optimistic (commissions were ~45% of live losses). Returns the
+// net PnL and records the trade.
+func (bt *backtestEngine) closePosition(pos *position, exitPrice float64, reason string) float64 {
+	gross := posPnL(pos, exitPrice)
+	fee := bt.feeRate * pos.qty * (pos.entryPrice + exitPrice) // taker on both legs
+	pnl := gross - fee
+	bt.balance += pnl
+	bt.equityCurve = append(bt.equityCurve, bt.balance)
+	bt.trades = append(bt.trades, trade{
+		symbol:    pos.symbol,
+		direction: pos.direction,
+		entry:     pos.entryPrice,
+		exit:      exitPrice,
+		pnl:       pnl,
+		reason:    reason,
+	})
+	delete(bt.positions, pos.symbol)
+	return pnl
 }
 
 func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binance.Kline, symbolIdx int) {
@@ -210,22 +246,12 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 			}
 
 			if closed {
-				pnl := posPnL(pos, exitPrice)
-				bt.balance += pnl
+				pnl := bt.closePosition(pos, exitPrice, reason)
 				totalPnL += pnl
 				trades++
 				if pnl > 0 {
 					wins++
 				}
-				bt.trades = append(bt.trades, trade{
-					symbol:    symbol,
-					direction: pos.direction,
-					entry:     pos.entryPrice,
-					exit:      exitPrice,
-					pnl:       pnl,
-					reason:    reason,
-				})
-				delete(bt.positions, symbol)
 				continue
 			}
 		}
@@ -302,22 +328,12 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 	// Close any remaining position at the last price.
 	if pos, ok := bt.positions[symbol]; ok {
 		lastPrice := klines[len(klines)-1].Close
-		pnl := posPnL(pos, lastPrice)
-		bt.balance += pnl
+		pnl := bt.closePosition(pos, lastPrice, "end-of-data")
 		totalPnL += pnl
 		trades++
 		if pnl > 0 {
 			wins++
 		}
-		bt.trades = append(bt.trades, trade{
-			symbol:    symbol,
-			direction: pos.direction,
-			entry:     pos.entryPrice,
-			exit:      lastPrice,
-			pnl:       pnl,
-			reason:    "end-of-data",
-		})
-		delete(bt.positions, symbol)
 	}
 
 	winRate := 0.0
@@ -345,32 +361,78 @@ func (bt *backtestEngine) report() {
 		winRate = float64(wins) / float64(len(bt.trades)) * 100
 	}
 
+	totalReturn := 0.0
+	if bt.startBalance > 0 {
+		totalReturn = (bt.balance/bt.startBalance - 1) * 100
+	}
 	fmt.Printf("Trades:  %d (%d wins, %.0f%%)\n", len(bt.trades), wins, winRate)
-	fmt.Printf("Net PnL: %+.2f USDT\n", totalPnL)
+	fmt.Printf("Net PnL: %+.2f USDT (%+.2f%% return, fees deducted)\n", totalPnL, totalReturn)
 	if len(bt.trades) > 0 {
-		avgWin := 0.0
-		avgLoss := 0.0
+		var grossWin, grossLoss float64
 		winsCount := 0
 		lossesCount := 0
+		maxConsecLoss, consec := 0, 0
+		var returns []float64
 		for _, t := range bt.trades {
 			if t.pnl > 0 {
-				avgWin += t.pnl
+				grossWin += t.pnl
 				winsCount++
-			} else {
-				avgLoss += t.pnl
+				consec = 0
+			} else if t.pnl < 0 {
+				grossLoss += t.pnl
 				lossesCount++
+				consec++
+				if consec > maxConsecLoss {
+					maxConsecLoss = consec
+				}
 			}
+			returns = append(returns, t.pnl/bt.startBalance) // return per trade vs starting equity
 		}
+		avgWin, avgLoss := 0.0, 0.0
 		if winsCount > 0 {
-			avgWin /= float64(winsCount)
+			avgWin = grossWin / float64(winsCount)
 		}
 		if lossesCount > 0 {
-			avgLoss /= float64(lossesCount)
+			avgLoss = grossLoss / float64(lossesCount)
 		}
+		expectancy := totalPnL / float64(len(bt.trades))
+
+		fmt.Printf("Expectancy/trade: %+.2f USDT\n", expectancy)
 		fmt.Printf("Avg win:  %+.2f  |  Avg loss: %+.2f\n", avgWin, avgLoss)
 		if avgLoss != 0 {
-			fmt.Printf("Profit factor: %.2f\n", avgWin/(-avgLoss))
+			fmt.Printf("Payoff (avgWin/avgLoss): %.2f\n", avgWin/(-avgLoss))
 		}
+		if grossLoss != 0 {
+			fmt.Printf("Profit factor: %.2f\n", grossWin/(-grossLoss))
+		}
+		fmt.Printf("Max consecutive losses: %d\n", maxConsecLoss)
+
+		// Sharpe & Sortino: mean(return) over total / downside dispersion.
+		// Per-trade, non-annualized — a relative consistency read.
+		if len(returns) > 1 {
+			meanRet := mean(returns)
+			if stdRet := stddev(returns, meanRet); stdRet > 0 {
+				fmt.Printf("Sharpe (per-trade):  %.2f\n", meanRet/stdRet)
+			}
+			if dd := downsideDev(returns); dd > 0 {
+				fmt.Printf("Sortino (per-trade): %.2f\n", meanRet/dd)
+			}
+		}
+
+		// Max drawdown from equity curve.
+		peak := bt.startBalance
+		maxDD := 0.0
+		for _, v := range bt.equityCurve {
+			if v > peak {
+				peak = v
+			}
+			if peak > 0 {
+				if dd := (peak - v) / peak * 100; dd > maxDD {
+					maxDD = dd
+				}
+			}
+		}
+		fmt.Printf("Max drawdown: %.1f%%\n", maxDD)
 	}
 
 	// Per-symbol breakdown.
@@ -424,4 +486,44 @@ func posPnL(pos *position, exitPrice float64) float64 {
 		return (pos.entryPrice - exitPrice) * pos.qty
 	}
 	return 0
+}
+
+func mean(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
+func stddev(vals []float64, mean float64) float64 {
+	if len(vals) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, v := range vals {
+		d := v - mean
+		sum += d * d
+	}
+	return math.Sqrt(sum / float64(len(vals)-1))
+}
+
+// downsideDev is the root-mean-square of the NEGATIVE returns (downside
+// deviation against a 0 target) — the denominator of the Sortino ratio, which
+// unlike Sharpe doesn't penalise upside volatility. Averaged over all trades so
+// a strategy that rarely loses scores well.
+func downsideDev(vals []float64) float64 {
+	if len(vals) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, v := range vals {
+		if v < 0 {
+			sum += v * v
+		}
+	}
+	return math.Sqrt(sum / float64(len(vals)-1))
 }

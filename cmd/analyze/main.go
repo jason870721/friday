@@ -106,26 +106,39 @@ func loadTrades(path string) []memory.TradeRecord {
 // Stats is the win/PnL summary shared by the per-strategy / per-symbol / regime
 // breakdowns.
 type Stats struct {
-	Trades       int     `json:"trades"`
-	Wins         int     `json:"wins"`
-	Losses       int     `json:"losses"`
-	WinRate      float64 `json:"win_rate"`
-	TotalPnL     float64 `json:"total_pnl"`
-	AvgPnL       float64 `json:"avg_pnl"`
-	ProfitFactor float64 `json:"profit_factor"` // gross wins / abs(gross losses); -1 ⇒ ∞ (no losses)
+	Trades          int     `json:"trades"`
+	Wins            int     `json:"wins"`
+	Losses          int     `json:"losses"`
+	WinRate         float64 `json:"win_rate"`
+	TotalPnL        float64 `json:"total_pnl"`
+	AvgPnL          float64 `json:"avg_pnl"` // = per-trade expectancy in USDT (WR×avgWin − LR×|avgLoss|)
+	AvgWin          float64 `json:"avg_win"`
+	AvgLoss         float64 `json:"avg_loss"`      // negative (mean of losing trades)
+	Payoff          float64 `json:"payoff"`        // avgWin / |avgLoss|; -1 ⇒ ∞ (no losses)
+	ProfitFactor    float64 `json:"profit_factor"` // gross wins / abs(gross losses); -1 ⇒ ∞ (no losses)
+	Sharpe          float64 `json:"sharpe"`        // per-trade mean(PnL)/stddev(PnL), NOT annualised
+	MaxConsecLosses int     `json:"max_consec_losses"`
 }
 
 // Report is the full structured post-mortem (also the -json payload).
 type Report struct {
 	Overview struct {
-		Rounds      int     `json:"rounds"`
-		Trades      int     `json:"trades"`
-		Paper       bool    `json:"paper"`
-		FirstTrade  string  `json:"first_trade,omitempty"`
-		LastTrade   string  `json:"last_trade,omitempty"`
-		TotalPnL    float64 `json:"total_pnl"`
-		TotalFees   float64 `json:"total_fees"`
-		MaxDrawdown float64 `json:"max_drawdown"`
+		Rounds          int     `json:"rounds"`
+		Trades          int     `json:"trades"`
+		Paper           bool    `json:"paper"`
+		FirstTrade      string  `json:"first_trade,omitempty"`
+		LastTrade       string  `json:"last_trade,omitempty"`
+		TotalPnL        float64 `json:"total_pnl"`
+		TotalFees       float64 `json:"total_fees"`
+		MaxDrawdown     float64 `json:"max_drawdown"`
+		WinRate         float64 `json:"win_rate"`
+		Expectancy      float64 `json:"expectancy"` // per-trade avg net PnL (USDT)
+		AvgWin          float64 `json:"avg_win"`
+		AvgLoss         float64 `json:"avg_loss"`
+		Payoff          float64 `json:"payoff"`
+		ProfitFactor    float64 `json:"profit_factor"`
+		Sharpe          float64 `json:"sharpe"`
+		MaxConsecLosses int     `json:"max_consec_losses"`
 	} `json:"overview"`
 	PerStrategy      map[string]Stats            `json:"per_strategy"`
 	PerSymbol        map[string]Stats            `json:"per_symbol"`
@@ -160,6 +173,19 @@ func buildReport(rounds []orchestrator.RoundRecord, trades []memory.TradeRecord)
 	rep.Overview.TotalPnL = sumPnL(trades)
 	rep.Overview.TotalFees = sumFees(trades)
 	rep.Overview.MaxDrawdown = maxDrawdown(trades)
+
+	// Aggregate risk/edge metrics over ALL trades (same maths as the per-group
+	// tables) so the overview answers "is there a positive expectancy, and how
+	// steady is it?" at a glance.
+	ov := statsOf(trades)
+	rep.Overview.WinRate = ov.WinRate
+	rep.Overview.Expectancy = ov.AvgPnL
+	rep.Overview.AvgWin = ov.AvgWin
+	rep.Overview.AvgLoss = ov.AvgLoss
+	rep.Overview.Payoff = ov.Payoff
+	rep.Overview.ProfitFactor = ov.ProfitFactor
+	rep.Overview.Sharpe = ov.Sharpe
+	rep.Overview.MaxConsecLosses = ov.MaxConsecLosses
 	if len(trades) > 0 {
 		sorted := append([]memory.TradeRecord(nil), trades...)
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Time < sorted[j].Time })
@@ -196,34 +222,91 @@ func statsByKey(trades []memory.TradeRecord, key func(memory.TradeRecord) string
 func statsOf(trades []memory.TradeRecord) Stats {
 	var s Stats
 	var grossWin, grossLoss float64
-	for _, t := range trades {
+
+	// Sort by time so the consecutive-loss streak is chronological.
+	sorted := append([]memory.TradeRecord(nil), trades...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Time < sorted[j].Time })
+	pnls := make([]float64, 0, len(sorted))
+	consec := 0
+	for _, t := range sorted {
 		p := t.EffectivePnL()
+		pnls = append(pnls, p)
 		s.Trades++
 		s.TotalPnL += p
 		switch {
 		case p > 0:
 			s.Wins++
 			grossWin += p
+			consec = 0
 		case p < 0:
 			s.Losses++
 			grossLoss += p
+			consec++
+			if consec > s.MaxConsecLosses {
+				s.MaxConsecLosses = consec
+			}
 		}
 	}
 	if s.Trades > 0 {
-		s.AvgPnL = s.TotalPnL / float64(s.Trades)
+		s.AvgPnL = s.TotalPnL / float64(s.Trades) // dollar expectancy per trade
 	}
 	if s.Wins+s.Losses > 0 {
 		s.WinRate = float64(s.Wins) / float64(s.Wins+s.Losses)
 	}
-	switch {
-	case grossLoss == 0 && grossWin > 0:
-		s.ProfitFactor = -1 // sentinel for ∞ (no losses)
-	case grossLoss == 0:
-		s.ProfitFactor = 0
-	default:
-		s.ProfitFactor = grossWin / math.Abs(grossLoss)
+	if s.Wins > 0 {
+		s.AvgWin = grossWin / float64(s.Wins)
+	}
+	if s.Losses > 0 {
+		s.AvgLoss = grossLoss / float64(s.Losses)
+	}
+	s.Payoff = ratioOrInf(s.AvgWin, math.Abs(s.AvgLoss))
+	s.ProfitFactor = ratioOrInf(grossWin, math.Abs(grossLoss))
+
+	// Per-trade Sharpe: mean(PnL)/stddev(PnL). Not annualised — a unitless
+	// consistency read (higher = steadier edge), comparable across strategies.
+	if len(pnls) > 1 {
+		m := meanF(pnls)
+		if sd := stddevF(pnls, m); sd > 0 {
+			s.Sharpe = m / sd
+		}
 	}
 	return s
+}
+
+// ratioOrInf returns num/den, or -1 as a sentinel for ∞ when den is 0 but num is
+// positive (a profitable group with no losing side), or 0 when both are 0.
+func ratioOrInf(num, den float64) float64 {
+	switch {
+	case den == 0 && num > 0:
+		return -1
+	case den == 0:
+		return 0
+	default:
+		return num / den
+	}
+}
+
+func meanF(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, x := range v {
+		sum += x
+	}
+	return sum / float64(len(v))
+}
+
+func stddevF(v []float64, mean float64) float64 {
+	if len(v) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, x := range v {
+		d := x - mean
+		sum += d * d
+	}
+	return math.Sqrt(sum / float64(len(v)-1))
 }
 
 func regimeByStrategy(trades []memory.TradeRecord, regimeOf func(memory.TradeRecord) string) map[string]map[string]Stats {
@@ -473,6 +556,12 @@ func (rep Report) text() string {
 	fmt.Fprintf(&b, "  Total net PnL  : %+.4f USDT\n", rep.Overview.TotalPnL)
 	fmt.Fprintf(&b, "  Total fees     : %.4f USDT\n", rep.Overview.TotalFees)
 	fmt.Fprintf(&b, "  Max drawdown   : %.4f USDT\n", rep.Overview.MaxDrawdown)
+	fmt.Fprintf(&b, "  Win rate       : %.1f%%\n", rep.Overview.WinRate*100)
+	fmt.Fprintf(&b, "  Expectancy/trade: %+.4f USDT\n", rep.Overview.Expectancy)
+	fmt.Fprintf(&b, "  Avg win / loss : %+.4f / %+.4f  (payoff %s, PF %s)\n",
+		rep.Overview.AvgWin, rep.Overview.AvgLoss, pfStr(rep.Overview.Payoff), pfStr(rep.Overview.ProfitFactor))
+	fmt.Fprintf(&b, "  Sharpe (/trade): %.2f\n", rep.Overview.Sharpe)
+	fmt.Fprintf(&b, "  Max consec loss: %d\n", rep.Overview.MaxConsecLosses)
 
 	// 2. Per-strategy.
 	fmt.Fprintf(&b, "\n[2] PER-STRATEGY\n")
@@ -522,15 +611,15 @@ func writeStatsTable(b *strings.Builder, m map[string]Stats) {
 		fmt.Fprintf(b, "  (no trades)\n")
 		return
 	}
-	fmt.Fprintf(b, "  %-14s %6s %7s %12s %11s %8s\n", "key", "trades", "win%", "totalPnL", "avgPnL", "PF")
+	fmt.Fprintf(b, "  %-14s %6s %7s %12s %11s %8s %7s %6s\n", "key", "trades", "win%", "totalPnL", "expect", "PF", "payoff", "maxCL")
 	for _, k := range keys {
 		fmt.Fprintf(b, "  %-14s %s\n", k, oneLine(m[k]))
 	}
 }
 
 func oneLine(s Stats) string {
-	return fmt.Sprintf("%6d %6.1f%% %+12.4f %+11.4f %8s",
-		s.Trades, s.WinRate*100, s.TotalPnL, s.AvgPnL, pfStr(s.ProfitFactor))
+	return fmt.Sprintf("%6d %6.1f%% %+12.4f %+11.4f %8s %7s %6d",
+		s.Trades, s.WinRate*100, s.TotalPnL, s.AvgPnL, pfStr(s.ProfitFactor), pfStr(s.Payoff), s.MaxConsecLosses)
 }
 
 func pfStr(pf float64) string {
