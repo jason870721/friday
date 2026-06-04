@@ -28,6 +28,7 @@ func main() {
 	riskFlag := flag.Float64("risk", 0.01, "Risk per trade as fraction of balance")
 	feeFlag := flag.Float64("fee", 0.0004, "Taker fee rate per side (round-trip = 2×); 0.0004 = 4 bps")
 	endAgoFlag := flag.Int("end-days-ago", 0, "End the window this many days before now (0 = now); use with -days for an out-of-sample window, e.g. -days 40 -end-days-ago 40")
+	mtfFlag := flag.Bool("mtf", false, "Multi-timeframe mode: walk the 5m entry TF and combine 5m+1h+4h via AggregateMTF (the live signal path); -interval is ignored. Limited to ~5 days (5m 1500-candle cap).")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -58,6 +59,9 @@ func main() {
 	fmt.Printf("leverage: %dx\n", *leverageFlag)
 	fmt.Printf("risk:     %.0f%% per trade\n", *riskFlag*100)
 	fmt.Printf("fee:      %.2f bps/side (%.2f bps round-trip)\n", *feeFlag*1e4, *feeFlag*2*1e4)
+	if *mtfFlag {
+		fmt.Printf("mode:     multi-timeframe (5m entry + 1h + 4h via AggregateMTF; -interval ignored)\n")
+	}
 	fmt.Println()
 
 	// Fetch klines. Binance returns up to 1500 candles per request.
@@ -69,6 +73,32 @@ func main() {
 	if *endAgoFlag > 0 {
 		endMs = endTime.UnixMilli()
 	}
+
+	// Multi-timeframe mode: fetch 5m (entry, capped to the window) plus generous
+	// 1h/4h lookback so every 5m bar has full higher-TF history behind it, then
+	// replay through AggregateMTF.
+	if *mtfFlag {
+		bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag)
+		lim5 := days * 288
+		if lim5 > 1500 {
+			lim5 = 1500
+		}
+		fmt.Printf("Fetching 5m/1h/4h klines (5m≤%d candles, ending %s)...\n", lim5, endTime.Format("01/02 15:04"))
+		for _, sym := range symbols {
+			k5, e5 := cli.KlinesUntil(ctx, sym, "5m", lim5, endMs)
+			k1, e1 := cli.KlinesUntil(ctx, sym, "1h", 1500, endMs)
+			k4, e4 := cli.KlinesUntil(ctx, sym, "4h", 1500, endMs)
+			if e5 != nil || e1 != nil || e4 != nil {
+				fmt.Printf("  %s: fetch ERROR (5m:%v 1h:%v 4h:%v)\n", sym, e5, e1, e4)
+				continue
+			}
+			fmt.Printf("  %s: 5m=%d 1h=%d 4h=%d candles\n", sym, len(k5), len(k1), len(k4))
+			bt.runMTF(sym, k5, k1, k4)
+		}
+		bt.report()
+		return
+	}
+
 	limit := days * 24 * 60 / candleMinutes(interval)
 	if limit > 1500 {
 		limit = 1500
@@ -206,14 +236,82 @@ func (bt *backtestEngine) closePosition(pos *position, exitPrice float64, reason
 	return pnl
 }
 
+// exitDecision reports whether an open position should close at the current
+// price, returning the fill price and reason (stop-loss / take-profit).
+func exitDecision(pos *position, price float64) (exitPrice float64, reason string, hit bool) {
+	switch pos.direction {
+	case strategy.Long:
+		if price <= pos.stopPrice {
+			return pos.stopPrice, "stop-loss", true
+		}
+		if price >= pos.tpPrice {
+			return pos.tpPrice, "take-profit", true
+		}
+	case strategy.Short:
+		if price >= pos.stopPrice {
+			return pos.stopPrice, "stop-loss", true
+		}
+		if price <= pos.tpPrice {
+			return pos.tpPrice, "take-profit", true
+		}
+	}
+	return 0, "", false
+}
+
+// openFromConsensus sizes and opens a position from a directional consensus,
+// using the entry-timeframe window for price/ATR. It applies the ATR fee-floor
+// (expected move ≥ 0.24%), risk-based sizing (risk% ÷ 2×ATR), and a stop that is
+// the tighter of 2×ATR or the consensus invalidation (when ≥1×ATR away). No-op
+// when NEUTRAL or already in a position. Returns true if it opened.
+func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Kline, c strategy.Consensus, openAt int) bool {
+	if c.Direction == strategy.Neutral {
+		return false
+	}
+	if _, ok := bt.positions[symbol]; ok {
+		return false
+	}
+	price := window[len(window)-1].Close
+	atr, ok := binance.ATR(window, 14)
+	if !ok || atr/price*100 < 0.24 { // fee floor: expected move must clear ~3× round-trip fee
+		return false
+	}
+	qty := (bt.riskPct * bt.balance) / (2 * atr)
+
+	stopDist := 2 * atr
+	tpDist := 2 * atr
+	if inval := c.Invalidation(); inval != 0 {
+		invalDist := 0.0
+		switch c.Direction {
+		case strategy.Long:
+			invalDist = price - inval
+		case strategy.Short:
+			invalDist = inval - price
+		}
+		if invalDist >= atr && invalDist < stopDist {
+			stopDist = invalDist
+		}
+	}
+	var stopPrice, tpPrice float64
+	switch c.Direction {
+	case strategy.Long:
+		stopPrice, tpPrice = price-stopDist, price+tpDist
+	case strategy.Short:
+		stopPrice, tpPrice = price+stopDist, price-tpDist
+	}
+	bt.positions[symbol] = &position{
+		symbol: symbol, direction: c.Direction, qty: qty,
+		entryPrice: price, stopPrice: stopPrice, tpPrice: tpPrice, atr: atr, openAt: openAt,
+	}
+	return true
+}
+
 func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binance.Kline, symbolIdx int) {
 	if len(klines) < 50 {
 		fmt.Printf("  %s: too few candles (%d), skipping\n", symbol, len(klines))
 		return
 	}
 
-	trades := 0
-	wins := 0
+	trades, wins := 0, 0
 	totalPnL := 0.0
 
 	// We need at least 50 candles for the strategies to work (EMA50).
@@ -222,36 +320,8 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 		window := klines[:i+1]
 		price := window[len(window)-1].Close
 
-		// Check existing position for stop/TP.
 		if pos, ok := bt.positions[symbol]; ok {
-			closed := false
-			var exitPrice float64
-			var reason string
-
-			switch pos.direction {
-			case strategy.Long:
-				if price <= pos.stopPrice {
-					exitPrice = pos.stopPrice
-					reason = "stop-loss"
-					closed = true
-				} else if price >= pos.tpPrice {
-					exitPrice = pos.tpPrice
-					reason = "take-profit"
-					closed = true
-				}
-			case strategy.Short:
-				if price >= pos.stopPrice {
-					exitPrice = pos.stopPrice
-					reason = "stop-loss"
-					closed = true
-				} else if price <= pos.tpPrice {
-					exitPrice = pos.tpPrice
-					reason = "take-profit"
-					closed = true
-				}
-			}
-
-			if closed {
+			if exitPrice, reason, hit := exitDecision(pos, price); hit {
 				pnl := bt.closePosition(pos, exitPrice, reason)
 				totalPnL += pnl
 				trades++
@@ -262,91 +332,114 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 			}
 		}
 
-		// Run strategy engine.
 		c := strategy.ConsensusForWithRegime(symbol, window)
-		if c.Direction == strategy.Neutral {
-			continue
-		}
+		bt.openFromConsensus(symbol, window, c, i)
+	}
 
-		// Only open if flat.
-		if _, ok := bt.positions[symbol]; ok {
-			continue
-		}
+	totalPnL += bt.closeRemaining(symbol, klines[len(klines)-1].Close, &trades, &wins)
+	reportSymbol(symbol, trades, wins, totalPnL)
+}
 
-		// Compute ATR.
-		atr, ok := binance.ATR(window, 14)
-		if !ok {
-			continue
-		}
+// runMTF is the multi-timeframe variant (-mtf): it walks the 5m entry timeframe
+// and, at each bar, runs the full calibrated+regime strategy engine on the 5m,
+// 1h, and 4h windows aligned to that moment, combines them via AggregateMTF
+// (the same path the live Analyst reads), and opens on the combined signal.
+// Higher-TF consensuses are recomputed only when a new higher-TF bar closes.
+func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
+	if len(k5) < 50 {
+		fmt.Printf("  %s: too few 5m candles (%d), skipping\n", symbol, len(k5))
+		return
+	}
+	trades, wins := 0, 0
+	totalPnL := 0.0
+	lastJ1, lastJ4 := -1, -1
+	var c1, c4 strategy.Consensus
 
-		// Fee check: expected move must clear 3× round-trip fee (~0.24% for crypto).
-		expectedMove := atr / price * 100
-		if expectedMove < 0.24 {
-			continue
-		}
+	for i := 50; i < len(k5); i++ {
+		w5 := k5[:i+1]
+		price := w5[len(w5)-1].Close
+		t := w5[len(w5)-1].CloseTime
 
-		// Size by risk: qty = (riskPct * balance) / (2 * atr).
-		riskDollars := bt.riskPct * bt.balance
-		qty := riskDollars / (2 * atr)
-
-		// Compute stop and TP.
-		stopDist := 2 * atr
-		tpDist1 := 2 * atr // tier-1 TP
-
-		// Apply 1×ATR invalidation filter.
-		inval := c.Invalidation()
-		if inval != 0 {
-			invalDist := 0.0
-			switch c.Direction {
-			case strategy.Long:
-				invalDist = price - inval
-			case strategy.Short:
-				invalDist = inval - price
-			}
-			if invalDist >= atr && invalDist < stopDist {
-				stopDist = invalDist
+		if pos, ok := bt.positions[symbol]; ok {
+			if exitPrice, reason, hit := exitDecision(pos, price); hit {
+				pnl := bt.closePosition(pos, exitPrice, reason)
+				totalPnL += pnl
+				trades++
+				if pnl > 0 {
+					wins++
+				}
+				continue
 			}
 		}
 
-		var stopPrice, tpPrice float64
-		switch c.Direction {
-		case strategy.Long:
-			stopPrice = price - stopDist
-			tpPrice = price + tpDist1
-		case strategy.Short:
-			stopPrice = price + stopDist
-			tpPrice = price - tpDist1
+		// Align the higher timeframes to "now" (bars closed at or before t);
+		// recompute their consensus only when a new higher-TF bar has closed.
+		j1, j4 := countBarsUpTo(k1, t), countBarsUpTo(k4, t)
+		if j1 != lastJ1 {
+			c1 = strategy.Consensus{}
+			if j1 > 0 {
+				c1 = strategy.ConsensusForWithRegime(symbol, k1[:j1])
+			}
+			lastJ1 = j1
+		}
+		if j4 != lastJ4 {
+			c4 = strategy.Consensus{}
+			if j4 > 0 {
+				c4 = strategy.ConsensusForWithRegime(symbol, k4[:j4])
+			}
+			lastJ4 = j4
 		}
 
-		pos := &position{
-			symbol:     symbol,
-			direction:  c.Direction,
-			qty:        qty,
-			entryPrice: price,
-			stopPrice:  stopPrice,
-			tpPrice:    tpPrice,
-			atr:        atr,
-			openAt:     i,
+		byTF := map[string]strategy.Consensus{"5m": strategy.ConsensusForWithRegime(symbol, w5)}
+		if j1 > 0 {
+			byTF["1h"] = c1
 		}
-		bt.positions[symbol] = pos
+		if j4 > 0 {
+			byTF["4h"] = c4
+		}
+		bt.openFromConsensus(symbol, w5, strategy.AggregateMTF(byTF), i)
 	}
 
-	// Close any remaining position at the last price.
-	if pos, ok := bt.positions[symbol]; ok {
-		lastPrice := klines[len(klines)-1].Close
-		pnl := bt.closePosition(pos, lastPrice, "end-of-data")
-		totalPnL += pnl
-		trades++
-		if pnl > 0 {
-			wins++
-		}
-	}
+	totalPnL += bt.closeRemaining(symbol, k5[len(k5)-1].Close, &trades, &wins)
+	reportSymbol(symbol, trades, wins, totalPnL)
+}
 
+// closeRemaining flattens a still-open position at the final price (end-of-data)
+// and folds it into the running trade/win counters; returns its PnL.
+func (bt *backtestEngine) closeRemaining(symbol string, lastPrice float64, trades, wins *int) float64 {
+	pos, ok := bt.positions[symbol]
+	if !ok {
+		return 0
+	}
+	pnl := bt.closePosition(pos, lastPrice, "end-of-data")
+	*trades++
+	if pnl > 0 {
+		*wins++
+	}
+	return pnl
+}
+
+func reportSymbol(symbol string, trades, wins int, totalPnL float64) {
 	winRate := 0.0
 	if trades > 0 {
 		winRate = float64(wins) / float64(trades) * 100
 	}
 	fmt.Printf("  %s: %d trades, %.0f%% win, PnL %+.2f USDT\n", symbol, trades, winRate, totalPnL)
+}
+
+// countBarsUpTo returns how many bars (sorted ascending by CloseTime) have
+// closed at or before t — i.e. the bars visible at moment t.
+func countBarsUpTo(bars []binance.Kline, t int64) int {
+	lo, hi := 0, len(bars)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if bars[mid].CloseTime <= t {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 func (bt *backtestEngine) report() {
