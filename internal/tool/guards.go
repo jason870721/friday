@@ -1,6 +1,10 @@
 package tool
 
 import (
+	"fmt"
+	"time"
+
+	"github.com/johnny1110/friday/internal/memory"
 	"github.com/johnny1110/friday/internal/notify"
 	"github.com/johnny1110/friday/internal/risk"
 )
@@ -49,5 +53,91 @@ func SetNotifier(n notify.Notifier, pnlPct float64) {
 	globalNotifier = n
 	if pnlPct > 0 {
 		notifyPnLPct = pnlPct
+	}
+}
+
+// estRoundTripFeeRate is the round-trip taker fee assumed when estimating a
+// StopMonitor close's net PnL (~2 × 0.04% taker = 0.08% of notional). It is a
+// deliberate over-estimate: for a safety breaker, UNDER-reporting a loss is the
+// dangerous direction, so we'd rather the daily-loss gate trip slightly early.
+const estRoundTripFeeRate = 0.0008
+
+// LogStopClose records a position closed by the StopMonitor (outside the normal
+// round loop) into the trade memory, feeds the circuit breaker, and fires a
+// notification — the same path a round-based close takes through log_trade.
+//
+// The PnL is ESTIMATED from entry vs mark minus an assumed round-trip taker fee
+// (the income ledger isn't queried here — it lags a market close by seconds), so
+// the record is marked "reported", not "exchange"; cmd/reconcile-memory backfills
+// the true net later. Feeding the breaker matters for safety: the daily-loss and
+// consecutive-loss gates would otherwise MISS monitor-triggered losses entirely
+// (drawdown/HALT keys off the true wallet balance via Observe, so it is exact).
+func LogStopClose(event risk.StopCloseEvent) {
+	store, err := sharedTradeStore()
+	if err != nil {
+		return
+	}
+
+	var pnl float64
+	bias := "LONG"
+	if event.PositionSide == risk.DirShort {
+		bias = "SHORT"
+	}
+	if event.EntryPrice > 0 && event.MarkPrice > 0 {
+		switch event.PositionSide {
+		case risk.DirLong:
+			pnl = (event.MarkPrice - event.EntryPrice) * event.PositionQty
+		case risk.DirShort:
+			pnl = (event.EntryPrice - event.MarkPrice) * event.PositionQty
+		}
+		// Deduct the estimated round-trip fee so the breaker's daily-loss
+		// accumulator isn't systematically under-counting, and a marginal gross
+		// gain that doesn't cover fees is correctly classified as a net LOSS.
+		pnl -= estRoundTripFeeRate * event.MarkPrice * event.PositionQty
+	}
+
+	rec := memory.TradeRecord{
+		Symbol:      event.Symbol,
+		Time:        time.Now().Unix(),
+		EntryReason: fmt.Sprintf("StopMonitor: %s at %.4f", event.Reason, event.MarkPrice),
+		Bias:        bias,
+		PnL:         pnl,
+		PnLSource:   "reported",
+		Outcome:     "LOSS",
+		Paper:       globalPaper != nil,
+	}
+	if pnl > 0 {
+		rec.Outcome = "WIN"
+	}
+
+	if err := store.Log(rec); err != nil {
+		return
+	}
+
+	// Feed the circuit breaker with the estimated PnL.
+	if globalBreaker != nil {
+		globalBreaker.RecordTrade(pnl)
+	}
+
+	// Fire a notification for every StopMonitor close.
+	if globalNotifier != nil {
+		outcomeWord := "虧損"
+		if pnl > 0 {
+			outcomeWord = "獲利"
+		}
+		tag := ""
+		if rec.Paper {
+			tag = " [PAPER]"
+		}
+		reason := "止損"
+		if event.Reason == "take-profit" {
+			reason = "停利"
+		}
+		title := fmt.Sprintf("🛑 Friday StopMonitor: %s %s%s", event.Symbol, reason, tag)
+		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f",
+			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice)
+		if nerr := globalNotifier.Notify(title, body); nerr != nil {
+			// best-effort; don't fail the close for a notify error
+		}
 	}
 }

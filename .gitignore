@@ -1,3 +1,6 @@
 *.log
 bin/
 /friday
+/analyze
+/backtest
+/reconcile-memory

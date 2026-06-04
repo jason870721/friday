@@ -87,9 +87,13 @@ FRIDAY_NOTIFY_PNL_PCT=0.05
 FRIDAY_RSI_FILTER=true
 # MTF hysteresis dead-band (raw weighted net below this reads NEUTRAL).
 FRIDAY_MTF_HYSTERESIS=0.05
-# 5m+1h override: when 4h is NEUTRAL and 5m+1h agree (≥0.5 each), adopt their
+# 5m+1h override: when 4h is NEUTRAL and 5m+1h agree (≥0.35 each), adopt their
 # direction at the average confidence (4h opposition stays a hard veto).
 FRIDAY_MTF_5M1H_OVERRIDE=true
+# MTF 2-of-3 quorum (PRD-024): when 4h is NEUTRAL, any 2 timeframes sharing a
+# direction set it (avg confidence); a directional 4h opposed by a lower TF is
+# vetoed to NEUTRAL. Disable to fall back to the weighted-sum + override path.
+FRIDAY_MTF_QUORUM=true
 `
 
 // New loads friday's config and builds the PRD-003 multi-agent

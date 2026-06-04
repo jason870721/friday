@@ -32,7 +32,11 @@ func RSIFilter(c Consensus, rsi float64) Consensus {
 	if rsi >= rsiOverbought || rsi <= rsiOversold {
 		c.Direction = Neutral
 		c.Confidence = 0
-		c.Summary = strings.TrimSpace(c.Summary) + fmt.Sprintf(" (blocked: RSI %.1f in extreme zone)", rsi)
+		blocked := fmt.Sprintf(" (blocked: RSI %.1f in extreme zone)", rsi)
+		c.Summary = strings.TrimSpace(c.Summary) + blocked
+		// PRD-024 R12: record the block in the diagnostic detail too, so the MTF
+		// output shows an RSI-filtered TF was the reason for NEUTRAL.
+		c.SignalDetails = strings.TrimSpace(c.SignalDetails) + blocked
 		return c
 	}
 	return c
@@ -48,6 +52,11 @@ func rsiFilterEnabled() bool { return envBool("FRIDAY_RSI_FILTER", true) }
 // mtf5m1hOverrideEnabled reports whether the 5m+1h lower-timeframe override is
 // active (FRIDAY_MTF_5M1H_OVERRIDE, default true).
 func mtf5m1hOverrideEnabled() bool { return envBool("FRIDAY_MTF_5M1H_OVERRIDE", true) }
+
+// mtfQuorumEnabled reports whether the 2-of-3 MTF quorum is active when the 4h is
+// silent (FRIDAY_MTF_QUORUM, default true — PRD-024 R4). Disabling it falls back
+// to the PRD-022 weighted-sum + 5m+1h-override path.
+func mtfQuorumEnabled() bool { return envBool("FRIDAY_MTF_QUORUM", true) }
 
 // mtfHysteresisValue is the dead-band around 0 in which the weighted net is read
 // as NEUTRAL (FRIDAY_MTF_HYSTERESIS, default 0.05 — lowered from PRD-017's 0.1 so

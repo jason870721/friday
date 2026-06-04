@@ -230,6 +230,7 @@ func TestAggregateMTF(t *testing.T) {
 	}
 
 	// 5m LONG 0.7 (+0.7), 1h NEUTRAL (0), 4h SHORT 0.6 (−1.2) → net −0.5 → SHORT.
+	// The weighted result follows the 4h, so the veto does NOT fire (PRD-022 R8).
 	c := AggregateMTF(map[string]Consensus{"5m": long(0.7), "1h": neutral, "4h": short(0.6)})
 	if c.Direction != Short {
 		t.Errorf("5m LONG / 4h SHORT → %v (%s); want SHORT (4h dominates)", c.Direction, c.Summary)

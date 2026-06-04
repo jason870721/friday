@@ -136,6 +136,6 @@ go run ./cmd/reconcile-memory  # dry-run PnL fix (-write to apply)
 
 ## Roadmap
 
-PRDs **001–023 are implemented**. See [docs/roadmap.md](docs/roadmap.md) for the
+PRDs **001–024 are implemented**. See [docs/roadmap.md](docs/roadmap.md) for the
 per-PRD index and status, and `docs/PRD/PRD-NNN.md` for each spec — the
 Out-of-Scope sections there track deferred follow-ups.

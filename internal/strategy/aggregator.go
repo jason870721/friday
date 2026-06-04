@@ -42,7 +42,62 @@ func Aggregate(symbol string, signals []Signal) Consensus {
 	}
 
 	c.Summary = summarise(c, longs, shorts)
+	c.SignalDetails = signalDetails(c, longs, shorts)
 	return c
+}
+
+// signalDetails renders a one-line, per-strategy diagnostic of WHY the consensus
+// turned out the way it did (PRD-024 R11): each confident directional signal as
+// "momentum LONG(0.55) inval=63250", each abstaining one as "ema_cross: <its
+// reason>", joined by " | ". For a NEUTRAL consensus the resolving reason is
+// appended ("— only 1 directional (need ≥2)" / "— conflict (…)"). Empty when
+// there were no signals at all.
+func signalDetails(c Consensus, longs, shorts []Signal) string {
+	if len(c.Signals) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(c.Signals))
+	for _, s := range c.Signals {
+		if s.Direction != Neutral && s.Confidence > 0 {
+			seg := fmt.Sprintf("%s %s(%.2f)", s.Strategy, s.Direction, s.Confidence)
+			if s.Invalidation != 0 {
+				seg += fmt.Sprintf(" inval=%.2f", s.Invalidation)
+			}
+			if s.TakeProfit != 0 {
+				seg += fmt.Sprintf(" tp=%.2f", s.TakeProfit)
+			}
+			parts = append(parts, seg)
+			continue
+		}
+		reason := s.Reason
+		if reason == "" {
+			reason = "no signal"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", s.Strategy, reason))
+	}
+	detail := strings.Join(parts, " | ")
+	if r := neutralReason(c, longs, shorts); r != "" {
+		detail += " — " + r
+	}
+	return detail
+}
+
+// neutralReason explains a NEUTRAL consensus in a few words (PRD-024 R11); ""
+// for a directional consensus (the per-strategy parts already say enough).
+func neutralReason(c Consensus, longs, shorts []Signal) string {
+	if c.Direction != Neutral {
+		return ""
+	}
+	switch n := len(longs) + len(shorts); {
+	case len(longs) > 0 && len(shorts) > 0:
+		return fmt.Sprintf("conflict (%s vs %s)", strings.Join(names(longs), "/"), strings.Join(names(shorts), "/"))
+	case n == 0:
+		return "no strategy fired"
+	case n == 1:
+		return "only 1 directional (need ≥2)"
+	default:
+		return fmt.Sprintf("only %d directional (need ≥2 aligned)", n)
+	}
 }
 
 func avgConfidence(sigs []Signal) float64 {
@@ -115,18 +170,23 @@ var (
 )
 
 // AggregateMTF combines per-timeframe consensuses into one cross-timeframe vote
-// (PRD-017, tuned by PRD-022). Each TF is first passed through the RSI
+// (PRD-017, tuned by PRD-022/024). Each TF is first passed through the RSI
 // extreme-zone filter (using that TF's own RSI), then contributes
 // `±Confidence × tfWeight` (+ for LONG, − for SHORT, 0 for NEUTRAL); the net
 // decides direction (within a ±hysteresis dead-band, default 0.05) and
-// `abs(net) / Σweights` the confidence. Two PRD-022 refinements then apply:
+// `abs(net) / Σweights` the confidence. Three refinements then apply, in order
+// (PRD-024 R5: quorum → override → the weighted net is the fallback):
 //
-//   - 5m+1h override: when the 4h is NEUTRAL (or absent) and the 5m and 1h agree
-//     with confidence ≥0.5 each, adopt their shared direction at the average of
-//     their confidences — so aligned lower-timeframe signals aren't drowned out
-//     by a perpetually-NEUTRAL 4h.
-//   - 4h hard veto: when the 4h is directional and OPPOSES the weighted result,
-//     force NEUTRAL — never trade a lower-TF setup against the 4h trend.
+//   - 2-of-3 quorum (PRD-024 R4, FRIDAY_MTF_QUORUM, default on): when the 4h is
+//     NEUTRAL/absent, any 2 timeframes sharing a direction adopt it at their
+//     average confidence; a lower-TF directional conflict resolves to NEUTRAL; a
+//     lone directional TF falls through so a single 5m signal can still trade.
+//   - 5m+1h override (PRD-022 R8, threshold lowered to 0.35 by PRD-024 R3): when
+//     the 4h is NEUTRAL and the 5m and 1h agree with confidence ≥0.35 each, adopt
+//     their shared direction at the average of their confidences.
+//   - 4h hard veto (PRD-022 R8): when the 4h is directional and OPPOSES the
+//     WEIGHTED result, force NEUTRAL — never trade against the 4h trend. (It keys
+//     off the net, so a lone lower-TF dissent against a with-4h net does NOT veto.)
 //
 // With a single TF present it degrades to that TF's (RSI-filtered) consensus.
 func AggregateMTF(consensusByTF map[string]Consensus) Consensus {
@@ -184,27 +244,104 @@ func AggregateMTF(consensusByTF map[string]Consensus) Consensus {
 	four, has4h := filtered["4h"]
 	fourNeutral := !has4h || four.Direction == Neutral
 
-	switch {
-	case mtf5m1hOverrideEnabled() && fourNeutral && lowerTFOverride(filtered) != Neutral:
-		// PRD-022 R8: aligned 5m+1h with a non-opposing 4h → adopt their direction
-		// at the average of their confidences.
+	// PRD-024 R5: order is quorum → 5m+1h override → weighted sum (the weighted
+	// `out` above is the fallback the others refine). Quorum and override both
+	// require the 4h to be silent; the 4h veto below requires it to be directional,
+	// so the two are mutually exclusive.
+	quorumHandled := false
+	if mtfQuorumEnabled() && fourNeutral {
+		// PRD-024 R4: with the 4h silent, a 2-of-3 quorum forms a directional vote
+		// even when the weighted sum is too timid (the fix for the perpetually-
+		// NEUTRAL 4h drowning out aligned lower TFs). A directional conflict among
+		// the lower TFs is decided NEUTRAL; a lone directional TF is left to fall
+		// through so a single 5m signal can still trade via the weighted path.
+		if dir, conf, decided := quorumDecision(filtered, present); decided {
+			out.Direction, out.Confidence = dir, conf
+			if dir == Neutral {
+				note = " [quorum: no majority]"
+			} else {
+				note = " [quorum]"
+			}
+			quorumHandled = true
+		}
+	}
+	if !quorumHandled && mtf5m1hOverrideEnabled() && fourNeutral && lowerTFOverride(filtered) != Neutral {
+		// PRD-022 R8 (threshold lowered to 0.35 by PRD-024 R3): aligned 5m+1h with a
+		// non-opposing 4h → adopt their direction at the average of their confidences.
 		five, oneH := filtered["5m"], filtered["1h"]
 		out.Direction = five.Direction
 		out.Confidence = clamp01((five.Confidence + oneH.Confidence) / 2)
 		note = " [5m+1h override]"
-	case has4h && four.Direction != Neutral && out.Direction != Neutral && four.Direction != out.Direction:
-		// PRD-022 R8: 4h opposition is a hard veto — never trade against the 4h.
+	}
+
+	// PRD-022 R8: 4h opposition is a hard veto — never trade against the 4h.
+	// Check the WEIGHTED result, not individual lower TFs: a lone 5m dissent
+	// is noise; what matters is whether the net vote opposes the dominant TF.
+	if has4h && four.Direction != Neutral && out.Direction != Neutral && out.Direction != four.Direction {
 		out.Direction = Neutral
 		out.Confidence = 0
 		note = " [4h veto]"
 	}
 
 	out.Summary = fmt.Sprintf("(%s) → weighted %s %.2f%s", strings.Join(parts, " + "), out.Direction, out.Confidence, note)
+	// PRD-024 R13: append each present TF's per-strategy detail line beneath the
+	// summary so a NEUTRAL round shows WHY (which strategies fired / conflicted /
+	// were RSI-filtered). The tool prints out.Summary verbatim, so no tool change.
+	for _, tf := range present {
+		if d := strings.TrimSpace(filtered[tf].SignalDetails); d != "" {
+			out.Summary += fmt.Sprintf("\n  %s: %s", tf, d)
+		}
+	}
 	return out
 }
 
+// quorumDecision evaluates the 4h-silent 2-of-3 quorum (PRD-024 R4). Because the
+// 4h is NEUTRAL in this branch, at most the 5m and 1h can be directional, so:
+//   - 2 TFs share a direction (no opposition) → that direction, avg confidence,
+//     decided=true;
+//   - the directional TFs conflict (one LONG, one SHORT) → NEUTRAL, decided=true;
+//   - ≤1 directional TF → decided=false, letting the caller fall through to the
+//     override/weighted path (a lone 5m signal can still trade).
+func quorumDecision(filtered map[string]Consensus, present []string) (Direction, float64, bool) {
+	var longs, shorts []Consensus
+	for _, tf := range present {
+		switch filtered[tf].Direction {
+		case Long:
+			longs = append(longs, filtered[tf])
+		case Short:
+			shorts = append(shorts, filtered[tf])
+		}
+	}
+	switch {
+	case len(longs) >= 2 && len(shorts) == 0:
+		return Long, avgConsensusConf(longs), true
+	case len(shorts) >= 2 && len(longs) == 0:
+		return Short, avgConsensusConf(shorts), true
+	case len(longs) > 0 && len(shorts) > 0:
+		return Neutral, 0, true // directional conflict → no clean majority
+	default:
+		return Neutral, 0, false // ≤1 directional → fall through
+	}
+}
+
+func avgConsensusConf(cs []Consensus) float64 {
+	if len(cs) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, c := range cs {
+		sum += c.Confidence
+	}
+	return clamp01(sum / float64(len(cs)))
+}
+
+// lowerTFOverrideFloor is the minimum per-TF confidence the 5m+1h override needs
+// (PRD-024 R3 lowered it from 0.5 to 0.35). Calibration + regime weighting often
+// pull a directionally-correct signal to 0.35–0.5, below the old arbitrary floor.
+const lowerTFOverrideFloor = 0.35
+
 // lowerTFOverride returns the shared 5m+1h direction when both are present,
-// agree on a non-NEUTRAL direction, and each has confidence ≥0.5 — else Neutral
+// agree on a non-NEUTRAL direction, and each has confidence ≥0.35 — else Neutral
 // (no override). The 4h-neutrality precondition is checked by the caller.
 func lowerTFOverride(filtered map[string]Consensus) Direction {
 	five, ok5 := filtered["5m"]
@@ -215,7 +352,7 @@ func lowerTFOverride(filtered map[string]Consensus) Direction {
 	if five.Direction == Neutral || five.Direction != oneH.Direction {
 		return Neutral
 	}
-	if five.Confidence < 0.5 || oneH.Confidence < 0.5 {
+	if five.Confidence < lowerTFOverrideFloor || oneH.Confidence < lowerTFOverrideFloor {
 		return Neutral
 	}
 	return five.Direction

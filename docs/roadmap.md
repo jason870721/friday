@@ -11,9 +11,10 @@ deterministic Go strategy engine behind hard, code-enforced safety rails":
 - **P2 strategy-engine hardening** (PRD-013..018) — portfolio expansion, per-strategy tracking, confidence calibration, regime detection, MTF consensus, strategy-aware exits.
 - **P3 production + operations** (PRD-020..023) — native stops / fee budget / portfolio caps / online re-calibration / paper mode / observability, plus PnL-analysis-driven signal (022) and Analyst (023) hardening.
 
-**Status: PRD-001–023 are all implemented** (PRD-023's testnet-session
-acceptance item awaits a live run). Per-PRD detail and deferred follow-ups live
-in each `docs/PRD/PRD-NNN.md`; the sections below track them with checkboxes.
+**Status: PRD-001–024 are all implemented** (PRD-023's testnet-session and
+PRD-024's paper-mode acceptance items await a live run). Per-PRD detail and
+deferred follow-ups live in each `docs/PRD/PRD-NNN.md`; the sections below track
+them with checkboxes.
 
 ---
 
@@ -141,7 +142,34 @@ The P2 tranche (PRD-013..018) is now **complete**, built in dependency order:
 014's strategy attribution) → `PRD-016` (regime, needs 015's calibrated weights)
 → `PRD-017` (MTF voting) + `PRD-018` (strategy-aware exits).
 
-All PRDs (001–023) are now implemented (PRD-023's testnet-session acceptance item awaits a live run).
+All PRDs (001–024) are now implemented (PRD-023's testnet-session and PRD-024's paper-mode acceptance items await a live run).
+
+---
+
+## Planned — P4: signal quantity + MTF responsiveness + Analyst resilience
+
+Source: [`.evva/plans/current.md`](../.evva/plans/current.md) — 106-round live-data analysis
+
+The 106-round live-data analysis revealed MTF Strategy is NEUTRAL for 97% of rounds
+(only 3 actionable rounds out of 106) and the Analyst collapses to one-word "凍結"
+summaries after 80+ consecutive NEUTRAL rounds. This tranche fixes the structural
+bottlenecks (5m candle count starving the strategy engine), relaxes the MTF
+aggregation (quorum voting + lower override threshold), prevents Analyst degradation,
+and adds per-strategy observability so NEUTRAL rounds are diagnosable.
+
+- [x] **[PRD-024](./PRD/PRD-024.md)** — Signal Quantity & MTF Responsiveness &
+  Analyst Resilience. ✅ Four changes: (1) 5m candle count 20→96 (`binance_mtf_klines`)
+  so all 5 strategies — EMACross needs 50 — can vote on the entry timeframe; (2) MTF
+  2-of-3 quorum when 4h is NEUTRAL (`FRIDAY_MTF_QUORUM`, default on) + 5m+1h override
+  floor lowered 0.5→0.35 (the PRD-022 4h hard veto is unchanged — it still fires only
+  when the *weighted* result opposes a directional 4h, so a lone lower-TF dissent does
+  not block a with-4h trade); (3) Analyst-prompt anti-degradation rule (always write a
+  concrete per-symbol summary, never "凍結") + Cross-TF-divergence flag + a
+  `consecutiveNeutral` counter that injects a vigilance warning into the carry after 10
+  flat rounds (`carryWithNeutralWarning`, strip-then-append); (4) per-strategy
+  `Consensus.SignalDetails` rendered as indented lines beneath the MTF Strategy line so
+  a NEUTRAL round shows *why* (which strategies fired / conflicted / were RSI-filtered).
+  Depends on PRD-006/017/022.
 
 ---
 

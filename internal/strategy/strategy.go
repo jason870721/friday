@@ -54,4 +54,10 @@ type Consensus struct {
 	RSI        float64  // RSI(14) on this consensus's timeframe (0 = unavailable) — drives the RSI extreme-zone filter (PRD-022)
 	Signals    []Signal // all inputs (for LLM context)
 	Summary    string   // natural-language summary for the LLM
+
+	// SignalDetails is a per-strategy diagnostic line (PRD-024 R10/R11): why each
+	// strategy did or didn't fire, plus the consensus reason. Surfaced beneath the
+	// MTF Strategy line so a NEUTRAL round shows WHY (no fire vs conflict vs
+	// RSI-filtered). Empty = no details.
+	SignalDetails string
 }

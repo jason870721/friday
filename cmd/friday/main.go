@@ -58,7 +58,7 @@ func main() {
 	if cli, err := tool.SharedBinanceClient(); err != nil {
 		fmt.Fprintf(os.Stderr, "friday: stop monitor disabled (%v)\n", err)
 	} else {
-		monitor := risk.NewStopMonitor(tool.NewBinanceStopBroker(cli), time.Second, slog.Default())
+		monitor := risk.NewStopMonitor(tool.NewBinanceStopBroker(cli), time.Second, slog.Default(), tool.LogStopClose)
 		tool.SetStopMonitor(monitor)
 		go monitor.Start(monitorCtx)
 

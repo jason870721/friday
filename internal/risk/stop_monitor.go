@@ -26,6 +26,7 @@ type StopLevels struct {
 	TakeProfit   float64 // mark price that triggers the take-profit (0 = none)
 	PositionQty  float64 // base-asset size to close on breach
 	PositionSide string  // DirLong / DirShort
+	EntryPrice   float64 // entry price of the position (for PnL estimation; 0 = unknown)
 }
 
 // active reports whether these levels are worth monitoring.
@@ -42,19 +43,37 @@ type StopBroker interface {
 	CloseReduceOnly(ctx context.Context, symbol string, qty float64, positionSide string) error
 }
 
+// StopCloseEvent describes a position that the StopMonitor closed.
+type StopCloseEvent struct {
+	Symbol       string
+	PositionQty  float64
+	PositionSide string  // DirLong or DirShort
+	EntryPrice   float64 // entry price (0 = unknown)
+	MarkPrice    float64
+	Reason       string  // "stop-loss" or "take-profit"
+}
+
+// StopCloseCallback is invoked after the StopMonitor closes a position. It
+// receives the close details so the caller can log the trade, fire
+// notifications, and feed the circuit breaker — the same path a round-based
+// close takes through log_trade. A nil callback disables this.
+type StopCloseCallback func(event StopCloseEvent)
+
 // StopMonitor watches registered levels and flattens on breach.
 type StopMonitor struct {
-	broker   StopBroker
-	interval time.Duration
-	logger   *slog.Logger
+	broker    StopBroker
+	interval  time.Duration
+	logger    *slog.Logger
+	onClose   StopCloseCallback
 
 	mu     sync.Mutex
 	levels map[string]StopLevels
 }
 
 // NewStopMonitor builds a monitor. interval ≤ 0 uses DefaultStopPollInterval;
-// a nil logger falls back to slog.Default().
-func NewStopMonitor(broker StopBroker, interval time.Duration, logger *slog.Logger) *StopMonitor {
+// a nil logger falls back to slog.Default(). onClose is called after each
+// successful stop-loss or take-profit close (nil = no callback).
+func NewStopMonitor(broker StopBroker, interval time.Duration, logger *slog.Logger, onClose StopCloseCallback) *StopMonitor {
 	if interval <= 0 {
 		interval = DefaultStopPollInterval
 	}
@@ -65,6 +84,7 @@ func NewStopMonitor(broker StopBroker, interval time.Duration, logger *slog.Logg
 		broker:   broker,
 		interval: interval,
 		logger:   logger,
+		onClose:  onClose,
 		levels:   make(map[string]StopLevels),
 	}
 }
@@ -136,6 +156,16 @@ func (m *StopMonitor) check(ctx context.Context) {
 			m.logger.Error("stop_monitor.close_failed", "symbol", symbol, "err", err)
 		} else {
 			m.logger.Info("stop_monitor.closed", "symbol", symbol, "reason", reason, "mark", mark)
+			if m.onClose != nil {
+				m.onClose(StopCloseEvent{
+					Symbol:       symbol,
+					PositionQty:  l.PositionQty,
+					PositionSide: l.PositionSide,
+					EntryPrice:   l.EntryPrice,
+					MarkPrice:    mark,
+					Reason:       reason,
+				})
+			}
 		}
 		// One-shot: clear whether or not the close succeeded, so a persistent
 		// failure (e.g. position already gone) can't spin; the next round's

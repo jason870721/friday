@@ -17,7 +17,7 @@ const BinanceMTFKlinesToolName tools.ToolName = "binance_mtf_klines"
 
 const binanceMTFKlinesDescription = `Multi-timeframe market read for a symbol in ONE call (PRD-008).
 
-Fetches three timeframes concurrently — 5m (last 100 min), 1h (last day), and
+Fetches three timeframes concurrently — 5m (last 8 hours), 1h (last day), and
 4h (last 4 days) — and returns, per timeframe, a natural-language Summary
 (price vs MA20, RSI, momentum, ATR) and a coarse direction (BULLISH / BEARISH /
 NEUTRAL). It then gives a cross-timeframe verdict:
@@ -57,7 +57,7 @@ var mtfFrames = []struct {
 	Interval string
 	Limit    int
 }{
-	{"5m", 20},
+	{"5m", 96}, // PRD-024 R1: 96×5m = 8h so all 5 strategies (EMACross needs 50) can vote on the entry TF
 	{"1h", 24},
 	{"4h", 48}, // PRD-016: ≥29 candles so ADX(14) → regime detection is computable
 }
@@ -173,6 +173,24 @@ func (BinanceMTFKlinesTool) Execute(ctx context.Context, logger *slog.Logger, ra
 		}
 	}
 	return tools.Result{Content: b.String()}, nil
+}
+
+// FetchMTF runs the multi-timeframe read for one symbol and returns the
+// formatted output string (the same text the LLM would see from the tool).
+// The orchestrator calls this for every symbol before the Analyst runs so the
+// LLM never needs to call binance_mtf_klines — the data is pre-loaded into
+// the round prompt, cutting 7 of the most expensive tool calls per round.
+func FetchMTF(ctx context.Context, symbol string) (string, error) {
+	var t BinanceMTFKlinesTool
+	raw, _ := json.Marshal(binanceMTFKlinesInput{Symbol: symbol})
+	res, err := t.Execute(ctx, slog.Default(), raw)
+	if err != nil {
+		return "", err
+	}
+	if res.IsError {
+		return "", fmt.Errorf("mtf_klines: %s", res.Content)
+	}
+	return res.Content, nil
 }
 
 // regimeLine renders the PRD-016 regime classification for a candle series:

@@ -63,7 +63,9 @@ LLM 無法繞過這些 Go 層防線。完整細節見 `CLAUDE.md` 的 Safety sys
 - **倉位與出場** — ATR 波動度倉位（風險 ~1% ÷ 2×ATR）；策略失效價/停利以 `inval=` / `tp=`
   提示風控；逐標的槓桿上限夾制（避免 `-4028`）。
 - **信號引擎** `internal/strategy` — 六個確定性策略（動量/突破/均值回歸/EMA 交叉/布林/跨標的背離）
-  → 信心校準（回測勝率）→ 市況加權 → MTF 跨時框投票（含 RSI 極端區過濾、5m+1h 覆寫、4h 硬否決）。
+  → 信心校準（回測勝率）→ 市況加權 → MTF 跨時框投票（5m 取 96 根 K 棒讓五策略都能在進場時框投票、
+  RSI 極端區過濾、4h 靜默時 2/3 共識、5m+1h 覆寫、低 TF 逆 4h 硬否決）。NEUTRAL 時 MTF Strategy
+  行下方會逐策略列出原因（未觸發/衝突/RSI 過濾/校準歸零），方便診斷。
 - **帳務與記憶** — 損益以 `/fapi/v1/income` 對帳為準（非 LLM 自報），WIN/LOSS 與熔斷皆以淨值計；
   `trades.jsonl` 逐策略績效、`rounds.jsonl` 逐輪記錄；`recall_trades` 相似交易 <5 筆時標示
   「insufficient data」，不可作為否決理由（避免 虧損→回溯全虧→不敢交易 的負回饋循環）。
@@ -91,7 +93,7 @@ LLM 無法繞過這些 Go 層防線。完整細節見 `CLAUDE.md` 的 Safety sys
 4. （可選）環境變數（不設則用括號內預設）：
    - 熔斷：`FRIDAY_DAILY_LOSS_PCT`(0.10)、`FRIDAY_MAX_CONSEC_LOSSES`(5)、`FRIDAY_DRAWDOWN_HALT_PCT`(0.20)、`FRIDAY_COOLDOWN_CYCLES`(20)
    - 風控：`FRIDAY_FEE_BUDGET_PCT`(0.005)、`FRIDAY_GROUP_LIMITS`（`name:pct:SYM1,SYM2;…`，預設 crypto/stocks）、`FRIDAY_RECALIBRATE_HOURS`(4，0 停用)
-   - 訊號：`FRIDAY_RSI_FILTER`(true)、`FRIDAY_MTF_HYSTERESIS`(0.05)、`FRIDAY_MTF_5M1H_OVERRIDE`(true)
+   - 訊號：`FRIDAY_RSI_FILTER`(true)、`FRIDAY_MTF_HYSTERESIS`(0.05)、`FRIDAY_MTF_5M1H_OVERRIDE`(true)、`FRIDAY_MTF_QUORUM`(true，4h 靜默時 2/3 共識投票)
    - 維運：`FRIDAY_PAPER`(false)、`FRIDAY_PAPER_BALANCE`(1000)、`FRIDAY_NOTIFY_PNL_PCT`(0.05)、Discord/Telegram 通知變數
 5. `go build ./...` 與 `go test ./...` 通過。
 

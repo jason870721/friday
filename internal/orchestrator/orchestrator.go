@@ -100,6 +100,28 @@ type Orchestrator struct {
 	// injected into every role prompt and submit schema. Resolved at
 	// bootstrap from FRIDAY_SYMBOLS (see bootstrap.resolveSymbols).
 	symbols []MarketSymbol
+
+	// consecutiveNeutral counts back-to-back non-actionable rounds (PRD-024 R9).
+	// Once it reaches neutralWarnAfter the carry carries an anti-degradation
+	// warning so the Analyst keeps producing real analysis through long lulls.
+	consecutiveNeutral int
+
+	// lastTradeSummary is the most recent position snapshot from an executed
+	// round (e.g. "ETH SHORT @1781.17 → +$11.73") — surfaced in the neutral
+	// warning so the Analyst remembers what an actual trade looks like.
+	lastTradeSummary string
+
+	// lastCloseCall describes the most recent round where a signal was close
+	// but not quite actionable (e.g. a non-NEUTRAL bias with setups that the
+	// Risk Manager WAITed on).
+	lastCloseCall string
+
+	// lastNeutralNotified is the highest consecutive-NEUTRAL milestone already
+	// alerted on for the CURRENT streak (PRD-024). Reset to 0 whenever an
+	// actionable round resets consecutiveNeutral, so each new streak re-alerts
+	// from the first milestone. Per-instance (not a package global) so sessions
+	// don't share state.
+	lastNeutralNotified int
 }
 
 // New builds the three role agents (each with a disjoint tool set) and
@@ -124,7 +146,6 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 		customTool(tool.BinancePriceToolName, func() pkgtools.Tool { return tool.NewBinancePrice() }),
 		customTool(tool.BinanceTickerToolName, func() pkgtools.Tool { return tool.NewBinanceTicker() }),
 		customTool(tool.BinanceKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceKlines() }),
-		customTool(tool.BinanceMTFKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceMTFKlines() }),
 		customTool(tool.BinanceFundingToolName, func() pkgtools.Tool { return tool.NewBinanceFunding() }),
 		customTool(tool.BinanceFeeToolName, func() pkgtools.Tool { return tool.NewBinanceFee() }),
 		customTool(tool.FearGreedIndexToolName, func() pkgtools.Tool { return tool.NewFearGreedIndex() }),
@@ -205,6 +226,10 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 		// Analyst and the Risk Manager see it next round when spend nears the cap.
 		carry = o.carryWithFeeWarning(carry)
 
+		// PRD-024 R9: on a long NEUTRAL streak, warn the next round so the Analyst
+		// stays vigilant and keeps producing real analysis instead of "凍結".
+		carry = o.carryWithNeutralWarning(carry)
+
 		// Periodic full compaction: prevent session bloat across
 		// hundreds of rounds (see compactEvery).
 		if round%compactEvery == 0 {
@@ -233,7 +258,13 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 
 	// 1. Analyst.
 	o.capAnalysis.reset()
-	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry)); err != nil {
+
+	// Preload MTF data for all symbols so the Analyst doesn't spend 7 tool-call
+	// turns on the most expensive operation (each mtf_klines fetches 96+24+48
+	// candles AND runs the strategy engine). The prompt already contains this
+	// data; the Analyst only needs fast tools (price, funding, recall).
+	mtfData := o.preloadMTF(ctx)
+	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, mtfData)); err != nil {
 		return ExecutionResult{}, fmt.Errorf("analyst run: %w", err)
 	}
 	var report AnalystReport
@@ -266,12 +297,17 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 
 	// Deterministic short-circuit: no orders to place → skip the Executor.
 	if !anyActionable(decisions) {
+		o.consecutiveNeutral++      // PRD-024 R9: track the NEUTRAL streak for the carry warning
+		o.captureCloseCall(report)  // capture "close but not quite" signals for the carry warning
+		o.notifyNeutralStreak()     // alert operator on long idle periods
 		rep := "No actionable trades this round. " + decisions.RiskNotes
 		o.narrate(roleOrch, rep)
 		res := ExecutionResult{Report: rep, Carry: carry}
 		o.recordRound(report, decisions, res, false, round)
 		return res, nil
 	}
+	o.consecutiveNeutral = 0  // PRD-024 R9: an actionable round breaks the streak
+	o.lastNeutralNotified = 0 // …and re-arms the per-streak milestone alerts
 
 	// 3. Executor.
 	o.capExec.reset()
@@ -282,16 +318,49 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	if err := o.capExec.into(&execRes); err != nil {
 		return ExecutionResult{}, fmt.Errorf("executor output: %w", err)
 	}
+	o.captureLastTrade(execRes.Carry) // PRD-024: remember the trade for the neutral warning
+	o.notifyTradeOpened(decisions)    // alert operator when a new position is entered
 	o.recordRound(report, decisions, execRes, true, round)
 	return execRes, nil
 }
 
 // --- prompt builders (inject upstream handoffs as JSON) ---
 
-func (o *Orchestrator) analystPrompt(round int, carry string) string {
+func (o *Orchestrator) analystPrompt(round int, carry string, mtfData string) string {
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\nAnalyse %s from fresh data now, then call submit_analysis with all of them.",
-		round, orFlat(carry), o.breakerLine(), symbolNames(o.symbols))
+		"Round %d. Previous state: %s%s\n\n--- Pre-loaded MTF data (already fetched — do NOT call binance_mtf_klines) ---\n%s\n--- End MTF data ---\n\nAnalyse %s from the pre-loaded data above, using the other tools (price, ticker, funding, fear_greed_index, position, recall_trades) for supplementary data. Then call submit_analysis with all of them.",
+		round, orFlat(carry), o.breakerLine(), mtfData, symbolNames(o.symbols))
+}
+
+// preloadMTF fetches the multi-timeframe read for every symbol concurrently in
+// Go and returns the combined text block for injection into the Analyst prompt.
+// This eliminates 7 sequential LLM tool-call turns (the most expensive operation
+// per round) — the LLM reads the data directly instead of calling the tool.
+func (o *Orchestrator) preloadMTF(ctx context.Context) string {
+	type result struct {
+		symbol string
+		text   string
+		err    error
+	}
+	ch := make(chan result, len(o.symbols))
+	for _, sym := range o.symbols {
+		go func(s string) {
+			text, err := tool.FetchMTF(ctx, s)
+			ch <- result{s, text, err}
+		}(sym.Name)
+	}
+
+	var b strings.Builder
+	for range o.symbols {
+		r := <-ch
+		if r.err != nil {
+			fmt.Fprintf(&b, "[%s] MTF data unavailable: %v\n\n", r.symbol, r.err)
+			continue
+		}
+		b.WriteString(r.text)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (o *Orchestrator) riskPrompt(round int, carry string, r AnalystReport) string {
@@ -341,20 +410,20 @@ func (o *Orchestrator) notifySessionStart() {
 	if ep == "" {
 		ep = "the configured endpoint"
 	}
-	o.notifyf("🚀 Friday started",
-		fmt.Sprintf("%s mode — trading %d symbol(s) (%s) on %s", mode, len(o.symbols), symbolNames(o.symbols), ep))
+	o.notifyf("🚀 Friday 啟動",
+		fmt.Sprintf("%s 模式 — 交易 %d 個標的（%s）於 %s", mode, len(o.symbols), symbolNames(o.symbols), ep))
 }
 
 // notifySessionStop sends a brief summary on clean shutdown (PRD-021 §3).
 func (o *Orchestrator) notifySessionStop(rounds int, lastReport string) {
-	body := fmt.Sprintf("Ran %d round(s).", rounds)
+	body := fmt.Sprintf("已執行 %d 輪。", rounds)
 	if o.breaker != nil {
-		body += " Breaker: " + o.breaker.Status() + "."
+		body += " 熔斷器: " + o.breaker.Status() + "。"
 	}
 	if r := strings.TrimSpace(lastReport); r != "" {
-		body += "\nLast: " + truncateLine(r, 300)
+		body += "\n最後一輪: " + truncateLine(r, 300)
 	}
-	o.notifyf("🛑 Friday stopped", body)
+	o.notifyf("🛑 Friday 關閉", body)
 }
 
 // truncateLine caps s at n runes for a notification body.
@@ -382,10 +451,63 @@ func (o *Orchestrator) notifyBreakerTransition() {
 	// Only alert on entering a degraded state, or recovering to NORMAL from one.
 	switch state {
 	case "PAUSED", "HALTED":
-		o.notifyf("⚠️ Friday breaker "+state, o.breaker.Status())
+		o.notifyf("⚠️ Friday 熔斷: "+state, o.breaker.Status())
 	case "NORMAL":
 		if prev == "PAUSED" || prev == "HALTED" {
-			o.notifyf("✅ Friday breaker recovered", o.breaker.Status())
+			o.notifyf("✅ Friday 熔斷恢復", o.breaker.Status())
+		}
+	}
+}
+
+// notifyTradeOpened sends a notification for each new position opened this round
+// (PRD-024). An OPEN_LONG or OPEN_SHORT decision that the Executor acted on
+// warrants an immediate alert — the operator shouldn't need to watch the TUI to
+// know the system is in a trade.
+func (o *Orchestrator) notifyTradeOpened(d RiskDecisions) {
+	if o.notifier == nil {
+		return
+	}
+	for _, dec := range d.Decisions {
+		if dec.Action != "OPEN_LONG" && dec.Action != "OPEN_SHORT" {
+			continue
+		}
+		dir := "LONG"
+		if dec.Action == "OPEN_SHORT" {
+			dir = "SHORT"
+		}
+		title := fmt.Sprintf("🔔 Friday 開倉: %s %s", dec.Symbol, dir)
+		body := fmt.Sprintf("%s %s 數量=%.4f 槓桿=%dx 止損=%.2f — %s",
+			dir, dec.Symbol, dec.Quantity, dec.Leverage, dec.StopLoss, dec.Reason)
+		o.notifyf(title, body)
+	}
+}
+
+// neutralStreakMilestones are the consecutive-NEUTRAL counts at which the
+// operator is alerted (PRD-024). 50 rounds ≈ 12.5 min of silence; 100 ≈ 25 min.
+var neutralStreakMilestones = []int{10, 20, 30, 40, 50, 75, 100}
+
+// notifyNeutralStreak alerts the operator when the system has been idle for an
+// extended period — a possible sign of a broken strategy engine or a structural
+// market shift that warrants investigation. The body includes the last known
+// close-call signal and trade so the operator has context without opening the TUI.
+func (o *Orchestrator) notifyNeutralStreak() {
+	if o.notifier == nil {
+		return
+	}
+	for _, m := range neutralStreakMilestones {
+		if o.consecutiveNeutral == m && m > o.lastNeutralNotified {
+			o.lastNeutralNotified = m
+			title := fmt.Sprintf("⏳ Friday: %d rounds without a trade", m)
+			body := fmt.Sprintf("已連續 %d 輪無交易（~%d 分鐘）。", m, m*15/60)
+			if o.lastTradeSummary != "" {
+				body += fmt.Sprintf(" 上次交易: %s。", o.lastTradeSummary)
+			}
+			if o.lastCloseCall != "" {
+				body += fmt.Sprintf(" 最近訊號: %s。", o.lastCloseCall)
+			}
+			body += " 若此閒置時間超出預期，請檢查策略引擎或市場狀態是否改變。"
+			o.notifyf(title, body)
+			return
 		}
 	}
 }
@@ -436,6 +558,99 @@ func stripFeeWarning(s string) string {
 	kept := lines[:0]
 	for _, ln := range lines {
 		if strings.Contains(ln, feeWarningMarker) {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	return strings.TrimRight(strings.Join(kept, "\n"), "\n")
+}
+
+// neutralWarnAfter is the consecutive-NEUTRAL streak length that triggers the
+// anti-degradation carry warning (PRD-024 R9).
+const neutralWarnAfter = 10
+
+// neutralWarningMarker tags the anti-degradation warning line in the carry so it
+// can be stripped and refreshed each round (rather than accumulating).
+const neutralWarningMarker = "⚠️ 已連續"
+
+// carryWithNeutralWarning refreshes the long-NEUTRAL-streak warning in the carry
+// (PRD-024 R9): it strips any prior warning, then appends a current one when the
+// streak has reached neutralWarnAfter. Strip-then-append keeps the carry from
+// growing a warning line every round (same pattern as carryWithFeeWarning).
+// When available, it also surfaces the last trade and last close-call signal so
+// the Analyst has concrete context beyond just a counter.
+func (o *Orchestrator) carryWithNeutralWarning(carry string) string {
+	base := stripNeutralWarning(carry)
+	if o.consecutiveNeutral < neutralWarnAfter {
+		return base
+	}
+	warn := fmt.Sprintf("%s %d 輪無交易。", neutralWarningMarker, o.consecutiveNeutral)
+	if o.lastTradeSummary != "" {
+		warn += fmt.Sprintf(" 上次交易: %s。", o.lastTradeSummary)
+	}
+	if o.lastCloseCall != "" {
+		warn += fmt.Sprintf(" 最近訊號: %s。", o.lastCloseCall)
+	}
+	warn += " 市場可能在醞釀突破——請保持警惕，不要因長期觀望而降低分析品質。"
+	if base == "" {
+		return warn
+	}
+	return base + "\n" + warn
+}
+
+// captureCloseCall extracts a "close but not quite" signal summary from the
+// Analyst report when the round produces no actionable trades (PRD-024 R9).
+// It looks for symbols with a non-NEUTRAL bias and setups — a signal the Risk
+// Manager WAITed on, worth reminding the Analyst about on long NEUTRAL streaks.
+func (o *Orchestrator) captureCloseCall(r AnalystReport) {
+	var best SymbolAnalysis
+	for _, s := range r.Symbols {
+		if s.Bias == "NEUTRAL" || len(s.Setups) == 0 {
+			continue
+		}
+		if len(s.Setups) > len(best.Setups) {
+			best = s
+		}
+	}
+	if best.Symbol == "" {
+		return
+	}
+	setup := strings.Join(best.Setups, ", ")
+	if len(setup) > 120 {
+		setup = setup[:117] + "..."
+	}
+	o.lastCloseCall = fmt.Sprintf("%s %s (%s)", best.Symbol, best.Bias, setup)
+}
+
+// captureLastTrade extracts a one-line trade summary from the executor's carry
+// string (PRD-024 R9). The carry contains position state like
+// "ETH: SHORT qty=1.468 entry=1781.17 peak=+$11.73 | BTC: FLAT | ...".
+// It picks the first non-FLAT entry as the most recent trade.
+func (o *Orchestrator) captureLastTrade(carry string) {
+	if carry == "" {
+		return
+	}
+	for _, part := range strings.Split(carry, "|") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasSuffix(part, "FLAT") {
+			continue
+		}
+		// "SYM: DIR qty=X.XX entry=Y.YY peak=+$Z.ZZ" — keep it concise.
+		o.lastTradeSummary = part
+		return
+	}
+}
+
+// stripNeutralWarning removes any previously-appended NEUTRAL-streak warning
+// line(s) from a carry string so the warning is refreshed, not duplicated.
+func stripNeutralWarning(s string) string {
+	if !strings.Contains(s, neutralWarningMarker) {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	kept := lines[:0]
+	for _, ln := range lines {
+		if strings.Contains(ln, neutralWarningMarker) {
 			continue
 		}
 		kept = append(kept, ln)

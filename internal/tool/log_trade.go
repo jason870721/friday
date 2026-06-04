@@ -159,13 +159,30 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 	// Large-PnL alert (PRD-021 §3): notify when this close's net wallet impact
 	// exceeds ±FRIDAY_NOTIFY_PNL_PCT of balance — a significant move the operator
 	// should know about without watching the TUI.
-	if globalNotifier != nil && balance > 0 && abs(effective) >= notifyPnLPct*balance {
+	largeClose := globalNotifier != nil && balance > 0 && abs(effective) >= notifyPnLPct*balance
+	if largeClose {
 		tag := ""
 		if rec.Paper {
 			tag = " [PAPER]"
 		}
-		title := fmt.Sprintf("📊 Friday: large %s on %s%s", outcomeWord(effective), in.Symbol, tag)
-		body := fmt.Sprintf("%s %s net %+.4f USDT (%.1f%% of $%.2f balance), strategy=%s",
+		title := fmt.Sprintf("📊 Friday 大額平倉: %s %s%s", in.Symbol, outcomeWord(effective), tag)
+		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（%.1f%% / 餘額 $%.2f），策略=%s",
+			in.Bias, in.Symbol, effective, effective/balance*100, balance, orNone(in.Strategy))
+		if nerr := globalNotifier.Notify(title, body); nerr != nil {
+			logger.Warn("log_trade.notify_failed", "err", nerr)
+		}
+	}
+
+	// Every-close alert: notify on ALL closes so the operator always knows when a
+	// position exits. For large closes the 📊 alert above already fired; use 💼
+	// for regular closes so the operator can distinguish at a glance.
+	if globalNotifier != nil && balance > 0 && !largeClose {
+		tag := ""
+		if rec.Paper {
+			tag = " [PAPER]"
+		}
+		title := fmt.Sprintf("💼 Friday 平倉: %s %s%s", in.Symbol, outcomeWord(effective), tag)
+		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（%.1f%% / 餘額 $%.2f），策略=%s",
 			in.Bias, in.Symbol, effective, effective/balance*100, balance, orNone(in.Strategy))
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			logger.Warn("log_trade.notify_failed", "err", nerr)
@@ -193,9 +210,9 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 // outcomeWord renders a PnL sign as a word for notification titles.
 func outcomeWord(pnl float64) string {
 	if pnl >= 0 {
-		return "WIN"
+		return "獲利"
 	}
-	return "LOSS"
+	return "虧損"
 }
 
 // orNone returns s, or "n/a" when blank.

@@ -31,7 +31,7 @@ func (m *mockBroker) CloseReduceOnly(_ context.Context, symbol string, qty float
 }
 
 func newTestMonitor(b StopBroker) *StopMonitor {
-	return NewStopMonitor(b, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewStopMonitor(b, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
 func TestStopMonitor_LongStopFires(t *testing.T) {
@@ -119,7 +119,7 @@ func TestStopMonitor_PriceErrorSkips(t *testing.T) {
 }
 
 func TestStopMonitor_StartStopsOnContextCancel(t *testing.T) {
-	m := NewStopMonitor(&mockBroker{price: 105}, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := NewStopMonitor(&mockBroker{price: 105}, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { m.Start(ctx); close(done) }()
