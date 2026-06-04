@@ -6,8 +6,17 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 
 	"github.com/johnny1110/evva/pkg/tools"
+)
+
+// Commission rates are fixed for the session (VIP tier / BNB discount don't
+// change mid-run), so cache the rendered line per symbol (T3) — avoids a signed
+// REST call on every Risk-Manager round.
+var (
+	feeMu    sync.Mutex
+	feeCache = map[string]string{}
 )
 
 const BinanceFeeToolName tools.ToolName = "binance_fee"
@@ -54,6 +63,13 @@ func (BinanceFeeTool) Execute(ctx context.Context, logger *slog.Logger, raw json
 		return tools.Result{IsError: true, Content: "binance_fee: symbol is required"}, nil
 	}
 
+	feeMu.Lock()
+	if cached, ok := feeCache[in.Symbol]; ok {
+		feeMu.Unlock()
+		return tools.Result{Content: cached}, nil
+	}
+	feeMu.Unlock()
+
 	cli, err := sharedBinanceClient()
 	if err != nil {
 		return tools.Result{IsError: true, Content: err.Error()}, nil
@@ -72,5 +88,8 @@ func (BinanceFeeTool) Execute(ctx context.Context, logger *slog.Logger, raw json
 		"%s maker=%s (%.4f%%) taker=%s (%.4f%%) round-trip≈%.4f%%",
 		r.Symbol, r.MakerCommissionRate, maker*100, r.TakerCommissionRate, taker*100, taker*2*100,
 	)
+	feeMu.Lock()
+	feeCache[in.Symbol] = content
+	feeMu.Unlock()
 	return tools.Result{Content: content}, nil
 }

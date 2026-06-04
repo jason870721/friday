@@ -307,6 +307,17 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	}
 	o.narrate(roleOrch, "Analyst → Risk Manager · "+summariseReport(report))
 
+	// T1 idle short-circuit: when every symbol is NEUTRAL and no position is
+	// open, the Risk Manager can only emit WAIT (no opens to size, no positions
+	// to manage) — so skip it AND the Executor entirely. This removes ~5–10 LLM
+	// round-trips on the common idle round. Risk still runs whenever a position
+	// is open (it owns the mandatory stop/TP/trailing checks) or any bias is
+	// directional. HasOpenPositions fails safe (true) if the state is unknown.
+	if allNeutralBias(report) && !tool.HasOpenPositions(ctx) {
+		rep := "All symbols NEUTRAL and no open positions — skipped Risk Manager (idle round)."
+		return o.idleRound(report, RiskDecisions{}, carry, rep, round), nil
+	}
+
 	// 2. Risk Manager.
 	o.capRisk.reset()
 	if _, err := o.risk.Run(ctx, o.riskPrompt(round, carry, report)); err != nil {
@@ -331,14 +342,8 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 
 	// Deterministic short-circuit: no orders to place → skip the Executor.
 	if !anyActionable(decisions) {
-		o.consecutiveNeutral++      // PRD-024 R9: track the NEUTRAL streak for the carry warning
-		o.captureCloseCall(report)  // capture "close but not quite" signals for the carry warning
-		o.notifyNeutralStreak()     // alert operator on long idle periods
 		rep := "No actionable trades this round. " + decisions.RiskNotes
-		o.narrate(roleOrch, rep)
-		res := ExecutionResult{Report: rep, Carry: carry}
-		o.recordRound(report, decisions, res, false, round)
-		return res, nil
+		return o.idleRound(report, decisions, carry, rep, round), nil
 	}
 	o.consecutiveNeutral = 0  // PRD-024 R9: an actionable round breaks the streak
 	o.lastNeutralNotified = 0 // …and re-arms the per-streak milestone alerts
@@ -830,6 +835,31 @@ func orFlat(s string) string {
 		return "(none — first round)"
 	}
 	return s
+}
+
+// idleRound records a non-actionable round (no Executor) and advances the
+// NEUTRAL-streak bookkeeping. Shared by the T1 all-NEUTRAL pre-Risk short-circuit
+// (decisions empty) and the post-Risk "nothing actionable" path.
+func (o *Orchestrator) idleRound(report AnalystReport, decisions RiskDecisions, carry, rep string, round int) ExecutionResult {
+	o.consecutiveNeutral++     // PRD-024 R9: track the NEUTRAL streak for the carry warning
+	o.captureCloseCall(report) // capture "close but not quite" signals for the carry warning
+	o.notifyNeutralStreak()    // alert operator on long idle periods
+	o.narrate(roleOrch, rep)
+	res := ExecutionResult{Report: rep, Carry: carry}
+	o.recordRound(report, decisions, res, false, round)
+	return res
+}
+
+// allNeutralBias reports whether every symbol in the report carries a NEUTRAL
+// bias (the precondition, with no open positions, for the T1 idle short-circuit).
+// An empty report counts as all-NEUTRAL (nothing to act on).
+func allNeutralBias(r AnalystReport) bool {
+	for _, s := range r.Symbols {
+		if strings.ToUpper(strings.TrimSpace(s.Bias)) != "NEUTRAL" {
+			return false
+		}
+	}
+	return true
 }
 
 func anyActionable(d RiskDecisions) bool {

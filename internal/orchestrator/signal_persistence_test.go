@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func TestAllNeutralBias(t *testing.T) {
+	allN := AnalystReport{Symbols: []SymbolAnalysis{{Symbol: "BTCUSDT", Bias: "NEUTRAL"}, {Symbol: "ETHUSDT", Bias: " neutral "}}}
+	if !allNeutralBias(allN) {
+		t.Errorf("all-NEUTRAL (incl. whitespace/case) should be true")
+	}
+	oneDir := AnalystReport{Symbols: []SymbolAnalysis{{Symbol: "BTCUSDT", Bias: "NEUTRAL"}, {Symbol: "ETHUSDT", Bias: "BEARISH"}}}
+	if allNeutralBias(oneDir) {
+		t.Errorf("a directional bias must make it false")
+	}
+	if !allNeutralBias(AnalystReport{}) {
+		t.Errorf("empty report should be all-NEUTRAL (nothing to act on)")
+	}
+}
+
 func TestParseMTFDirections(t *testing.T) {
 	syms := []MarketSymbol{{Name: "BTCUSDT"}, {Name: "ETHUSDT"}, {Name: "SOLUSDT"}}
 	mtf := "BTCUSDT multi-timeframe read:\n[5m] … → BEARISH\nMTF Strategy: SHORT (5m:SHORT …) → weighted SHORT 0.42\n" +

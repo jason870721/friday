@@ -7,9 +7,21 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/johnny1110/evva/pkg/tools"
+)
+
+// Fear & Greed updates roughly daily, so cache it across rounds (T3): the
+// external alternative.me call is the slowest tool the Analyst hits every round.
+// A short TTL keeps it fresh enough while removing the per-round network latency.
+const fearGreedTTL = 10 * time.Minute
+
+var (
+	fgMu       sync.Mutex
+	fgCached   string
+	fgCachedAt time.Time
 )
 
 // FearGreedIndexToolName is the wire name the LLM sees.
@@ -83,6 +95,15 @@ func parseFearGreed(body []byte) (string, error) {
 func (FearGreedIndexTool) Execute(ctx context.Context, logger *slog.Logger, _ json.RawMessage) (tools.Result, error) {
 	logger.Debug("fear_greed_index.dispatch")
 
+	// T3: serve a fresh cached value to avoid re-hitting the external API every round.
+	fgMu.Lock()
+	if fgCached != "" && time.Since(fgCachedAt) < fearGreedTTL {
+		cached := fgCached
+		fgMu.Unlock()
+		return tools.Result{Content: cached + " (cached)"}, nil
+	}
+	fgMu.Unlock()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fearGreedURL, nil)
 	if err != nil {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("fear_greed_index: build request: %v", err)}, nil
@@ -105,5 +126,8 @@ func (FearGreedIndexTool) Execute(ctx context.Context, logger *slog.Logger, _ js
 	if err != nil {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("fear_greed_index: %v", err)}, nil
 	}
+	fgMu.Lock()
+	fgCached, fgCachedAt = line, time.Now()
+	fgMu.Unlock()
 	return tools.Result{Content: line}, nil
 }

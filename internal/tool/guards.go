@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -8,6 +9,27 @@ import (
 	"github.com/johnny1110/friday/internal/notify"
 	"github.com/johnny1110/friday/internal/risk"
 )
+
+// HasOpenPositions reports whether any non-zero position is currently held —
+// a cheap Go-side check the orchestrator uses to decide if it can skip the Risk
+// Manager on an all-NEUTRAL round (the idle short-circuit). Paper mode reads the
+// virtual book (instant); live mode does one /fapi/v2/positionRisk call. On a
+// query error it returns true (fail safe — never skip the risk checks when the
+// position state is unknown).
+func HasOpenPositions(ctx context.Context) bool {
+	if globalPaper != nil {
+		return len(globalPaper.Positions()) > 0
+	}
+	cli, err := sharedBinanceClient()
+	if err != nil {
+		return true
+	}
+	open, err := cli.OpenPositions(ctx)
+	if err != nil {
+		return true
+	}
+	return len(open) > 0
+}
 
 // Process-wide pre-trade guards installed by bootstrap (PRD-020). Like
 // globalBreaker, they are consulted by binance_order before an OPENING order
