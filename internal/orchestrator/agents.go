@@ -13,13 +13,13 @@ import (
 // the per-role custom tools passed as options. Active tools are left empty
 // — the SDK auto-registers each WithCustomTool into the active catalog, so
 // each agent ends up with exactly its disjoint tool set and nothing else.
-func buildAgent(cfg *config.Config, name, role, systemPrompt string, emitter RoleEmitter, maxIters int, toolOpts ...agent.Option) (agent.Agent, error) {
+func buildAgent(cfg *config.Config, name, role, systemPrompt string, emitter RoleEmitter, maxIters int, model constant.Model, effort string, toolOpts ...agent.Option) (agent.Agent, error) {
 	prof, err := agent.NewProfile(
 		name,
 		systemPrompt,
 		[]pkgtools.ToolName{}, // custom tools auto-add to the active catalog
 		"deepseek",
-		constant.DEEPSEEK_V4_PRO,
+		model,
 		agent.ProfileOptions{Stream: false},
 	)
 	if err != nil {
@@ -39,7 +39,7 @@ func buildAgent(cfg *config.Config, name, role, systemPrompt string, emitter Rol
 	if err != nil {
 		return nil, err
 	}
-	if err := ag.SetEffort("ultra"); err != nil {
+	if err := ag.SetEffort(effort); err != nil {
 		return nil, err
 	}
 	return ag, nil

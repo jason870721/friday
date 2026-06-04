@@ -11,6 +11,7 @@ import (
 
 	"github.com/johnny1110/evva/pkg/agent"
 	"github.com/johnny1110/evva/pkg/config"
+	"github.com/johnny1110/evva/pkg/constant"
 	"github.com/johnny1110/evva/pkg/event"
 	pkgtools "github.com/johnny1110/evva/pkg/tools"
 
@@ -203,21 +204,21 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 			cap := &capture{}
 			// maxIters 15 (not 40): with the data-complete prompt a per-symbol
 			// agent submits in ~1-2 turns, so 15 is a generous runaway fuse.
-			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}), emitter, 15, analystTools(cap, 1)...)
+			ag, err := buildAgent(cfg, "friday-analyst-"+sym.Name, roleAnalyst, analystSystemPrompt([]MarketSymbol{sym}), emitter, 15, analystModel(), analystEffort(), analystTools(cap, 1)...)
 			if err != nil {
 				return nil, fmt.Errorf("build analyst %s: %w", sym.Name, err)
 			}
 			o.analystUnits = append(o.analystUnits, analystUnit{symbol: sym.Name, run: ag, agent: ag, cap: cap})
 		}
 	} else {
-		a, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40, analystTools(o.capAnalysis, len(symbols))...)
+		a, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40, analystModel(), analystEffort(), analystTools(o.capAnalysis, len(symbols))...)
 		if err != nil {
 			return nil, fmt.Errorf("build analyst: %w", err)
 		}
 		analyst = a
 	}
 
-	risk, err := buildAgent(cfg, "friday-risk", roleRisk, riskSystemPrompt(symbols), emitter, 30,
+	risk, err := buildAgent(cfg, "friday-risk", roleRisk, riskSystemPrompt(symbols), emitter, 30, constant.DEEPSEEK_V4_PRO, "ultra",
 		customTool(tool.BinanceBalanceToolName, func() pkgtools.Tool { return tool.NewBinanceBalance() }),
 		customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
 		customTool(tool.BinancePriceToolName, func() pkgtools.Tool { return tool.NewBinancePrice() }),
@@ -228,7 +229,7 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 		return nil, fmt.Errorf("build risk manager: %w", err)
 	}
 
-	executor, err := buildAgent(cfg, "friday-executor", roleExec, executorSystemPrompt(symbols), emitter, 40,
+	executor, err := buildAgent(cfg, "friday-executor", roleExec, executorSystemPrompt(symbols), emitter, 40, constant.DEEPSEEK_V4_PRO, "ultra",
 		customTool(tool.BinanceLeverageToolName, func() pkgtools.Tool { return tool.NewBinanceLeverage() }),
 		customTool(tool.BinanceOrderToolName, func() pkgtools.Tool { return tool.NewBinanceOrder() }),
 		customTool(tool.BinanceCloseAllToolName, func() pkgtools.Tool { return tool.NewBinanceCloseAll() }),
@@ -315,6 +316,26 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 		case <-time.After(o.interval):
 		}
 	}
+}
+
+// analystModel / analystEffort pick the Analyst's LLM tier. Default to the
+// faster deepseek-v4-flash at "medium" effort: the Analyst reads pre-loaded data
+// and validates the deterministic signal against code-enforced gates — it does
+// not need v4-pro/ultra reasoning, and it's the per-round latency bottleneck
+// (7 concurrent calls). Risk/Executor stay on v4-pro/ultra (they size, veto, and
+// place real orders). Override via FRIDAY_ANALYST_MODEL / FRIDAY_ANALYST_EFFORT.
+func analystModel() constant.Model {
+	if m := strings.TrimSpace(os.Getenv("FRIDAY_ANALYST_MODEL")); m != "" {
+		return constant.Model(m)
+	}
+	return constant.DEEPSEEK_V4_FLASH
+}
+
+func analystEffort() string {
+	if e := strings.TrimSpace(os.Getenv("FRIDAY_ANALYST_EFFORT")); e != "" {
+		return e
+	}
+	return "medium"
 }
 
 // SetMaxRounds bounds Run to n rounds then return (0 = unbounded). For a
