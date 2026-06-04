@@ -158,16 +158,16 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 		symbols:     symbols,
 	}
 
+	// The Analyst's market data (Fear & Greed + per-symbol MTF + price/24h/
+	// funding snapshot) is pre-loaded into its prompt by preloadMarketData, so
+	// price/ticker/funding/fee/fear_greed tools are NOT registered — that's the
+	// data-complete-prompt optimisation that cut the Analyst from ~30 tool-call
+	// round-trips to ~1. It keeps only the OPTIONAL tools it occasionally needs.
 	analyst, err := buildAgent(cfg, "friday-analyst", roleAnalyst, analystSystemPrompt(symbols), emitter, 40,
-		customTool(tool.BinancePriceToolName, func() pkgtools.Tool { return tool.NewBinancePrice() }),
-		customTool(tool.BinanceTickerToolName, func() pkgtools.Tool { return tool.NewBinanceTicker() }),
 		customTool(tool.BinanceKlinesToolName, func() pkgtools.Tool { return tool.NewBinanceKlines() }),
-		customTool(tool.BinanceFundingToolName, func() pkgtools.Tool { return tool.NewBinanceFunding() }),
-		customTool(tool.BinanceFeeToolName, func() pkgtools.Tool { return tool.NewBinanceFee() }),
-		customTool(tool.FearGreedIndexToolName, func() pkgtools.Tool { return tool.NewFearGreedIndex() }),
 		customTool(tool.BinancePositionToolName, func() pkgtools.Tool { return tool.NewBinancePosition() }),
 		// PRD-004: self-reflection (recall similar past trades) and
-		// hypothesis validation (sandbox backtest) before forming a bias.
+		// hypothesis validation (sandbox backtest) when validating a directional bias.
 		customTool(tool.RecallTradesToolName, func() pkgtools.Tool { return tool.NewRecallTrades() }),
 		customTool(tool.RunBacktestToolName, func() pkgtools.Tool { return tool.NewRunBacktest() }),
 		submitOption(submitAnalysisName, submitAnalysisDesc, submitAnalysisSchema(len(symbols)), o.capAnalysis),
@@ -289,16 +289,16 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 	// 1. Analyst.
 	o.capAnalysis.reset()
 
-	// Preload MTF data for all symbols so the Analyst doesn't spend 7 tool-call
-	// turns on the most expensive operation (each mtf_klines fetches 96+24+48
-	// candles AND runs the strategy engine). The prompt already contains this
-	// data; the Analyst only needs fast tools (price, funding, recall).
-	mtfData := o.preloadMTF(ctx)
+	// Preload ALL read-only market data in Go (Fear & Greed + per-symbol MTF +
+	// price/24h/funding snapshot) so the Analyst reads it from the prompt and
+	// makes ~1 LLM call instead of ~30 tool-call round-trips (mtf/price/ticker/
+	// funding/F&G were the Analyst-stage latency bottleneck).
+	marketData := o.preloadMarketData(ctx)
 	// PRD-024 review fix: update the per-symbol MTF-direction persistence streaks
 	// from this round's data and inject them so the Analyst holds back fresh
 	// (×1) signals until they confirm (the signal-persistence gate).
-	o.updateMTFStreaks(parseMTFDirections(mtfData, o.symbols))
-	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, mtfData, o.persistenceLine())); err != nil {
+	o.updateMTFStreaks(parseMTFDirections(marketData, o.symbols))
+	if _, err := o.analyst.Run(ctx, o.analystPrompt(round, carry, marketData, o.persistenceLine())); err != nil {
 		return ExecutionResult{}, fmt.Errorf("analyst run: %w", err)
 	}
 	var report AnalystReport
@@ -365,10 +365,10 @@ func (o *Orchestrator) runRound(ctx context.Context, round int, carry string) (E
 
 // --- prompt builders (inject upstream handoffs as JSON) ---
 
-func (o *Orchestrator) analystPrompt(round int, carry, mtfData, persistence string) string {
+func (o *Orchestrator) analystPrompt(round int, carry, marketData, persistence string) string {
 	return fmt.Sprintf(
-		"Round %d. Previous state: %s%s\n\n--- Pre-loaded MTF data (already fetched — do NOT call binance_mtf_klines) ---\n%s\n%s\n--- End MTF data ---\n\nAnalyse %s from the pre-loaded data above, using the other tools (price, ticker, funding, fear_greed_index, position, recall_trades) for supplementary data. Then call submit_analysis with all of them.",
-		round, orFlat(carry), o.breakerLine(), mtfData, persistence, symbolNames(o.symbols))
+		"Round %d. Previous state: %s%s\n\n--- Pre-loaded market data (Fear & Greed + per-symbol MTF block & snapshot, all fetched in Go) ---\n%s\n%s\n--- End pre-loaded data ---\n\nAnalyse %s from the pre-loaded data above — it already has price/24h/funding/sentiment, so you should not need any tool before submit_analysis. Then call submit_analysis with all of them.",
+		round, orFlat(carry), o.breakerLine(), marketData, persistence, symbolNames(o.symbols))
 }
 
 // parseMTFDirections extracts each symbol's current MTF Strategy direction
@@ -454,35 +454,42 @@ func (o *Orchestrator) persistenceLine() string {
 	return "Signal persistence: " + strings.Join(parts, "; ")
 }
 
-// preloadMTF fetches the multi-timeframe read for every symbol concurrently in
-// Go and returns the combined text block for injection into the Analyst prompt.
-// This eliminates 7 sequential LLM tool-call turns (the most expensive operation
-// per round) — the LLM reads the data directly instead of calling the tool.
-func (o *Orchestrator) preloadMTF(ctx context.Context) string {
+// preloadMarketData fetches, in Go before the Analyst runs, ALL the read-only
+// data the Analyst needs: the market-wide Fear & Greed line, and per symbol the
+// multi-timeframe read PLUS a price/24h/funding snapshot. Injected into the
+// Analyst prompt so the Analyst makes ~1 LLM call (read → submit) instead of the
+// ~30 tool-call round-trips it used to spend on mtf/price/ticker/funding/F&G.
+// Symbols are fetched concurrently; results are assembled in stable order.
+func (o *Orchestrator) preloadMarketData(ctx context.Context) string {
 	type result struct {
-		symbol string
-		text   string
-		err    error
+		idx  int
+		text string
 	}
 	ch := make(chan result, len(o.symbols))
-	for _, sym := range o.symbols {
-		go func(s string) {
-			text, err := tool.FetchMTF(ctx, s)
-			ch <- result{s, text, err}
-		}(sym.Name)
+	for i, sym := range o.symbols {
+		go func(i int, s string) {
+			var b strings.Builder
+			if mtf, err := tool.FetchMTF(ctx, s); err != nil {
+				fmt.Fprintf(&b, "[%s] MTF data unavailable: %v\n", s, err)
+			} else {
+				b.WriteString(mtf)
+				b.WriteString(tool.FetchSnapshot(ctx, s))
+				b.WriteString("\n")
+			}
+			ch <- result{i, b.String()}
+		}(i, sym.Name)
 	}
-
-	var b strings.Builder
+	blocks := make([]string, len(o.symbols))
 	for range o.symbols {
 		r := <-ch
-		if r.err != nil {
-			fmt.Fprintf(&b, "[%s] MTF data unavailable: %v\n\n", r.symbol, r.err)
-			continue
-		}
-		b.WriteString(r.text)
-		b.WriteString("\n")
+		blocks[r.idx] = r.text
 	}
-	return b.String()
+
+	var out strings.Builder
+	out.WriteString(tool.FetchFearGreed(ctx))
+	out.WriteString("\n\n")
+	out.WriteString(strings.Join(blocks, "\n"))
+	return out.String()
 }
 
 func (o *Orchestrator) riskPrompt(round int, carry string, r AnalystReport) string {
