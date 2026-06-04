@@ -74,9 +74,11 @@ FRIDAY_RECALIBRATE_HOURS=4
 # Paper trading: no real orders — a virtual book trades against live market data.
 # FRIDAY_PAPER=true
 # FRIDAY_PAPER_BALANCE=1000
-# Analyst speed: run one per-symbol Analyst agent concurrently each round (default
-# on, ~2.5× faster than one big multi-symbol call). Set false for a single agent.
-FRIDAY_PARALLEL_ANALYST=true
+# Analyst speed: per-symbol parallel Analyst is EXPERIMENTAL and OFF by default —
+# evva dedups custom tools by name across agents, so the fleet collides on one
+# submit capture (6/7 results lost). Leave false until each agent gets a unique
+# submit tool name.
+# FRIDAY_PARALLEL_ANALYST=false
 # Analyst LLM tier (default flash+medium — the Analyst validates a deterministic
 # signal against code gates, so it needs no v4-pro/ultra reasoning, and it's the
 # latency bottleneck). Risk/Executor stay on v4-pro/ultra regardless.

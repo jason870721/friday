@@ -194,12 +194,15 @@ func New(cfg *config.Config, emitter RoleEmitter, breaker *risk.CircuitBreaker, 
 		}
 	}
 
-	// Parallel analyst (default): build one single-symbol agent per market so the
-	// stage fans out concurrently each round (wall-clock = one small DeepSeek call
-	// instead of one big 7-symbol call). FRIDAY_PARALLEL_ANALYST=false falls back
-	// to a single multi-symbol analyst.
+	// Parallel analyst — DEFAULT OFF, EXPERIMENTAL/BROKEN. evva's WithCustomTool
+	// dedups custom tools by NAME across agents ("registers the factory once and
+	// reuses it"), so all per-symbol agents sharing the "submit_analysis" name
+	// collide on the FIRST agent's capture — 6 of 7 results are lost and the
+	// survivor is mislabelled. Until each agent gets a UNIQUE submit tool name,
+	// the single multi-symbol analyst (collision-free) is the default. Opt in
+	// with FRIDAY_PARALLEL_ANALYST=true only after that fix lands.
 	var analyst agent.Agent
-	if !strings.EqualFold(strings.TrimSpace(os.Getenv("FRIDAY_PARALLEL_ANALYST")), "false") {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("FRIDAY_PARALLEL_ANALYST")), "true") {
 		for _, sym := range symbols {
 			cap := &capture{}
 			// maxIters 15 (not 40): with the data-complete prompt a per-symbol
