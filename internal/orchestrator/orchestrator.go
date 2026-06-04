@@ -379,6 +379,13 @@ func parseMTFDirections(mtfData string, symbols []MarketSymbol) map[string]strin
 			continue
 		}
 		trimmed := strings.TrimSpace(ln)
+		// A "data unavailable" symbol has no MTF line; clear the scope so a later
+		// stray line can't be misattributed to it (defensive — the next symbol's
+		// header would reset cur anyway).
+		if strings.Contains(trimmed, "MTF data unavailable") {
+			cur = ""
+			continue
+		}
 		if cur != "" && strings.HasPrefix(trimmed, "MTF Strategy:") {
 			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "MTF Strategy:"))
 			switch {

@@ -1,8 +1,27 @@
 // Command backtest replays friday's deterministic strategy engine over
 // historical candles and simulates position management with the same rules the
-// Risk Manager uses (ATR sizing, 1×ATR invalidation filter, ATR-scaled TP/SL) —
-// no LLM, no exchange. It answers "what would friday have done?" without risking
-// a cent.
+// Risk Manager uses (ATR sizing, 1×ATR invalidation filter, ATR-scaled TP/SL,
+// round-trip taker fees) — no LLM, no exchange. It answers "what would friday
+// have done?" without risking a cent. It reports win rate, expectancy, payoff,
+// profit factor, Sharpe/Sortino, max drawdown and max consecutive losses.
+//
+// Klines are PUBLIC, so point BINANCE_BASE_URL at mainnet for real data even
+// when you trade testnet (the API key only needs to be non-empty):
+//
+//	# single-timeframe replay (the strategy signal on one interval)
+//	BINANCE_BASE_URL=https://fapi.binance.com \
+//	  go run ./cmd/backtest -symbols BTCUSDT,ETHUSDT,SOLUSDT -interval 5m -days 5
+//
+//	# multi-timeframe: walk 5m and combine 5m+1h+4h via AggregateMTF — the live
+//	# Analyst's signal path (new 5m-leading weights, RSI filter, quorum, 4h veto).
+//	# Bounded to ~5-day windows by the 5m 1500-candle cap; -interval is ignored.
+//	... go run ./cmd/backtest -days 5 -mtf
+//
+//	# out-of-sample / walk-forward: shift the window back N days (no overlap)
+//	... go run ./cmd/backtest -interval 1h -days 40 -end-days-ago 40
+//
+// Flags: -symbols, -interval, -days, -balance, -leverage, -risk, -fee (taker
+// rate/side, default 4 bps), -end-days-ago (window shift), -mtf (multi-timeframe).
 package main
 
 import (

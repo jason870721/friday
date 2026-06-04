@@ -118,7 +118,9 @@ go build ./...
 go test ./...                  # every internal/* package has unit tests
 go vet ./...
 go run ./cmd/friday            # launches the TUI; paste the kickoff prompt from SKILL.md
+go run ./cmd/friday -headless -rounds N [-fast]   # non-TUI batch run (pair with FRIDAY_PAPER=true)
 go run ./cmd/analyze           # session post-mortem (-json, -rounds/-trades flags)
+go run ./cmd/backtest          # replay the strategy engine on historical klines (-mtf, -end-days-ago, -fee, …)
 go run ./cmd/reconcile-memory  # dry-run PnL fix (-write to apply)
 ```
 
