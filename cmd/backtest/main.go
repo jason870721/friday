@@ -48,6 +48,16 @@ func main() {
 	feeFlag := flag.Float64("fee", 0.0004, "Taker fee rate per side (round-trip = 2×); 0.0004 = 4 bps")
 	endAgoFlag := flag.Int("end-days-ago", 0, "End the window this many days before now (0 = now); use with -days for an out-of-sample window, e.g. -days 40 -end-days-ago 40")
 	mtfFlag := flag.Bool("mtf", false, "Multi-timeframe mode: walk the 5m entry TF and combine 5m+1h+4h via AggregateMTF (the live signal path); -interval is ignored. Limited to ~5 days (5m 1500-candle cap).")
+	tpMultFlag := flag.Float64("tp-mult", 2.0, "Take-profit distance in ATR multiples (default 2.0 = symmetric 1:1).")
+	slMultFlag := flag.Float64("sl-mult", 2.0, "Stop-loss distance in ATR multiples (default 2.0).")
+	regimeGateFlag := flag.Bool("regime-gate", false, "Only open when the regime (4h in MTF mode, entry-TF in single) is TRENDING (ADX>25) — suppress RANGING/TRANSITIONAL chop.")
+	tieredFlag := flag.Bool("tiered", false, "Faithful tiered exit (mirrors the live prompt): tier-1 closes -tier1-frac at -tp1×R + moves stop to break-even, tier-2 closes the rest at -tp2×R, with a trailing stop. Overrides the single-TP exit. R = the stop distance.")
+	tp1Flag := flag.Float64("tp1", 2.0, "Tiered: tier-1 take-profit in R multiples (R = stop distance).")
+	tp2Flag := flag.Float64("tp2", 4.0, "Tiered: tier-2 (final) take-profit in R multiples.")
+	tier1FracFlag := flag.Float64("tier1-frac", 0.5, "Tiered: fraction of the position closed at tier-1.")
+	breakevenFlag := flag.Bool("breakeven", true, "Tiered: after tier-1, move the stop to break-even on the remainder.")
+	trailStartFlag := flag.Float64("trail-start", 2.0, "Tiered: peak favourable excursion (in R) that engages the trailing stop.")
+	trailGiveFlag := flag.Float64("trail-give", 1.0, "Tiered: once trailing, close if uPnL gives back to this many R.")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -97,7 +107,8 @@ func main() {
 	// 1h/4h lookback so every 5m bar has full higher-TF history behind it, then
 	// replay through AggregateMTF.
 	if *mtfFlag {
-		bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag)
+		bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
+		bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
 		lim5 := days * 288
 		if lim5 > 1500 {
 			lim5 = 1500
@@ -148,7 +159,8 @@ func main() {
 	fmt.Println()
 
 	// Run the backtest.
-	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag)
+	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
+	bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
 	for i, sd := range results {
 		if sd.err != nil {
 			continue
@@ -198,6 +210,12 @@ type position struct {
 	tpPrice    float64
 	atr        float64
 	openAt     int // candle index
+	// Tiered-exit state (used when the engine runs in tiered mode).
+	rDist     float64 // 1R in price = the stop distance at entry
+	tier1Px   float64 // tier-1 take-profit price
+	tier2Px   float64 // tier-2 (final) take-profit price
+	tier1Done bool    // tier-1 partial already taken
+	peakFav   float64 // best favourable excursion (price distance) seen, for the trail
 }
 
 type trade struct {
@@ -215,18 +233,38 @@ type backtestEngine struct {
 	leverage     int
 	riskPct      float64
 	feeRate      float64 // taker rate per side; round-trip = 2×
-	positions    map[string]*position
-	trades       []trade
-	equityCurve  []float64
+	tpMult       float64 // take-profit distance in ATR multiples (single-TP mode)
+	slMult       float64 // stop-loss distance in ATR multiples
+	regimeGate   bool    // only open in a TRENDING regime
+	// Tiered exit (mirrors the live prompt). R = the stop distance.
+	tiered     bool
+	tp1        float64 // tier-1 TP in R
+	tp2        float64 // tier-2 (final) TP in R
+	tier1Frac  float64 // fraction closed at tier-1
+	breakeven  bool    // move stop to break-even after tier-1
+	trailStart float64 // peak excursion (R) that engages the trail
+	trailGive  float64 // once trailing, exit if uPnL gives back to this many R
+	positions   map[string]*position
+	trades      []trade
+	equityCurve []float64
 }
 
-func newBacktest(balance float64, leverage int, riskPct, feeRate float64) *backtestEngine {
+// setTiered installs the faithful tiered-exit plan (mirrors the live prompt).
+func (bt *backtestEngine) setTiered(on bool, tp1, tp2, frac, trailStart, trailGive float64, breakeven bool) {
+	bt.tiered, bt.tp1, bt.tp2, bt.tier1Frac = on, tp1, tp2, frac
+	bt.trailStart, bt.trailGive, bt.breakeven = trailStart, trailGive, breakeven
+}
+
+func newBacktest(balance float64, leverage int, riskPct, feeRate, tpMult, slMult float64, regimeGate bool) *backtestEngine {
 	return &backtestEngine{
 		balance:      balance,
 		startBalance: balance,
 		leverage:     leverage,
 		riskPct:      riskPct,
 		feeRate:      feeRate,
+		tpMult:       tpMult,
+		slMult:       slMult,
+		regimeGate:   regimeGate,
 		positions:    make(map[string]*position),
 		equityCurve:  []float64{balance},
 	}
@@ -238,8 +276,24 @@ func newBacktest(balance float64, leverage int, riskPct, feeRate float64) *backt
 // systematically optimistic (commissions were ~45% of live losses). Returns the
 // net PnL and records the trade.
 func (bt *backtestEngine) closePosition(pos *position, exitPrice float64, reason string) float64 {
-	gross := posPnL(pos, exitPrice)
-	fee := bt.feeRate * pos.qty * (pos.entryPrice + exitPrice) // taker on both legs
+	pnl := bt.book(pos, exitPrice, pos.qty, reason)
+	delete(bt.positions, pos.symbol)
+	return pnl
+}
+
+// book records a close of `qty` of the position at exitPrice, net of the
+// round-trip taker fee on that qty, and appends it as a trade. It does NOT
+// remove the position (the caller decides) — so it serves both full and partial
+// (tiered) closes.
+func (bt *backtestEngine) book(pos *position, exitPrice, qty float64, reason string) float64 {
+	var gross float64
+	switch pos.direction {
+	case strategy.Long:
+		gross = (exitPrice - pos.entryPrice) * qty
+	case strategy.Short:
+		gross = (pos.entryPrice - exitPrice) * qty
+	}
+	fee := bt.feeRate * qty * (pos.entryPrice + exitPrice) // taker on both legs
 	pnl := gross - fee
 	bt.balance += pnl
 	bt.equityCurve = append(bt.equityCurve, bt.balance)
@@ -251,8 +305,82 @@ func (bt *backtestEngine) closePosition(pos *position, exitPrice float64, reason
 		pnl:       pnl,
 		reason:    reason,
 	})
-	delete(bt.positions, pos.symbol)
 	return pnl
+}
+
+// manage runs the faithful tiered exit for one bar (mirrors the live prompt):
+// hard stop → tier-2 (full) → tier-1 (partial + move stop to break-even) →
+// trailing (full, once peak ≥ trailStart R, exit on give-back to trailGive R).
+// Returns the PnL booked this bar, how many closes were booked, how many were
+// wins, and whether the position is now fully closed. Checked at the bar close
+// (the backtest's price granularity).
+func (bt *backtestEngine) manage(pos *position, price float64) (pnl float64, closes, wins int, done bool) {
+	book := func(exitPrice, qty float64, reason string, remove bool) {
+		p := bt.book(pos, exitPrice, qty, reason)
+		pnl += p
+		closes++
+		if p > 0 {
+			wins++
+		}
+		if remove {
+			delete(bt.positions, pos.symbol)
+			done = true
+		}
+	}
+	// Favourable excursion (price distance in our favour) + peak for the trail.
+	fav := price - pos.entryPrice
+	if pos.direction == strategy.Short {
+		fav = pos.entryPrice - price
+	}
+	if fav > pos.peakFav {
+		pos.peakFav = fav
+	}
+	R := pos.rDist
+
+	// 1. Hard stop (adverse) — current stopPrice (moves to break-even after tier-1).
+	if pos.direction == strategy.Long && price <= pos.stopPrice {
+		reason := "stop-loss"
+		if pos.tier1Done && bt.breakeven {
+			reason = "break-even"
+		}
+		book(pos.stopPrice, pos.qty, reason, true)
+		return
+	}
+	if pos.direction == strategy.Short && price >= pos.stopPrice {
+		reason := "stop-loss"
+		if pos.tier1Done && bt.breakeven {
+			reason = "break-even"
+		}
+		book(pos.stopPrice, pos.qty, reason, true)
+		return
+	}
+	// 2. Tier-2 (final) — close the whole remainder.
+	if fav >= bt.tp2*R {
+		book(pos.tier2Px, pos.qty, "take-profit-t2", true)
+		return
+	}
+	// 3. Tier-1 partial — close tier1Frac, then move the stop to break-even.
+	if !pos.tier1Done && fav >= bt.tp1*R {
+		book(pos.tier1Px, pos.qty*bt.tier1Frac, "take-profit-t1", false)
+		pos.qty -= pos.qty * bt.tier1Frac
+		pos.tier1Done = true
+		if bt.breakeven {
+			pos.stopPrice = pos.entryPrice
+		}
+	}
+	// 4. Trailing — once the peak reached trailStart R, exit the remainder if the
+	// move gives back to trailGive R of favourable excursion.
+	if pos.peakFav >= bt.trailStart*R && fav <= bt.trailGive*R {
+		var exitPrice float64
+		if pos.direction == strategy.Long {
+			exitPrice = pos.entryPrice + bt.trailGive*R
+		} else {
+			exitPrice = pos.entryPrice - bt.trailGive*R
+		}
+		book(exitPrice, pos.qty, "trail", true)
+		return
+	}
+	return
 }
 
 // exitDecision reports whether an open position should close at the current
@@ -282,8 +410,13 @@ func exitDecision(pos *position, price float64) (exitPrice float64, reason strin
 // (expected move ≥ 0.24%), risk-based sizing (risk% ÷ 2×ATR), and a stop that is
 // the tighter of 2×ATR or the consensus invalidation (when ≥1×ATR away). No-op
 // when NEUTRAL or already in a position. Returns true if it opened.
-func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Kline, c strategy.Consensus, openAt int) bool {
+func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Kline, c strategy.Consensus, openAt int, regime strategy.Regime) bool {
 	if c.Direction == strategy.Neutral {
+		return false
+	}
+	// Regime gate (PRD-016 idea, measured here): suppress entries outside a
+	// committed trend — momentum/breakout in chop is where the losses cluster.
+	if bt.regimeGate && regime != strategy.RegimeTrending {
 		return false
 	}
 	if _, ok := bt.positions[symbol]; ok {
@@ -294,10 +427,10 @@ func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Klin
 	if !ok || atr/price*100 < 0.24 { // fee floor: expected move must clear ~3× round-trip fee
 		return false
 	}
-	qty := (bt.riskPct * bt.balance) / (2 * atr)
+	qty := (bt.riskPct * bt.balance) / (bt.slMult * atr) // size by the actual stop so risk/trade stays constant across sweeps
 
-	stopDist := 2 * atr
-	tpDist := 2 * atr
+	stopDist := bt.slMult * atr
+	tpDist := bt.tpMult * atr
 	if inval := c.Invalidation(); inval != 0 {
 		invalDist := 0.0
 		switch c.Direction {
@@ -317,10 +450,23 @@ func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Klin
 	case strategy.Short:
 		stopPrice, tpPrice = price+stopDist, price-tpDist
 	}
-	bt.positions[symbol] = &position{
+	pos := &position{
 		symbol: symbol, direction: c.Direction, qty: qty,
 		entryPrice: price, stopPrice: stopPrice, tpPrice: tpPrice, atr: atr, openAt: openAt,
 	}
+	// Tiered exit: R = the actual stop distance; tier-1/tier-2 sit at tp1×R / tp2×R
+	// from entry. The single-TP tpPrice is overridden by tier-2 (the final target).
+	if bt.tiered {
+		pos.rDist = stopDist
+		switch c.Direction {
+		case strategy.Long:
+			pos.tier1Px, pos.tier2Px = price+bt.tp1*stopDist, price+bt.tp2*stopDist
+		case strategy.Short:
+			pos.tier1Px, pos.tier2Px = price-bt.tp1*stopDist, price-bt.tp2*stopDist
+		}
+		pos.tpPrice = pos.tier2Px
+	}
+	bt.positions[symbol] = pos
 	return true
 }
 
@@ -340,7 +486,17 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 		price := window[len(window)-1].Close
 
 		if pos, ok := bt.positions[symbol]; ok {
-			if exitPrice, reason, hit := exitDecision(pos, price); hit {
+			if bt.tiered {
+				p, n, w, fin := bt.manage(pos, price)
+				totalPnL += p
+				trades += n
+				wins += w
+				if fin {
+					continue
+				}
+				// still open (partial taken or nothing triggered): fall through;
+				// openFromConsensus no-ops while a position exists.
+			} else if exitPrice, reason, hit := exitDecision(pos, price); hit {
 				pnl := bt.closePosition(pos, exitPrice, reason)
 				totalPnL += pnl
 				trades++
@@ -352,7 +508,7 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 		}
 
 		c := strategy.ConsensusForWithRegime(symbol, window)
-		bt.openFromConsensus(symbol, window, c, i)
+		bt.openFromConsensus(symbol, window, c, i, strategy.DetectRegime(window))
 	}
 
 	totalPnL += bt.closeRemaining(symbol, klines[len(klines)-1].Close, &trades, &wins)
@@ -380,7 +536,17 @@ func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
 		t := w5[len(w5)-1].CloseTime
 
 		if pos, ok := bt.positions[symbol]; ok {
-			if exitPrice, reason, hit := exitDecision(pos, price); hit {
+			if bt.tiered {
+				p, n, w, fin := bt.manage(pos, price)
+				totalPnL += p
+				trades += n
+				wins += w
+				if fin {
+					continue
+				}
+				// still open (partial taken or nothing triggered): fall through;
+				// openFromConsensus no-ops while a position exists.
+			} else if exitPrice, reason, hit := exitDecision(pos, price); hit {
 				pnl := bt.closePosition(pos, exitPrice, reason)
 				totalPnL += pnl
 				trades++
@@ -416,7 +582,13 @@ func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
 		if j4 > 0 {
 			byTF["4h"] = c4
 		}
-		bt.openFromConsensus(symbol, w5, strategy.AggregateMTF(byTF), i)
+		// Regime gate uses the 4h read (matching the live Analyst's 4h ADX regime);
+		// fall back to the 5m window when no 4h bar has closed yet.
+		regime := strategy.DetectRegime(w5)
+		if j4 > 0 {
+			regime = strategy.DetectRegime(k4[:j4])
+		}
+		bt.openFromConsensus(symbol, w5, strategy.AggregateMTF(byTF), i, regime)
 	}
 
 	totalPnL += bt.closeRemaining(symbol, k5[len(k5)-1].Close, &trades, &wins)
