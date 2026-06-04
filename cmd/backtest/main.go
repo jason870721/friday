@@ -58,6 +58,8 @@ func main() {
 	breakevenFlag := flag.Bool("breakeven", true, "Tiered: after tier-1, move the stop to break-even on the remainder.")
 	trailStartFlag := flag.Float64("trail-start", 2.0, "Tiered: peak favourable excursion (in R) that engages the trailing stop.")
 	trailGiveFlag := flag.Float64("trail-give", 1.0, "Tiered: once trailing, close if uPnL gives back to this many R.")
+	liveGatesFlag := flag.Bool("live-gates", false, "Apply the live entry gates the raw engine omits: signal-persistence (same MTF direction held ≥2 consecutive 5m bars) and no-chop (skip when price sits on its 5m MA20 with a neutral 45–55 RSI). Isolates how much live filtering changes the raw edge.")
+	trendAlignFlag := flag.Bool("trend-align", false, "Only open in the direction of the 4h trend (4h close vs 4h MA20): suppress longs while 4h is below its MA20 and shorts while above. Tests whether the long-side bleed in a downtrend is cured by higher-TF trend alignment. MTF mode only.")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -109,6 +111,8 @@ func main() {
 	if *mtfFlag {
 		bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
 		bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
+		bt.liveGates = *liveGatesFlag
+		bt.trendAlign = *trendAlignFlag
 		lim5 := days * 288
 		if lim5 > 1500 {
 			lim5 = 1500
@@ -161,6 +165,7 @@ func main() {
 	// Run the backtest.
 	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
 	bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
+	bt.liveGates = *liveGatesFlag
 	for i, sd := range results {
 		if sd.err != nil {
 			continue
@@ -236,6 +241,8 @@ type backtestEngine struct {
 	tpMult       float64 // take-profit distance in ATR multiples (single-TP mode)
 	slMult       float64 // stop-loss distance in ATR multiples
 	regimeGate   bool    // only open in a TRENDING regime
+	liveGates    bool    // apply the live persistence + no-chop entry gates
+	trendAlign   bool    // only open in the direction of the 4h trend (price vs 4h MA20)
 	// Tiered exit (mirrors the live prompt). R = the stop distance.
 	tiered     bool
 	tp1        float64 // tier-1 TP in R
@@ -410,14 +417,95 @@ func exitDecision(pos *position, price float64) (exitPrice float64, reason strin
 // (expected move ≥ 0.24%), risk-based sizing (risk% ÷ 2×ATR), and a stop that is
 // the tighter of 2×ATR or the consensus invalidation (when ≥1×ATR away). No-op
 // when NEUTRAL or already in a position. Returns true if it opened.
-func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Kline, c strategy.Consensus, openAt int, regime strategy.Regime) bool {
+// trend4h returns the 4h trend direction (last 4h close vs its 20-bar MA): Long
+// above, Short below, Neutral when there aren't enough 4h bars to judge.
+func trend4h(k4 []binance.Kline) strategy.Direction {
+	if len(k4) < 20 {
+		return strategy.Neutral
+	}
+	var sum float64
+	for _, k := range k4[len(k4)-20:] {
+		sum += k.Close
+	}
+	ma20 := sum / 20
+	switch last := k4[len(k4)-1].Close; {
+	case last > ma20:
+		return strategy.Long
+	case last < ma20:
+		return strategy.Short
+	default:
+		return strategy.Neutral
+	}
+}
+
+// trackStreak updates a same-direction run length (mirrors the live
+// signal-persistence counter): a non-NEUTRAL direction matching the previous bar
+// increments it, a different direction resets to 1, NEUTRAL resets to 0.
+func trackStreak(prev strategy.Direction, streak int, cur strategy.Direction) (strategy.Direction, int) {
+	switch {
+	case cur == strategy.Neutral:
+		return strategy.Neutral, 0
+	case cur == prev:
+		return cur, streak + 1
+	default:
+		return cur, 1
+	}
+}
+
+// onMABand reports whether the last close sits on its 5m MA20 (|Δ| < 0.3%) with a
+// neutral 45–55 RSI — the live no-chop condition. ok=false when there aren't
+// enough candles to judge (caller then doesn't suppress).
+func onMABand(window []binance.Kline) (chop, ok bool) {
+	if len(window) < 20 {
+		return false, false
+	}
+	closes := make([]float64, len(window))
+	for i, k := range window {
+		closes[i] = k.Close
+	}
+	var sum float64
+	for _, c := range closes[len(closes)-20:] {
+		sum += c
+	}
+	ma20 := sum / 20
+	price := closes[len(closes)-1]
+	rsi, rok := binance.RSI(closes, 14)
+	if !rok {
+		return false, false
+	}
+	onMA := math.Abs(price-ma20)/price*100 < 0.3
+	neutralRSI := rsi >= 45 && rsi <= 55
+	return onMA && neutralRSI, true
+}
+
+func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Kline, c strategy.Consensus, openAt int, regime strategy.Regime, confirmed bool, trendDir strategy.Direction) bool {
 	if c.Direction == strategy.Neutral {
+		return false
+	}
+	// Trend-alignment gate (-trend-align): never open against the 4h trend
+	// (4h close vs 4h MA20). Catches the downtrend longs the 4h-consensus veto
+	// misses when the 4h consensus is itself NEUTRAL.
+	if bt.trendAlign && trendDir != strategy.Neutral && c.Direction != trendDir {
 		return false
 	}
 	// Regime gate (PRD-016 idea, measured here): suppress entries outside a
 	// committed trend — momentum/breakout in chop is where the losses cluster.
 	if bt.regimeGate && regime != strategy.RegimeTrending {
 		return false
+	}
+	// Live entry gates the raw engine otherwise omits (-live-gates), to measure
+	// how much the bot's filtering changes the raw edge:
+	//   - signal-persistence: the same MTF direction must have held ≥2 consecutive
+	//     5m bars (the caller tracks the streak and passes `confirmed`).
+	//   - no-chop: skip when price sits on its 5m MA20 (|Δ| < 0.3%) with a neutral
+	//     45–55 RSI — no displacement, so a 2×ATR stop sits inside the noise band.
+	if bt.liveGates {
+		if !confirmed {
+			return false
+		}
+		if chop, ok := onMABand(window); ok && chop {
+			return false
+		}
 	}
 	if _, ok := bt.positions[symbol]; ok {
 		return false
@@ -478,6 +566,8 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 
 	trades, wins := 0, 0
 	totalPnL := 0.0
+	var prevDir strategy.Direction
+	streak := 0
 
 	// We need at least 50 candles for the strategies to work (EMA50).
 	// Walk forward, simulating one round per candle.
@@ -508,7 +598,9 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 		}
 
 		c := strategy.ConsensusForWithRegime(symbol, window)
-		bt.openFromConsensus(symbol, window, c, i, strategy.DetectRegime(window))
+		prevDir, streak = trackStreak(prevDir, streak, c.Direction)
+		// Single-TF mode has no 4h series → trend-align is a no-op (Neutral).
+		bt.openFromConsensus(symbol, window, c, i, strategy.DetectRegime(window), streak >= 2, strategy.Neutral)
 	}
 
 	totalPnL += bt.closeRemaining(symbol, klines[len(klines)-1].Close, &trades, &wins)
@@ -529,6 +621,8 @@ func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
 	totalPnL := 0.0
 	lastJ1, lastJ4 := -1, -1
 	var c1, c4 strategy.Consensus
+	var prevDir strategy.Direction
+	streak := 0
 
 	for i := 50; i < len(k5); i++ {
 		w5 := k5[:i+1]
@@ -588,7 +682,13 @@ func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
 		if j4 > 0 {
 			regime = strategy.DetectRegime(k4[:j4])
 		}
-		bt.openFromConsensus(symbol, w5, strategy.AggregateMTF(byTF), i, regime)
+		cons := strategy.AggregateMTF(byTF)
+		prevDir, streak = trackStreak(prevDir, streak, cons.Direction)
+		trendDir := strategy.Neutral
+		if j4 > 0 {
+			trendDir = trend4h(k4[:j4])
+		}
+		bt.openFromConsensus(symbol, w5, cons, i, regime, streak >= 2, trendDir)
 	}
 
 	totalPnL += bt.closeRemaining(symbol, k5[len(k5)-1].Close, &trades, &wins)
