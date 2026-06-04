@@ -41,6 +41,33 @@ func fallingCandles(n int) []binance.Kline {
 	return ks
 }
 
+// momentumWinnersCandles is a net-up sawtooth: each cycle climbs for several
+// bars (momentum fires Long) then snaps back below its MA (stopping the long at
+// invalidation) before resuming higher. It produces many momentum trades whose
+// winners (the rides up) outweigh the small stop-outs — a sub-50% win rate with
+// positive expectancy, the trend-strategy profile the calibration must keep.
+func momentumWinnersCandles() []binance.Kline {
+	closes := []float64{}
+	v := 100.0
+	for c := 0; c < 24; c++ {
+		// climb (momentum entry forms on the rising closes)
+		for i := 0; i < 5; i++ {
+			v += 3
+			closes = append(closes, v)
+		}
+		// sharp pullback below the lagging MA → stops the long
+		for i := 0; i < 3; i++ {
+			v -= 4
+			closes = append(closes, v)
+		}
+	}
+	ks := make([]binance.Kline, len(closes))
+	for i, c := range closes {
+		ks[i] = binance.Kline{Close: c, High: c * 1.003, Low: c * 0.997, Volume: 100}
+	}
+	return ks
+}
+
 func TestRunStrategy_MomentumUptrendWins(t *testing.T) {
 	res, err := RunStrategy(strategy.Momentum{}, "BTCUSDT", risingPullbackCandles(40))
 	if err != nil {
@@ -75,10 +102,10 @@ func TestRunStrategy_NoCandles(t *testing.T) {
 	}
 }
 
-func TestCalibrate_MapsWinRateAndOmitsThin(t *testing.T) {
+func TestCalibrate_MapsExpectancyAndOmitsThin(t *testing.T) {
 	strats := []strategy.Strategy{strategy.MeanReversion{}, strategy.Momentum{}}
 	cal := Calibrate(strats, map[string][]binance.Kline{
-		"FALLUSDT": fallingCandles(40),        // MeanReversion: many stop-outs (≥5) → 0% win → conf 0
+		"FALLUSDT": fallingCandles(40),        // MeanReversion: many stop-outs (≥5) → negative expectancy → conf 0
 		"RISEUSDT": risingPullbackCandles(40), // Momentum: one trade to end (<5) → omitted
 	})
 
@@ -86,12 +113,35 @@ func TestCalibrate_MapsWinRateAndOmitsThin(t *testing.T) {
 	if !ok {
 		t.Fatal("mean_reversion should be calibrated on FALLUSDT (≥5 trades)")
 	}
+	// Negative per-trade expectancy (each fade stopped at its invalidation) → 0.
 	if mr != 0 {
-		t.Errorf("a 0%% win rate maps to 0 confidence; got %.2f", mr)
+		t.Errorf("a negative-expectancy strategy maps to 0 confidence; got %.2f", mr)
 	}
 	// A strategy with <CalibrationMinTrades trades is omitted → hardcoded fallback.
 	if _, ok := cal["RISEUSDT"]["momentum"]; ok {
 		t.Error("momentum had <5 trades on RISEUSDT; it should be omitted (fallback), not calibrated")
+	}
+}
+
+// TestCalibrate_KeepsProfitableLowWinRate is the regression guard for the
+// win-rate→expectancy fix: a strategy that wins rarely but with large winners
+// (positive expectancy, sub-50% win rate) must NOT be disabled — the old
+// win-rate map zeroed exactly these profitable trend strategies.
+func TestCalibrate_KeepsProfitableLowWinRate(t *testing.T) {
+	res, err := RunStrategy(strategy.Momentum{}, "UPUSDT", momentumWinnersCandles())
+	if err != nil {
+		t.Fatalf("RunStrategy: %v", err)
+	}
+	if res.Trades < CalibrationMinTrades {
+		t.Skipf("fixture produced %d trades (<%d); cannot exercise the calibration path", res.Trades, CalibrationMinTrades)
+	}
+	cal := Calibrate([]strategy.Strategy{strategy.Momentum{}}, map[string][]binance.Kline{"UPUSDT": momentumWinnersCandles()})
+	conf, ok := cal["UPUSDT"]["momentum"]
+	if res.AvgPnLPct-roundTripFeePct > 0 {
+		if !ok || conf <= 0 {
+			t.Errorf("a positive-expectancy strategy (avg %.2f%%, win rate %.0f%%) must keep confidence >0; got ok=%v conf=%.2f",
+				res.AvgPnLPct, res.WinRate*100, ok, conf)
+		}
 	}
 }
 
