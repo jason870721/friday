@@ -27,6 +27,7 @@ func main() {
 	leverageFlag := flag.Int("leverage", 100, "Leverage")
 	riskFlag := flag.Float64("risk", 0.01, "Risk per trade as fraction of balance")
 	feeFlag := flag.Float64("fee", 0.0004, "Taker fee rate per side (round-trip = 2×); 0.0004 = 4 bps")
+	endAgoFlag := flag.Int("end-days-ago", 0, "End the window this many days before now (0 = now); use with -days for an out-of-sample window, e.g. -days 40 -end-days-ago 40")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -61,8 +62,13 @@ func main() {
 
 	// Fetch klines. Binance returns up to 1500 candles per request.
 	// For 5m that's ~5 days, 15m ~15 days, 1h ~62 days, 4h ~250 days.
-	endTime := time.Now()
+	// -end-days-ago shifts the window back for out-of-sample tests.
+	endTime := time.Now().Add(-time.Duration(*endAgoFlag) * 24 * time.Hour)
 	startTime := endTime.Add(-time.Duration(days) * 24 * time.Hour)
+	endMs := int64(0)
+	if *endAgoFlag > 0 {
+		endMs = endTime.UnixMilli()
+	}
 	limit := days * 24 * 60 / candleMinutes(interval)
 	if limit > 1500 {
 		limit = 1500
@@ -82,7 +88,7 @@ func main() {
 	fmt.Printf("Fetching %s klines (%d candles, %s → %s)...\n", interval, limit,
 		startTime.Format("01/02 15:04"), endTime.Format("01/02 15:04"))
 	for i, sym := range symbols {
-		ks, err := cli.Klines(ctx, sym, interval, limit)
+		ks, err := cli.KlinesUntil(ctx, sym, interval, limit, endMs)
 		results[i] = symData{sym, ks, err}
 		if err != nil {
 			fmt.Printf("  %s: ERROR %v\n", sym, err)

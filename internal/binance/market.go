@@ -103,12 +103,22 @@ type Kline struct {
 
 // Klines returns recent klines for a symbol.
 func (c *Client) Klines(ctx context.Context, symbol, interval string, limit int) ([]Kline, error) {
+	return c.KlinesUntil(ctx, symbol, interval, limit, 0)
+}
+
+// KlinesUntil is Klines bounded by an end time: the most recent `limit` candles
+// at or before endMs (epoch ms). endMs ≤ 0 means "up to now" (same as Klines).
+// Used by cmd/backtest to fetch an older, out-of-sample window.
+func (c *Client) KlinesUntil(ctx context.Context, symbol, interval string, limit int, endMs int64) ([]Kline, error) {
 	params := url.Values{
 		"symbol":   {symbol},
 		"interval": {interval},
 	}
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
+	}
+	if endMs > 0 {
+		params.Set("endTime", strconv.FormatInt(endMs, 10))
 	}
 
 	var raw [][]any
