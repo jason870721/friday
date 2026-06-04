@@ -72,6 +72,10 @@ type Orchestrator struct {
 	interval time.Duration
 	breaker  *risk.CircuitBreaker
 
+	// maxRounds bounds the loop for a headless batch run (0 = unbounded, the
+	// normal live mode). Set via SetMaxRounds before Run.
+	maxRounds int
+
 	// feeBudget surfaces a fee-spend status line in the Risk Manager round
 	// prompt when near the cap (PRD-020 §3). nil → no line. The hard gate lives
 	// in binance_order; this is just awareness.
@@ -253,6 +257,12 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 			o.breaker.Tick()
 		}
 
+		// Headless batch bound: stop after maxRounds (0 = unbounded live mode),
+		// skipping the trailing inter-round sleep.
+		if o.maxRounds > 0 && round >= o.maxRounds {
+			return lastReport, nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return lastReport, nil
@@ -260,6 +270,14 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) (string, error) {
 		}
 	}
 }
+
+// SetMaxRounds bounds Run to n rounds then return (0 = unbounded). For a
+// headless batch run; call before Run.
+func (o *Orchestrator) SetMaxRounds(n int) { o.maxRounds = n }
+
+// SetInterval overrides the inter-round delay (default 15s). Pass 0 to run
+// rounds back-to-back in a headless batch. Call before Run.
+func (o *Orchestrator) SetInterval(d time.Duration) { o.interval = d }
 
 // runRound runs one Analyst → Risk → Executor pass and returns the
 // executor's result. The typed handoffs let the orchestrator make

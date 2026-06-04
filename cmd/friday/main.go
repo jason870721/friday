@@ -11,13 +11,16 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/johnny1110/evva/pkg/event"
 	"github.com/johnny1110/evva/pkg/version"
 	"github.com/johnny1110/friday/internal/bootstrap"
 	"github.com/johnny1110/friday/internal/risk"
@@ -25,14 +28,87 @@ import (
 	"github.com/johnny1110/friday/internal/tui"
 )
 
+// kickoffPrompt is the standard start instruction (mirrors .friday/skills/start).
+const kickoffPrompt = "開始交易。立即分析所有已設定的市場（見啟動時印出的清單），依授權執行。分析與報告請以中文回覆。"
+
+// startStopMonitor wires the PRD-009 stop-loss/TP monitor (shared by the TUI and
+// headless paths). Orphan-stop cleanup is skipped in paper mode (real endpoints).
+func startStopMonitor(ctx context.Context) {
+	cli, err := tool.SharedBinanceClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "friday: stop monitor disabled (%v)\n", err)
+		return
+	}
+	monitor := risk.NewStopMonitor(tool.NewBinanceStopBroker(cli), time.Second, slog.Default(), tool.LogStopClose)
+	tool.SetStopMonitor(monitor)
+	go monitor.Start(ctx)
+	if !tool.PaperEnabled() {
+		go tool.CleanupOrphanStops(ctx, slog.Default())
+	}
+}
+
+// stdoutEmitter is a headless orchestrator.RoleEmitter: it prints the pipeline's
+// text narration to stdout (no TUI), so a batch run is observable in a log.
+type stdoutEmitter struct{}
+
+func (stdoutEmitter) EmitRole(role string, e event.Event) {
+	if e.Kind != event.KindText || e.Text == nil {
+		return
+	}
+	if role == "" {
+		fmt.Println(e.Text.Text)
+		return
+	}
+	fmt.Printf("[%s] %s\n", role, e.Text.Text)
+}
+
+// runHeadless runs the orchestrator for a bounded number of rounds without the
+// TUI, then exits — for paper-mode batch validation (FRIDAY_PAPER=true). Ctrl+C
+// stops early. After it returns, run `go run ./cmd/analyze` for the post-mortem.
+func runHeadless(rounds int, fast bool) {
+	orch, _, err := bootstrap.New(stdoutEmitter{})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "friday: bootstrap failed:", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	startStopMonitor(ctx)
+
+	orch.SetMaxRounds(rounds)
+	if fast {
+		orch.SetInterval(0) // back-to-back rounds, no 15s live cadence
+	}
+
+	mode := "LIVE"
+	if tool.PaperEnabled() {
+		mode = "PAPER"
+	}
+	fmt.Fprintf(os.Stderr, "friday: headless %s run — %d round(s), fast=%v\n", mode, rounds, fast)
+	if _, err := orch.Run(ctx, kickoffPrompt); err != nil {
+		fmt.Fprintln(os.Stderr, "friday: run error:", err)
+	}
+	fmt.Fprintln(os.Stderr, "friday: headless run complete — `go run ./cmd/analyze` for the post-mortem.")
+}
+
 func main() {
-	// Log the evva SDK version friday is bound to. Useful when the
-	// user files a bug — pkg/version is stable surface so this is
-	// safe to query at any startup.
-	// Bare() drops the leading "v" — composes cleanly into our own
-	// "evva 0.2.4-alpha.3" log format without the awkward double-v.
+	headless := flag.Bool("headless", false, "run N rounds without the TUI then exit (for FRIDAY_PAPER batch validation)")
+	rounds := flag.Int("rounds", 30, "headless: number of rounds to run before exiting")
+	fast := flag.Bool("fast", false, "headless: run rounds back-to-back with no inter-round delay")
+	flag.Parse()
+
 	fmt.Fprintf(os.Stderr, "friday: built on evva %s\n", version.Bare())
 
+	if *headless {
+		runHeadless(*rounds, *fast)
+		return
+	}
+
+	mainTUI()
+}
+
+func mainTUI() {
 	// 1. Build the event sink first. The bubbletea program isn't ready
 	//    yet, so the sink starts unattached; it gets wired below once
 	//    we've constructed the program.
@@ -55,21 +131,7 @@ func main() {
 	//     (cancelled on exit). Skipped if Binance credentials are absent.
 	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 	defer cancelMonitor()
-	if cli, err := tool.SharedBinanceClient(); err != nil {
-		fmt.Fprintf(os.Stderr, "friday: stop monitor disabled (%v)\n", err)
-	} else {
-		monitor := risk.NewStopMonitor(tool.NewBinanceStopBroker(cli), time.Second, slog.Default(), tool.LogStopClose)
-		tool.SetStopMonitor(monitor)
-		go monitor.Start(monitorCtx)
-
-		// PRD-020 §2 R5: cancel any server-side STOP_MARKET / TAKE_PROFIT_MARKET
-		// orders orphaned by a previous session (position no longer exists), so a
-		// stale stop can't fire against a position friday no longer holds. Skipped
-		// in paper mode — it queries real account endpoints (PRD-021 §4).
-		if !tool.PaperEnabled() {
-			go tool.CleanupOrphanStops(monitorCtx, slog.Default())
-		}
-	}
+	startStopMonitor(monitorCtx)
 
 	// 3. Bubbletea program. Alt-screen + mouse support is plenty for v1;
 	//    the textinput handles its own focus.
