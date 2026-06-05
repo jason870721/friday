@@ -37,19 +37,28 @@ func makerEntryEnabled() bool {
 // fee) and falling back to a MARKET taker if it won't rest or doesn't fully fill.
 // reduce_only or maker disabled → straight MARKET.
 func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logger, symbol string, side binance.OrderSide, quantity float64, reduceOnly bool) (*binance.OrderResponse, error) {
-	if reduceOnly || !makerEntryEnabled() {
-		return cli.MarketOrder(ctx, symbol, side, quantity, reduceOnly)
+	if reduceOnly {
+		return cli.MarketOrder(ctx, symbol, side, quantity, true) // a close never rests
+	}
+	if !makerEntryEnabled() {
+		recordEntryFill(symbol, "taker")
+		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+	}
+	taker := func() (*binance.OrderResponse, error) {
+		recordEntryFill(symbol, "taker")
+		return cli.MarketOrder(ctx, symbol, side, quantity, false)
 	}
 	mp, err := cli.Price(ctx, symbol)
 	if err != nil || mp == nil || mp.MarkPrice == "" {
-		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+		return taker()
 	}
 	ord, err := cli.LimitMakerOrder(ctx, symbol, side, quantity, mp.MarkPrice, false)
 	if err != nil || ord == nil || ord.Status == "EXPIRED" || ord.Status == "REJECTED" {
 		logger.Debug("binance_order.maker_no_rest_fallback_market", "symbol", symbol, "err", err)
-		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+		return taker()
 	}
 	if ord.Status == "FILLED" {
+		recordEntryFill(symbol, "maker")
 		return ord, nil
 	}
 	for i := 0; i < makerPollAttempts; i++ {
@@ -60,6 +69,7 @@ func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logg
 		}
 		ord = q
 		if ord.Status == "FILLED" {
+			recordEntryFill(symbol, "maker")
 			return ord, nil
 		}
 		if ord.Status == "CANCELED" || ord.Status == "EXPIRED" || ord.Status == "REJECTED" {
@@ -72,8 +82,16 @@ func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logg
 	executed, _ := strconv.ParseFloat(ord.ExecutedQty, 64)
 	if remainder := quantity - executed; remainder > 0 {
 		logger.Debug("binance_order.maker_partial_market_remainder", "symbol", symbol, "executed", executed, "remainder", remainder)
+		// Partial maker + market remainder → predominantly taker; label by the
+		// larger leg so the notification isn't misleading.
+		if executed >= remainder {
+			recordEntryFill(symbol, "maker+taker")
+		} else {
+			recordEntryFill(symbol, "taker")
+		}
 		return cli.MarketOrder(ctx, symbol, side, remainder, false)
 	}
+	recordEntryFill(symbol, "maker")
 	return ord, nil
 }
 

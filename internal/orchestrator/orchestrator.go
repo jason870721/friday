@@ -821,9 +821,13 @@ func (o *Orchestrator) notifyTradeOpened(d RiskDecisions) {
 		if dec.Action == "OPEN_SHORT" {
 			dir = "SHORT"
 		}
+		fill := ""
+		if k := tool.LastEntryFill(dec.Symbol); k != "" {
+			fill = fmt.Sprintf(" 成交=%s", k) // maker / taker / maker+taker
+		}
 		title := fmt.Sprintf("🔔 Friday 開倉: %s %s", dec.Symbol, dir)
-		body := fmt.Sprintf("%s %s 數量=%.4f 槓桿=%dx 止損=%.2f — %s",
-			dir, dec.Symbol, dec.Quantity, dec.Leverage, dec.StopLoss, dec.Reason)
+		body := fmt.Sprintf("%s %s 數量=%.4f 槓桿=%dx 止損=%.2f%s — %s",
+			dir, dec.Symbol, dec.Quantity, dec.Leverage, dec.StopLoss, fill, dec.Reason)
 		o.notifyf(title, body)
 	}
 }

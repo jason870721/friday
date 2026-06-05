@@ -47,6 +47,29 @@ func recordOpenSnapshot(symbol string, entry, qty, leverage float64) {
 	openSnaps[symbol] = openSnapshot{entry: entry, qty: qty, leverage: leverage}
 }
 
+// lastEntryFill records how the most recent OPENING order for a symbol filled —
+// "maker" (post-only LIMIT rested and filled) or "taker" (MARKET, incl. the
+// maker-fallback). The orchestrator reads it to surface maker/taker on the open
+// notification so the operator can see whether maker entries are actually resting.
+var (
+	lastFillMu sync.Mutex
+	lastFill   = map[string]string{}
+)
+
+func recordEntryFill(symbol, kind string) {
+	lastFillMu.Lock()
+	defer lastFillMu.Unlock()
+	lastFill[symbol] = kind
+}
+
+// LastEntryFill returns "maker" / "taker" for the symbol's most recent opening
+// fill, or "" if unknown.
+func LastEntryFill(symbol string) string {
+	lastFillMu.Lock()
+	defer lastFillMu.Unlock()
+	return lastFill[symbol]
+}
+
 // openSnapshotFor returns the last-armed open params for a symbol (for ROE).
 func openSnapshotFor(symbol string) (openSnapshot, bool) {
 	openSnapMu.Lock()
