@@ -65,6 +65,8 @@ func main() {
 	erMinFlag := flag.Float64("er-min", 0, "Whipsaw filter: require the 5m Kaufman Efficiency Ratio (|net move| / Σ|bar moves| over -er-lookback bars) ≥ this to open. ~1 = clean trend, ~0 = chop. 0 = off. Suppresses entries in oscillating ranges where trend signals get sawed.")
 	erLookbackFlag := flag.Int("er-lookback", 20, "Whipsaw filter: lookback (5m bars) for the Efficiency Ratio.")
 	rungsFlag := flag.String("rungs", "", "Laddered scale-out (implies -tiered): comma-separated R:frac rungs, e.g. \"1:0.33,2:0.33\" closes 33%% of the ORIGINAL position at 1R and 2R, leaving 34%% to trail. Overrides the tier-1/tier-2 take-profits. Empty = use tier-1/tier-2.")
+	feeFloorFlag := flag.Float64("fee-floor", 0.24, "Minimum expected move to open: skip when ATR(14) as %% of price is below this (must clear ~3× round-trip fee). Raise to filter marginal trades fees would eat.")
+	require1hFlag := flag.Bool("require-1h", false, "Tighter multi-TF: only open when the 1h consensus direction matches the entry direction (not just the 5m-led vote). MTF mode only.")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -122,6 +124,8 @@ func main() {
 		bt.erMin = *erMinFlag
 		bt.erLookback = *erLookbackFlag
 		bt.rungs = parseRungs(*rungsFlag)
+		bt.feeFloor = *feeFloorFlag
+		bt.require1h = *require1hFlag
 		if len(bt.rungs) > 0 {
 			bt.tiered = true
 		}
@@ -183,6 +187,8 @@ func main() {
 	bt.erMin = *erMinFlag
 	bt.erLookback = *erLookbackFlag
 	bt.rungs = parseRungs(*rungsFlag)
+	bt.feeFloor = *feeFloorFlag
+	bt.require1h = *require1hFlag
 	if len(bt.rungs) > 0 {
 		bt.tiered = true
 	}
@@ -277,6 +283,8 @@ type backtestEngine struct {
 	trailStart  float64 // peak excursion (R) that engages the trail
 	trailGive   float64 // once trailing, exit if uPnL gives back to this many R
 	rungs       []rung  // laddered scale-out (overrides tier-1/tier-2 when set)
+	feeFloor    float64 // min ATR%-of-price to open (expected move must clear fees)
+	require1h   bool    // only open when the 1h consensus aligns with the entry
 	positions   map[string]*position
 	trades      []trade
 	equityCurve []float64
@@ -628,7 +636,7 @@ func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Klin
 	}
 	price := window[len(window)-1].Close
 	atr, ok := binance.ATR(window, 14)
-	if !ok || atr/price*100 < 0.24 { // fee floor: expected move must clear ~3× round-trip fee
+	if !ok || atr/price*100 < bt.feeFloor { // fee floor: expected move must clear ~3× round-trip fee
 		return false
 	}
 	qty := (bt.riskPct * bt.balance) / (bt.slMult * atr) // size by the actual stop so risk/trade stays constant across sweeps
@@ -803,6 +811,11 @@ func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
 		trendDir := strategy.Neutral
 		if j4 > 0 {
 			trendDir = trend4h(k4[:j4])
+		}
+		// Tighter multi-TF (-require-1h): the 1h consensus must align with the
+		// entry, not just the 5m-led weighted vote — kills 5m-only "bounce" entries.
+		if bt.require1h && cons.Direction != strategy.Neutral && c1.Direction != cons.Direction {
+			continue
 		}
 		bt.openFromConsensus(symbol, w5, cons, i, regime, streak >= bt.persistence, trendDir)
 	}
