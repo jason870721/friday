@@ -177,7 +177,7 @@ func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
 		calibrated += len(m)
 	}
 	fmt.Fprintf(os.Stderr,
-		"friday: calibrated %d strategy×symbol confidence(s) from 4h backtests (the rest fall back to defaults)\n", calibrated)
+		"friday: calibrated %d strategy×symbol confidence(s) from 5m backtests (the rest fall back to defaults)\n", calibrated)
 }
 
 // startRecalibrator launches the PRD-020 §5 online re-calibration goroutine: it
