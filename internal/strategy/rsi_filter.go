@@ -29,7 +29,16 @@ func RSIFilter(c Consensus, rsi float64) Consensus {
 	if c.Direction == Neutral || rsi == 0 {
 		return c
 	}
-	if rsi >= rsiOverbought || rsi <= rsiOversold {
+	// Hard extreme zone (both sides) + a direction-aware exhaustion guard: don't
+	// SHORT into an oversold reading or LONG into an overbought one — the live
+	// loss pattern was trend strategies confirming SHORT only after RSI was already
+	// ~32 near the lows, right before the mean-reversion bounce stopped them out
+	// (PRD: entry-quality). Floor/ceiling are env-tunable; default off (0/100) so
+	// behaviour is unchanged until tuned.
+	extreme := rsi >= rsiOverbought || rsi <= rsiOversold
+	exhausted := (c.Direction == Short && rsi <= rsiShortFloor()) ||
+		(c.Direction == Long && rsi >= rsiLongCeil())
+	if extreme || exhausted {
 		c.Direction = Neutral
 		c.Confidence = 0
 		blocked := fmt.Sprintf(" (blocked: RSI %.1f in extreme zone)", rsi)
@@ -48,6 +57,16 @@ func RSIFilter(c Consensus, rsi float64) Consensus {
 // rsiFilterEnabled reports whether the RSI extreme-zone filter is active
 // (FRIDAY_RSI_FILTER, default true; "false"/"0" disables).
 func rsiFilterEnabled() bool { return envBool("FRIDAY_RSI_FILTER", true) }
+
+// rsiShortFloor / rsiLongCeil are the direction-aware exhaustion thresholds: a
+// SHORT consensus at RSI ≤ floor, or a LONG at RSI ≥ ceiling, is downgraded to
+// NEUTRAL (don't chase a move into exhaustion). Default 38 / 62: the live loss
+// pattern was trend strategies confirming SHORT only after RSI was already ~32
+// near the lows, right before the mean-reversion bounce — a 4-window MTF backtest
+// showed this guard turned the choppy windows from net-negative to net-positive.
+// Tunable via FRIDAY_RSI_SHORT_FLOOR / FRIDAY_RSI_LONG_CEIL (0 / 100 disables).
+func rsiShortFloor() float64 { return envFloat("FRIDAY_RSI_SHORT_FLOOR", 38) }
+func rsiLongCeil() float64   { return envFloat("FRIDAY_RSI_LONG_CEIL", 62) }
 
 // mtf5m1hOverrideEnabled reports whether the 5m+1h lower-timeframe override is
 // active (FRIDAY_MTF_5M1H_OVERRIDE, default true).
