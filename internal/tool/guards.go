@@ -65,7 +65,16 @@ func OpenPositionsBySymbol(ctx context.Context) (map[string]string, bool) {
 		}
 		entry, _ := strconv.ParseFloat(p.EntryPrice, 64)
 		upnl, _ := strconv.ParseFloat(p.UnRealizedProfit, 64)
-		out[p.Symbol] = fmt.Sprintf("%s %g @ %.4f uPnL %+.2f", dir, absf(amt), entry, upnl)
+		line := fmt.Sprintf("%s %g @ %.4f uPnL %+.2f", dir, absf(amt), entry, upnl)
+		// Authoritative peak favourable uPnL, tracked by the StopMonitor from the
+		// real mark price each poll — replaces the agent's drifting carry estimate
+		// so the trailing-stop decision keys off a Go-verified peak.
+		if globalStopMonitor != nil {
+			if peak, ok := globalStopMonitor.PeakPnL(p.Symbol); ok {
+				line += fmt.Sprintf(" peak %+.2f", peak)
+			}
+		}
+		out[p.Symbol] = line
 	}
 	return out, true
 }

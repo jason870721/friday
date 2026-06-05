@@ -540,7 +540,12 @@ func (o *Orchestrator) positionsLineAll(posBySym map[string]string, ok bool) str
 			parts = append(parts, s.Name+" "+p)
 		}
 	}
-	return "\nACTUAL open positions (exchange, authoritative — trust this over Previous state): " + strings.Join(parts, "; ") + "."
+	joined := strings.Join(parts, "; ")
+	note := ""
+	if strings.Contains(joined, "peak") {
+		note = ` (each "peak" is the StopMonitor's verified peak uPnL since entry — use it, not your carry, for the trailing-stop give-back rule)`
+	}
+	return "\nACTUAL open positions (exchange, authoritative — trust this over Previous state): " + joined + "." + note
 }
 
 // positionLineForSymbol renders the authoritative state for ONE symbol (the
@@ -550,7 +555,11 @@ func (o *Orchestrator) positionLineForSymbol(symbol string, posBySym map[string]
 		return ""
 	}
 	if p, held := posBySym[symbol]; held {
-		return fmt.Sprintf("\nACTUAL %s position (exchange, authoritative — trust this over Previous state): %s.", symbol, p)
+		note := ""
+		if strings.Contains(p, "peak") {
+			note = ` ("peak" is the StopMonitor's verified peak uPnL since entry — use it, not your carry, for the trailing-stop give-back rule)`
+		}
+		return fmt.Sprintf("\nACTUAL %s position (exchange, authoritative — trust this over Previous state): %s.%s", symbol, p, note)
 	}
 	return fmt.Sprintf("\nACTUAL %s position (exchange, authoritative — trust this over Previous state): FLAT, you hold NONE of it.", symbol)
 }

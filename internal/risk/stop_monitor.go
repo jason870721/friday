@@ -61,6 +61,17 @@ type StopCloseEvent struct {
 // close takes through log_trade. A nil callback disables this.
 type StopCloseCallback func(event StopCloseEvent)
 
+// peakState tracks a position's best favourable uPnL (USDT) since its levels
+// were armed, sampled from the real mark price each poll — so the trailing-stop
+// decision keys off a Go-verified peak instead of the agent's free-text carry
+// estimate. `entry` ties the peak to a specific position: a different entry means
+// a new position, so the peak resets.
+type peakState struct {
+	entry float64 // entry the peak is measured against
+	peak  float64 // best uPnL (USDT) seen
+	seen  bool    // whether peak has been set from a real observation
+}
+
 // StopMonitor watches registered levels and flattens on breach.
 type StopMonitor struct {
 	broker   StopBroker
@@ -70,6 +81,7 @@ type StopMonitor struct {
 
 	mu     sync.Mutex
 	levels map[string]StopLevels
+	peaks  map[string]peakState
 }
 
 // NewStopMonitor builds a monitor. interval ≤ 0 uses DefaultStopPollInterval;
@@ -88,6 +100,7 @@ func NewStopMonitor(broker StopBroker, interval time.Duration, logger *slog.Logg
 		logger:   logger,
 		onClose:  onClose,
 		levels:   make(map[string]StopLevels),
+		peaks:    make(map[string]peakState),
 	}
 }
 
@@ -99,9 +112,56 @@ func (m *StopMonitor) SetLevels(symbol string, l StopLevels) {
 	defer m.mu.Unlock()
 	if !l.active() {
 		delete(m.levels, symbol)
+		delete(m.peaks, symbol)
 		return
 	}
 	m.levels[symbol] = l
+	// Reset the peak only when this is a NEW position (no prior peak, or the entry
+	// changed); keep it across re-arms of the same open position so the peak
+	// accumulates over the position's life.
+	if ps, ok := m.peaks[symbol]; !ok || ps.entry != l.EntryPrice {
+		m.peaks[symbol] = peakState{entry: l.EntryPrice}
+	}
+}
+
+// PeakPnL returns the best favourable uPnL (USDT) the monitor has observed for
+// symbol's current position since its levels were armed, and whether any peak has
+// been recorded. Authoritative — sampled from the real mark price each poll, so
+// it does not drift like the agent's carry estimate.
+func (m *StopMonitor) PeakPnL(symbol string) (float64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ps, ok := m.peaks[symbol]
+	if !ok || !ps.seen {
+		return 0, false
+	}
+	return ps.peak, true
+}
+
+// updatePeak folds one mark-price observation into symbol's peak favourable uPnL.
+func (m *StopMonitor) updatePeak(symbol string, l StopLevels, mark float64) {
+	if l.EntryPrice <= 0 || l.PositionQty <= 0 {
+		return
+	}
+	var upnl float64
+	switch l.PositionSide {
+	case DirLong:
+		upnl = (mark - l.EntryPrice) * l.PositionQty
+	case DirShort:
+		upnl = (l.EntryPrice - mark) * l.PositionQty
+	default:
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ps, ok := m.peaks[symbol]
+	if !ok || ps.entry != l.EntryPrice {
+		ps = peakState{entry: l.EntryPrice}
+	}
+	if !ps.seen || upnl > ps.peak {
+		ps.peak, ps.seen = upnl, true
+	}
+	m.peaks[symbol] = ps
 }
 
 // Active reports how many symbols currently have levels (diagnostics/tests).
@@ -148,6 +208,7 @@ func (m *StopMonitor) check(ctx context.Context) {
 			m.logger.Debug("stop_monitor.price_failed", "symbol", symbol, "err", err)
 			continue
 		}
+		m.updatePeak(symbol, l, mark)
 		reason := breachReason(l, mark)
 		if reason == "" {
 			continue
