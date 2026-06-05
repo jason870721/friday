@@ -72,6 +72,44 @@ func (c *Client) MarketOrder(ctx context.Context, symbol string, side OrderSide,
 	return &out, nil
 }
 
+// LimitMakerOrder places a post-only LIMIT order (timeInForce=GTX): it rests as
+// a MAKER and is rejected (status EXPIRED) rather than crossing the spread as a
+// taker — so a fill always earns the maker fee. priceStr is passed through
+// verbatim (use the mark-price string so the precision is already tick-valid).
+// The caller polls for a fill and falls back to a MARKET order if it doesn't
+// rest or doesn't fill. quantity is the base-asset size.
+func (c *Client) LimitMakerOrder(ctx context.Context, symbol string, side OrderSide, quantity float64, priceStr string, reduceOnly bool) (*OrderResponse, error) {
+	params := url.Values{
+		"symbol":      {symbol},
+		"side":        {string(side)},
+		"type":        {"LIMIT"},
+		"timeInForce": {"GTX"},
+		"quantity":    {strconv.FormatFloat(quantity, 'f', -1, 64)},
+		"price":       {priceStr},
+	}
+	if reduceOnly {
+		params.Set("reduceOnly", "true")
+	}
+	var out OrderResponse
+	if err := c.postSigned(ctx, "/fapi/v1/order", params, &out); err != nil {
+		return nil, fmt.Errorf("limitMakerOrder: %w", err)
+	}
+	return &out, nil
+}
+
+// QueryOrder fetches the current state of one order (for polling a maker fill).
+func (c *Client) QueryOrder(ctx context.Context, symbol string, orderID int64) (*OrderResponse, error) {
+	params := url.Values{
+		"symbol":  {symbol},
+		"orderId": {strconv.FormatInt(orderID, 10)},
+	}
+	var out OrderResponse
+	if err := c.getSigned(ctx, "/fapi/v1/order", params, &out); err != nil {
+		return nil, fmt.Errorf("queryOrder %s #%d: %w", symbol, orderID, err)
+	}
+	return &out, nil
+}
+
 // StopMarketOrder places a server-side STOP_MARKET order (PRD-020 §2) — a
 // crash-survivable stop-loss that executes on the exchange even if friday is
 // killed, OOMs, or hangs (unlike the in-memory StopMonitor). stopPrice is the

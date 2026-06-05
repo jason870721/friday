@@ -5,13 +5,77 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/johnny1110/evva/pkg/tools"
 	"github.com/johnny1110/friday/internal/binance"
 	"github.com/johnny1110/friday/internal/risk"
 )
+
+// Maker-entry knobs (PRD: cut fees — taker is ~45% of live losses). Opt-in via
+// FRIDAY_MAKER_ENTRY: an OPENING order is first placed as a post-only LIMIT (GTX,
+// maker fee) at the mark; if it won't rest or doesn't fill within the poll
+// window, it falls back to a MARKET taker so the entry always happens. reduce_only
+// closes always go MARKET — a flatten must never sit unfilled.
+const (
+	makerPollAttempts = 5
+	makerPollInterval = 800 * time.Millisecond
+)
+
+func makerEntryEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FRIDAY_MAKER_ENTRY"))) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// placeEntryOrder fills `quantity`, preferring a post-only maker LIMIT (half the
+// fee) and falling back to a MARKET taker if it won't rest or doesn't fully fill.
+// reduce_only or maker disabled → straight MARKET.
+func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logger, symbol string, side binance.OrderSide, quantity float64, reduceOnly bool) (*binance.OrderResponse, error) {
+	if reduceOnly || !makerEntryEnabled() {
+		return cli.MarketOrder(ctx, symbol, side, quantity, reduceOnly)
+	}
+	mp, err := cli.Price(ctx, symbol)
+	if err != nil || mp == nil || mp.MarkPrice == "" {
+		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+	}
+	ord, err := cli.LimitMakerOrder(ctx, symbol, side, quantity, mp.MarkPrice, false)
+	if err != nil || ord == nil || ord.Status == "EXPIRED" || ord.Status == "REJECTED" {
+		logger.Debug("binance_order.maker_no_rest_fallback_market", "symbol", symbol, "err", err)
+		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+	}
+	if ord.Status == "FILLED" {
+		return ord, nil
+	}
+	for i := 0; i < makerPollAttempts; i++ {
+		time.Sleep(makerPollInterval)
+		q, qerr := cli.QueryOrder(ctx, symbol, ord.OrderID)
+		if qerr != nil {
+			continue
+		}
+		ord = q
+		if ord.Status == "FILLED" {
+			return ord, nil
+		}
+		if ord.Status == "CANCELED" || ord.Status == "EXPIRED" || ord.Status == "REJECTED" {
+			break
+		}
+	}
+	// Not fully filled: cancel the rest and MARKET the unfilled remainder so the
+	// position still reaches the intended size (the stop is registered for it).
+	_ = cli.CancelOrder(ctx, symbol, ord.OrderID)
+	executed, _ := strconv.ParseFloat(ord.ExecutedQty, 64)
+	if remainder := quantity - executed; remainder > 0 {
+		logger.Debug("binance_order.maker_partial_market_remainder", "symbol", symbol, "executed", executed, "remainder", remainder)
+		return cli.MarketOrder(ctx, symbol, side, remainder, false)
+	}
+	return ord, nil
+}
 
 // guardrailMaxMarginPct is the hard ceiling the pre-trade guardrail
 // enforces: an opening order's margin may not exceed this fraction of the
@@ -183,7 +247,7 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		}
 	}
 
-	ord, err := cli.MarketOrder(ctx, in.Symbol, side, in.Quantity, in.ReduceOnly)
+	ord, err := placeEntryOrder(ctx, cli, logger, in.Symbol, side, in.Quantity, in.ReduceOnly)
 	if err != nil {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: %v", err)}, nil
 	}

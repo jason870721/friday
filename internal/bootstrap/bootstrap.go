@@ -69,6 +69,11 @@ FRIDAY_FEE_BUDGET_PCT=0.005
 # Online re-calibration: re-run the strategy-confidence backtest sweep this often
 # (hours) so confidences track regime shifts. 0 disables (startup calibration only).
 FRIDAY_RECALIBRATE_HOURS=4
+# Maker entries: open with a post-only LIMIT (maker fee, ~half of taker) and fall
+# back to MARKET if it won't rest or fill in ~4s. Cuts the fee drag that keeps
+# out-of-sample returns near breakeven; risk = occasional missed/late fills.
+# Closes always go MARKET. Default off.
+# FRIDAY_MAKER_ENTRY=true
 
 # Operations & observability (PRD-021).
 # Paper trading: no real orders — a virtual book trades against live market data.
