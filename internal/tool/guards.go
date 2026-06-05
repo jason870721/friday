@@ -216,9 +216,13 @@ func LogStopClose(event risk.StopCloseEvent) {
 				roeStr = fmt.Sprintf("，回報率 %+.1f%%（%gx）", pnl/margin*100, event.Leverage)
 			}
 		}
+		entryStr := ""
+		if k := LastEntryFill(event.Symbol); k != "" {
+			entryStr = fmt.Sprintf("，進場=%s", k)
+		}
 		title := fmt.Sprintf("🛑 Friday StopMonitor: %s %s%s", event.Symbol, reasonLabel, tag)
-		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f%s，平倉原因：%s",
-			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice, roeStr, reasonLabel)
+		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f%s，平倉原因：%s%s",
+			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice, roeStr, reasonLabel, entryStr)
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			// best-effort; don't fail the close for a notify error
 		}

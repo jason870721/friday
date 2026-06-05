@@ -176,6 +176,9 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 	if in.ExitReason != "" {
 		exitStr = fmt.Sprintf("，平倉原因：%s", in.ExitReason)
 	}
+	if k := LastEntryFill(in.Symbol); k != "" {
+		exitStr += fmt.Sprintf("，進場=%s", k)
+	}
 
 	largeClose := globalNotifier != nil && balance > 0 && abs(effective) >= notifyPnLPct*balance
 	if largeClose {
