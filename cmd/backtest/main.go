@@ -31,6 +31,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +64,7 @@ func main() {
 	trendAlignFlag := flag.Bool("trend-align", false, "Only open in the direction of the 4h trend (4h close vs 4h MA20): suppress longs while 4h is below its MA20 and shorts while above. Tests whether the long-side bleed in a downtrend is cured by higher-TF trend alignment. MTF mode only.")
 	erMinFlag := flag.Float64("er-min", 0, "Whipsaw filter: require the 5m Kaufman Efficiency Ratio (|net move| / Σ|bar moves| over -er-lookback bars) ≥ this to open. ~1 = clean trend, ~0 = chop. 0 = off. Suppresses entries in oscillating ranges where trend signals get sawed.")
 	erLookbackFlag := flag.Int("er-lookback", 20, "Whipsaw filter: lookback (5m bars) for the Efficiency Ratio.")
+	rungsFlag := flag.String("rungs", "", "Laddered scale-out (implies -tiered): comma-separated R:frac rungs, e.g. \"1:0.33,2:0.33\" closes 33%% of the ORIGINAL position at 1R and 2R, leaving 34%% to trail. Overrides the tier-1/tier-2 take-profits. Empty = use tier-1/tier-2.")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -119,6 +121,10 @@ func main() {
 		bt.trendAlign = *trendAlignFlag
 		bt.erMin = *erMinFlag
 		bt.erLookback = *erLookbackFlag
+		bt.rungs = parseRungs(*rungsFlag)
+		if len(bt.rungs) > 0 {
+			bt.tiered = true
+		}
 		lim5 := days * 288
 		if lim5 > 1500 {
 			lim5 = 1500
@@ -176,6 +182,10 @@ func main() {
 	bt.trendAlign = *trendAlignFlag
 	bt.erMin = *erMinFlag
 	bt.erLookback = *erLookbackFlag
+	bt.rungs = parseRungs(*rungsFlag)
+	if len(bt.rungs) > 0 {
+		bt.tiered = true
+	}
 	for i, sd := range results {
 		if sd.err != nil {
 			continue
@@ -231,6 +241,8 @@ type position struct {
 	tier2Px   float64 // tier-2 (final) take-profit price
 	tier1Done bool    // tier-1 partial already taken
 	peakFav   float64 // best favourable excursion (price distance) seen, for the trail
+	origQty   float64 // qty at entry (rungs close fractions of THIS, not the remainder)
+	rungsDone int     // how many ladder rungs have been taken (they fire in order)
 }
 
 type trade struct {
@@ -264,9 +276,18 @@ type backtestEngine struct {
 	breakeven   bool    // move stop to break-even after tier-1
 	trailStart  float64 // peak excursion (R) that engages the trail
 	trailGive   float64 // once trailing, exit if uPnL gives back to this many R
+	rungs       []rung  // laddered scale-out (overrides tier-1/tier-2 when set)
 	positions   map[string]*position
 	trades      []trade
 	equityCurve []float64
+}
+
+// rung is one step of a laddered scale-out: when favourable excursion reaches
+// r×R, close frac of the ORIGINAL position. Rungs fire in ascending r order; the
+// fraction left after the last rung is handed to the trailing stop.
+type rung struct {
+	r    float64
+	frac float64
 }
 
 // setTiered installs the faithful tiered-exit plan (mirrors the live prompt).
@@ -374,18 +395,53 @@ func (bt *backtestEngine) manage(pos *position, price float64) (pnl float64, clo
 		book(pos.stopPrice, pos.qty, reason, true)
 		return
 	}
-	// 2. Tier-2 (final) — close the whole remainder.
-	if fav >= bt.tp2*R {
-		book(pos.tier2Px, pos.qty, "take-profit-t2", true)
-		return
-	}
-	// 3. Tier-1 partial — close tier1Frac, then move the stop to break-even.
-	if !pos.tier1Done && fav >= bt.tp1*R {
-		book(pos.tier1Px, pos.qty*bt.tier1Frac, "take-profit-t1", false)
-		pos.qty -= pos.qty * bt.tier1Frac
-		pos.tier1Done = true
-		if bt.breakeven {
-			pos.stopPrice = pos.entryPrice
+	// 2/3. Take-profit ladder.
+	if len(bt.rungs) > 0 {
+		// Laddered scale-out: fire the next unfilled rung when favourable
+		// excursion reaches its R level, closing a fraction of the ORIGINAL qty.
+		// The first rung also moves the stop to break-even. Whatever is left after
+		// the last rung is handed to the trailing block below.
+		for pos.rungsDone < len(bt.rungs) {
+			rg := bt.rungs[pos.rungsDone]
+			if fav < rg.r*R {
+				break
+			}
+			closeQty := rg.frac * pos.origQty
+			if closeQty > pos.qty {
+				closeQty = pos.qty
+			}
+			var px float64
+			if pos.direction == strategy.Long {
+				px = pos.entryPrice + rg.r*R
+			} else {
+				px = pos.entryPrice - rg.r*R
+			}
+			last := pos.rungsDone == len(bt.rungs)-1 && pos.qty-closeQty <= 1e-9
+			book(px, closeQty, fmt.Sprintf("rung-%gR", rg.r), last)
+			pos.qty -= closeQty
+			if pos.rungsDone == 0 && bt.breakeven {
+				pos.stopPrice = pos.entryPrice
+			}
+			pos.tier1Done = true
+			pos.rungsDone++
+			if done {
+				return
+			}
+		}
+	} else {
+		// Tier-2 (final) — close the whole remainder.
+		if fav >= bt.tp2*R {
+			book(pos.tier2Px, pos.qty, "take-profit-t2", true)
+			return
+		}
+		// Tier-1 partial — close tier1Frac, then move the stop to break-even.
+		if !pos.tier1Done && fav >= bt.tp1*R {
+			book(pos.tier1Px, pos.qty*bt.tier1Frac, "take-profit-t1", false)
+			pos.qty -= pos.qty * bt.tier1Frac
+			pos.tier1Done = true
+			if bt.breakeven {
+				pos.stopPrice = pos.entryPrice
+			}
 		}
 	}
 	// 4. Trailing — once the peak reached trailStart R, exit the remainder if the
@@ -469,6 +525,30 @@ func trend4h(k4 []binance.Kline) strategy.Direction {
 	default:
 		return strategy.Neutral
 	}
+}
+
+// parseRungs parses "1:0.33,2:0.5" into ascending-R scale-out rungs (R-level :
+// fraction-of-original). Malformed or empty → nil (the caller keeps tier-1/2).
+func parseRungs(s string) []rung {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var out []rung
+	for _, part := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		r, e1 := strconv.ParseFloat(strings.TrimSpace(kv[0]), 64)
+		f, e2 := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+		if e1 != nil || e2 != nil || r <= 0 || f <= 0 {
+			continue
+		}
+		out = append(out, rung{r: r, frac: f})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].r < out[j].r })
+	return out
 }
 
 // trackStreak updates a same-direction run length (mirrors the live
@@ -575,7 +655,7 @@ func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Klin
 		stopPrice, tpPrice = price+stopDist, price-tpDist
 	}
 	pos := &position{
-		symbol: symbol, direction: c.Direction, qty: qty,
+		symbol: symbol, direction: c.Direction, qty: qty, origQty: qty,
 		entryPrice: price, stopPrice: stopPrice, tpPrice: tpPrice, atr: atr, openAt: openAt,
 	}
 	// Tiered exit: R = the actual stop distance; tier-1/tier-2 sit at tp1×R / tp2×R
