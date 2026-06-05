@@ -57,6 +57,7 @@ type TradeRecord struct {
 	Time        int64    `json:"time"` // unix seconds
 	Features    Features `json:"features"`
 	EntryReason string   `json:"entry_reason"`
+	ExitReason  string   `json:"exit_reason,omitempty"` // why the position was closed (PRD: close-reason logging); "" for older records
 	Bias        string   `json:"bias"`                  // LONG / SHORT
 	Strategy    string   `json:"strategy,omitempty"`    // triggering strategy, e.g. "momentum" (PRD-014); "" for pre-PRD-014 records
 	PnL         float64  `json:"pnl"`                   // realised price PnL in USDT

@@ -157,10 +157,17 @@ func LogStopClose(event risk.StopCloseEvent) {
 		pnl -= estRoundTripFeeRate * event.MarkPrice * event.PositionQty
 	}
 
+	// Close reason in Chinese for the notification + memory (止損/停利).
+	reasonLabel := "止損"
+	if event.Reason == "take-profit" {
+		reasonLabel = "停利"
+	}
+
 	rec := memory.TradeRecord{
 		Symbol:      event.Symbol,
 		Time:        time.Now().Unix(),
 		EntryReason: fmt.Sprintf("StopMonitor: %s at %.4f", event.Reason, event.MarkPrice),
+		ExitReason:  fmt.Sprintf("StopMonitor %s", reasonLabel),
 		Bias:        bias,
 		PnL:         pnl,
 		PnLSource:   "reported",
@@ -190,10 +197,6 @@ func LogStopClose(event risk.StopCloseEvent) {
 		if rec.Paper {
 			tag = " [PAPER]"
 		}
-		reason := "止損"
-		if event.Reason == "take-profit" {
-			reason = "停利"
-		}
 		// ROE on margin (matches Binance's ROE%): PnL ÷ initial margin, where
 		// margin = entry notional ÷ leverage. Appended only when we captured the
 		// leverage and entry at arm-time; omitted otherwise (no misleading number).
@@ -204,9 +207,9 @@ func LogStopClose(event risk.StopCloseEvent) {
 				roeStr = fmt.Sprintf("，回報率 %+.1f%%（%gx）", pnl/margin*100, event.Leverage)
 			}
 		}
-		title := fmt.Sprintf("🛑 Friday StopMonitor: %s %s%s", event.Symbol, reason, tag)
-		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f%s",
-			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice, roeStr)
+		title := fmt.Sprintf("🛑 Friday StopMonitor: %s %s%s", event.Symbol, reasonLabel, tag)
+		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f%s，平倉原因：%s",
+			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice, roeStr, reasonLabel)
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			// best-effort; don't fail the close for a notify error
 		}

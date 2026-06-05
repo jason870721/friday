@@ -35,6 +35,7 @@ const logTradeSchema = `{
 		"strategy":    {"type": "string", "description": "The strategy that triggered this trade, e.g. momentum / breakout / mean_reversion / ema_cross / divergence (from the Risk Manager's decision reason). Optional but enables per-strategy win/loss tracking."},
 		"pnl":         {"type": "number", "description": "Your best estimate of realised PnL in USDT (a hint; reconciled against the exchange ledger)."},
 		"entry_reason":{"type": "string", "description": "Why the trade was opened (the setup)."},
+		"exit_reason": {"type": "string", "description": "Why the position was CLOSED this round, e.g. 'MTF flipped SHORT', 'take-profit hit', 'trend reversal', 'profit-guard'. Optional but recommended — surfaced in the close notification and stored for review."},
 		"rsi":         {"type": "number", "description": "RSI(14) at the trade, 0-100."},
 		"price_vs_ma": {"type": "number", "description": "(price-MA20)/MA20 as a percent, e.g. 0.3."},
 		"momentum":    {"type": "number", "description": "-1 falling, 0 mixed, +1 rising."},
@@ -57,6 +58,7 @@ type logTradeInput struct {
 	Strategy    string  `json:"strategy,omitempty"`
 	PnL         float64 `json:"pnl"`
 	EntryReason string  `json:"entry_reason"`
+	ExitReason  string  `json:"exit_reason,omitempty"`
 	RSI         float64 `json:"rsi"`
 	PriceVsMA   float64 `json:"price_vs_ma"`
 	Momentum    float64 `json:"momentum"`
@@ -88,6 +90,7 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 		Symbol:      in.Symbol,
 		Time:        time.Now().Unix(),
 		EntryReason: in.EntryReason,
+		ExitReason:  in.ExitReason,
 		Bias:        in.Bias,
 		Strategy:    in.Strategy,
 		PnL:         in.PnL,
@@ -169,6 +172,10 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 			roeStr = fmt.Sprintf("，回報率 %+.1f%%（%gx）", effective/margin*100, snap.leverage)
 		}
 	}
+	exitStr := ""
+	if in.ExitReason != "" {
+		exitStr = fmt.Sprintf("，平倉原因：%s", in.ExitReason)
+	}
 
 	largeClose := globalNotifier != nil && balance > 0 && abs(effective) >= notifyPnLPct*balance
 	if largeClose {
@@ -177,8 +184,8 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 			tag = " [PAPER]"
 		}
 		title := fmt.Sprintf("📊 Friday 大額平倉: %s %s%s", in.Symbol, outcomeWord(effective), tag)
-		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（帳戶 %.1f%% / 餘額 $%.2f）%s，策略=%s",
-			in.Bias, in.Symbol, effective, effective/balance*100, balance, roeStr, orNone(in.Strategy))
+		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（帳戶 %.1f%% / 餘額 $%.2f）%s%s，策略=%s",
+			in.Bias, in.Symbol, effective, effective/balance*100, balance, roeStr, exitStr, orNone(in.Strategy))
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			logger.Warn("log_trade.notify_failed", "err", nerr)
 		}
@@ -193,8 +200,8 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 			tag = " [PAPER]"
 		}
 		title := fmt.Sprintf("💼 Friday 平倉: %s %s%s", in.Symbol, outcomeWord(effective), tag)
-		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（帳戶 %.1f%% / 餘額 $%.2f）%s，策略=%s",
-			in.Bias, in.Symbol, effective, effective/balance*100, balance, roeStr, orNone(in.Strategy))
+		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（帳戶 %.1f%% / 餘額 $%.2f）%s%s，策略=%s",
+			in.Bias, in.Symbol, effective, effective/balance*100, balance, roeStr, exitStr, orNone(in.Strategy))
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			logger.Warn("log_trade.notify_failed", "err", nerr)
 		}
