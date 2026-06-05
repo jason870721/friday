@@ -58,7 +58,8 @@ func main() {
 	breakevenFlag := flag.Bool("breakeven", true, "Tiered: after tier-1, move the stop to break-even on the remainder.")
 	trailStartFlag := flag.Float64("trail-start", 2.0, "Tiered: peak favourable excursion (in R) that engages the trailing stop.")
 	trailGiveFlag := flag.Float64("trail-give", 1.0, "Tiered: once trailing, close if uPnL gives back to this many R.")
-	liveGatesFlag := flag.Bool("live-gates", false, "Apply the live entry gates the raw engine omits: signal-persistence (same MTF direction held ≥2 consecutive 5m bars) and no-chop (skip when price sits on its 5m MA20 with a neutral 45–55 RSI). Isolates how much live filtering changes the raw edge.")
+	persistenceFlag := flag.Int("persistence", 2, "Signal-persistence: require the same MTF direction to hold ≥N consecutive 5m bars before opening (mirrors the live prompt's persistence gate). 0 = off.")
+	noChopFlag := flag.Bool("no-chop", false, "No-chop gate: skip when price sits on its 5m MA20 (|Δ| < 0.3%) with a neutral 45–55 RSI — no displacement, stop sits inside noise band.")
 	trendAlignFlag := flag.Bool("trend-align", false, "Only open in the direction of the 4h trend (4h close vs 4h MA20): suppress longs while 4h is below its MA20 and shorts while above. Tests whether the long-side bleed in a downtrend is cured by higher-TF trend alignment. MTF mode only.")
 	erMinFlag := flag.Float64("er-min", 0, "Whipsaw filter: require the 5m Kaufman Efficiency Ratio (|net move| / Σ|bar moves| over -er-lookback bars) ≥ this to open. ~1 = clean trend, ~0 = chop. 0 = off. Suppresses entries in oscillating ranges where trend signals get sawed.")
 	erLookbackFlag := flag.Int("er-lookback", 20, "Whipsaw filter: lookback (5m bars) for the Efficiency Ratio.")
@@ -113,7 +114,8 @@ func main() {
 	if *mtfFlag {
 		bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
 		bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
-		bt.liveGates = *liveGatesFlag
+		bt.persistence = *persistenceFlag
+		bt.noChop = *noChopFlag
 		bt.trendAlign = *trendAlignFlag
 		bt.erMin = *erMinFlag
 		bt.erLookback = *erLookbackFlag
@@ -169,7 +171,8 @@ func main() {
 	// Run the backtest.
 	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
 	bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
-	bt.liveGates = *liveGatesFlag
+	bt.persistence = *persistenceFlag
+	bt.noChop = *noChopFlag
 	bt.trendAlign = *trendAlignFlag
 	bt.erMin = *erMinFlag
 	bt.erLookback = *erLookbackFlag
@@ -248,18 +251,19 @@ type backtestEngine struct {
 	tpMult       float64 // take-profit distance in ATR multiples (single-TP mode)
 	slMult       float64 // stop-loss distance in ATR multiples
 	regimeGate   bool    // only open in a TRENDING regime
-	liveGates    bool    // apply the live persistence + no-chop entry gates
+	persistence  int     // signal-persistence threshold (0 = off)
+	noChop       bool    // no-chop gate
 	trendAlign   bool    // only open in the direction of the 4h trend (price vs 4h MA20)
 	erMin        float64 // whipsaw filter: min 5m Efficiency Ratio to open (0 = off)
 	erLookback   int     // Efficiency Ratio lookback in 5m bars
 	// Tiered exit (mirrors the live prompt). R = the stop distance.
-	tiered     bool
-	tp1        float64 // tier-1 TP in R
-	tp2        float64 // tier-2 (final) TP in R
-	tier1Frac  float64 // fraction closed at tier-1
-	breakeven  bool    // move stop to break-even after tier-1
-	trailStart float64 // peak excursion (R) that engages the trail
-	trailGive  float64 // once trailing, exit if uPnL gives back to this many R
+	tiered      bool
+	tp1         float64 // tier-1 TP in R
+	tp2         float64 // tier-2 (final) TP in R
+	tier1Frac   float64 // fraction closed at tier-1
+	breakeven   bool    // move stop to break-even after tier-1
+	trailStart  float64 // peak excursion (R) that engages the trail
+	trailGive   float64 // once trailing, exit if uPnL gives back to this many R
 	positions   map[string]*position
 	trades      []trade
 	equityCurve []float64
@@ -522,16 +526,10 @@ func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Klin
 	if bt.regimeGate && regime != strategy.RegimeTrending {
 		return false
 	}
-	// Live entry gates the raw engine otherwise omits (-live-gates), to measure
-	// how much the bot's filtering changes the raw edge:
-	//   - signal-persistence: the same MTF direction must have held ≥2 consecutive
-	//     5m bars (the caller tracks the streak and passes `confirmed`).
-	//   - no-chop: skip when price sits on its 5m MA20 (|Δ| < 0.3%) with a neutral
-	//     45–55 RSI — no displacement, so a 2×ATR stop sits inside the noise band.
-	if bt.liveGates {
-		if !confirmed {
-			return false
-		}
+	if bt.persistence > 0 && !confirmed {
+		return false
+	}
+	if bt.noChop {
 		if chop, ok := onMABand(window); ok && chop {
 			return false
 		}
@@ -638,7 +636,7 @@ func (bt *backtestEngine) run(ctx context.Context, symbol string, klines []binan
 		c := strategy.ConsensusForWithRegime(symbol, window)
 		prevDir, streak = trackStreak(prevDir, streak, c.Direction)
 		// Single-TF mode has no 4h series → trend-align is a no-op (Neutral).
-		bt.openFromConsensus(symbol, window, c, i, strategy.DetectRegime(window), streak >= 2, strategy.Neutral)
+		bt.openFromConsensus(symbol, window, c, i, strategy.DetectRegime(window), streak >= bt.persistence, strategy.Neutral)
 	}
 
 	totalPnL += bt.closeRemaining(symbol, klines[len(klines)-1].Close, &trades, &wins)
@@ -726,7 +724,7 @@ func (bt *backtestEngine) runMTF(symbol string, k5, k1, k4 []binance.Kline) {
 		if j4 > 0 {
 			trendDir = trend4h(k4[:j4])
 		}
-		bt.openFromConsensus(symbol, w5, cons, i, regime, streak >= 2, trendDir)
+		bt.openFromConsensus(symbol, w5, cons, i, regime, streak >= bt.persistence, trendDir)
 	}
 
 	totalPnL += bt.closeRemaining(symbol, k5[len(k5)-1].Close, &trades, &wins)

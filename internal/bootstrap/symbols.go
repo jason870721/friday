@@ -173,8 +173,10 @@ func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
 	strategy.SetDefaultCalibration(cal)
 
 	calibrated := 0
-	for _, m := range cal {
-		calibrated += len(m)
+	for _, sm := range cal {
+		for _, dm := range sm {
+			calibrated += len(dm)
+		}
 	}
 	fmt.Fprintf(os.Stderr,
 		"friday: calibrated %d strategy×symbol confidence(s) from 5m backtests (the rest fall back to defaults)\n", calibrated)
@@ -202,7 +204,7 @@ func startRecalibrator(symbols []orchestrator.MarketSymbol) {
 		Strategies: strategy.DefaultStrategies(),
 		Interval:   time.Duration(hours * float64(time.Hour)),
 		Fetch:      cli.Klines,
-		CalibrateFn: func(strats []strategy.Strategy, candles map[string][]binance.Kline) map[string]map[string]float64 {
+		CalibrateFn: func(strats []strategy.Strategy, candles map[string][]binance.Kline) map[string]map[string]map[string]float64 {
 			return backtest.Calibrate(strats, candles)
 		},
 		Logger: slog.Default(),

@@ -29,7 +29,7 @@ type Recalibrator struct {
 	Strategies  []Strategy
 	Interval    time.Duration
 	Fetch       func(ctx context.Context, symbol, interval string, limit int) ([]binance.Kline, error)
-	CalibrateFn func(strategies []Strategy, candlesBySymbol map[string][]binance.Kline) map[string]map[string]float64
+	CalibrateFn func(strategies []Strategy, candlesBySymbol map[string][]binance.Kline) map[string]map[string]map[string]float64
 	Logger      *slog.Logger
 }
 

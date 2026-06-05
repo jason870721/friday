@@ -132,7 +132,7 @@ func TestRegistry_AppliesCalibratedConfidence(t *testing.T) {
 	// PRD-015: a calibrated base REPLACES the hardcoded 0.6, with ADX boost
 	// added on top — so a momentum Long here reads ≥0.9, not 0.6.
 	r := DefaultRegistry()
-	r.SetCalibration(map[string]float64{"momentum": 0.9})
+	r.SetCalibration(map[string]map[string]float64{"momentum": {"LONG": 0.9, "SHORT": 0.9}})
 	sigs := r.AnalyzeAll("BTCUSDT", candlesFromCloses(risingWithPullbacks(30)...))
 
 	found := false
@@ -157,7 +157,7 @@ func TestAnalyzeAll_ExcludesZeroCalibratedStrategy(t *testing.T) {
 	// PRD-016 R6: a strategy calibrated to 0 on a symbol is auto-disabled —
 	// absent from the signal list entirely.
 	r := DefaultRegistry()
-	r.SetCalibration(map[string]float64{"momentum": 0})
+	r.SetCalibration(map[string]map[string]float64{"momentum": {"LONG": 0, "SHORT": 0}})
 	sigs := r.AnalyzeAll("BTCUSDT", candlesFromCloses(risingWithPullbacks(30)...))
 	for _, s := range sigs {
 		if s.Strategy == "momentum" {

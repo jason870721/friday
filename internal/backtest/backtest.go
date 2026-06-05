@@ -15,7 +15,7 @@ import (
 type Indicator string
 
 const (
-	IndicatorRSI       Indicator = "RSI"        // RSI(14), 0-100
+	IndicatorRSI       Indicator = "RSI"         // RSI(14), 0-100
 	IndicatorPriceVsMA Indicator = "PRICE_VS_MA" // (close-MA20)/MA20 as a percent
 )
 
@@ -48,6 +48,13 @@ type Result struct {
 	AvgPnLPct      float64 `json:"avg_pnl_pct"`      // per-trade, leverage-applied
 	TotalReturnPct float64 `json:"total_return_pct"` // sum of trade PnL%
 	MaxDrawdownPct float64 `json:"max_drawdown_pct"` // worst peak-to-trough of cumulative return
+	// Direction-specific breakdown (long/short split calibration, PRD-022).
+	LongTrades     int     `json:"long_trades"`
+	LongWins       int     `json:"long_wins"`
+	LongAvgPnLPct  float64 `json:"long_avg_pnl_pct"`
+	ShortTrades    int     `json:"short_trades"`
+	ShortWins      int     `json:"short_wins"`
+	ShortAvgPnLPct float64 `json:"short_avg_pnl_pct"`
 }
 
 // Validate checks the rule is runnable.
@@ -145,6 +152,7 @@ func RunStrategy(s strategy.Strategy, symbol string, candles []binance.Kline) (R
 
 	var res Result
 	var cumulative, peak, maxDD float64
+	var longPnLSum, shortPnLSum float64
 
 	i := 0
 	for i < len(candles) {
@@ -162,6 +170,19 @@ func RunStrategy(s strategy.Strategy, symbol string, candles []binance.Kline) (R
 			res.Wins++
 		}
 		res.TotalReturnPct += pnlPct
+		if long {
+			res.LongTrades++
+			longPnLSum += pnlPct
+			if pnlPct > 0 {
+				res.LongWins++
+			}
+		} else {
+			res.ShortTrades++
+			shortPnLSum += pnlPct
+			if pnlPct > 0 {
+				res.ShortWins++
+			}
+		}
 
 		cumulative += pnlPct
 		if cumulative > peak {
@@ -181,6 +202,12 @@ func RunStrategy(s strategy.Strategy, symbol string, candles []binance.Kline) (R
 	if res.Trades > 0 {
 		res.WinRate = float64(res.Wins) / float64(res.Trades)
 		res.AvgPnLPct = res.TotalReturnPct / float64(res.Trades)
+	}
+	if res.LongTrades > 0 {
+		res.LongAvgPnLPct = longPnLSum / float64(res.LongTrades)
+	}
+	if res.ShortTrades > 0 {
+		res.ShortAvgPnLPct = shortPnLSum / float64(res.ShortTrades)
 	}
 	res.MaxDrawdownPct = maxDD
 	return res, nil

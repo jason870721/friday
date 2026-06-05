@@ -13,7 +13,7 @@ import (
 // process-wide store before each read.
 type Registry struct {
 	strategies  []Strategy
-	calibration map[string]float64 // strategy name → calibrated base confidence; nil = use hardcoded
+	calibration map[string]map[string]float64 // strategy name → calibrated base confidence; nil = use hardcoded
 }
 
 // NewRegistry builds a registry from the given strategies.
@@ -46,7 +46,7 @@ func DefaultRegistry() *Registry {
 
 // SetCalibration installs the calibrated confidences for the symbol this
 // registry is about to evaluate (strategy name → confidence). nil clears it.
-func (r *Registry) SetCalibration(m map[string]float64) { r.calibration = m }
+func (r *Registry) SetCalibration(m map[string]map[string]float64) { r.calibration = m }
 
 // AnalyzeAll runs every strategy against the symbol's candles and returns
 // their signals. When a calibrated confidence exists for a directional signal's
@@ -57,15 +57,19 @@ func (r *Registry) AnalyzeAll(symbol string, candles []binance.Kline) []Signal {
 	for _, s := range r.strategies {
 		// PRD-016 R6: a strategy calibrated to 0 confidence on this symbol (no
 		// historical edge, ≥5 trades) is auto-disabled — it doesn't even vote.
-		if r.calibration != nil {
-			if base, ok := r.calibration[s.Name()]; ok && base <= 0 {
-				continue
-			}
-		}
 		sig := s.Analyze(symbol, candles)
 		if sig.Direction != Neutral && r.calibration != nil {
-			if base, ok := r.calibration[sig.Strategy]; ok {
-				sig.Confidence = clamp01(base + adxBoost(candles))
+			if dirs, ok := r.calibration[sig.Strategy]; ok {
+				dirKey := "LONG"
+				if sig.Direction == Short {
+					dirKey = "SHORT"
+				}
+				if base, ok := dirs[dirKey]; ok {
+					if base <= 0 {
+						continue // no edge for this direction → abstain
+					}
+					sig.Confidence = clamp01(base + adxBoost(candles))
+				}
 			}
 		}
 		out = append(out, sig)
@@ -87,20 +91,20 @@ func (r *Registry) Consensus(symbol string, candles []binance.Kline) Consensus {
 // SetDefaultCalibration after the startup backtest sweep.
 var (
 	calMu            sync.RWMutex
-	calibrationStore map[string]map[string]float64 // symbol → strategy → confidence
+	calibrationStore map[string]map[string]map[string]float64 // symbol → strategy → confidence
 )
 
 // SetDefaultCalibration installs the process-wide per-symbol calibration that
 // ConsensusFor applies. A nil/empty map disables calibration (hardcoded
 // confidences stand).
-func SetDefaultCalibration(m map[string]map[string]float64) {
+func SetDefaultCalibration(m map[string]map[string]map[string]float64) {
 	calMu.Lock()
 	defer calMu.Unlock()
 	calibrationStore = m
 }
 
 // calibrationFor returns the calibrated confidences for one symbol, or nil.
-func calibrationFor(symbol string) map[string]float64 {
+func calibrationFor(symbol string) map[string]map[string]float64 {
 	calMu.RLock()
 	defer calMu.RUnlock()
 	return calibrationStore[symbol]

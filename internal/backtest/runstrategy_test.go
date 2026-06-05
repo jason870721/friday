@@ -109,13 +109,14 @@ func TestCalibrate_MapsExpectancyAndOmitsThin(t *testing.T) {
 		"RISEUSDT": risingPullbackCandles(40), // Momentum: one trade to end (<5) → omitted
 	})
 
-	mr, ok := cal["FALLUSDT"]["mean_reversion"]
+	dirs, ok := cal["FALLUSDT"]["mean_reversion"]
 	if !ok {
 		t.Fatal("mean_reversion should be calibrated on FALLUSDT (≥5 trades)")
 	}
 	// Negative per-trade expectancy (each fade stopped at its invalidation) → 0.
-	if mr != 0 {
-		t.Errorf("a negative-expectancy strategy maps to 0 confidence; got %.2f", mr)
+	// MeanReversion fires LONG on oversold → check the LONG direction.
+	if conf := dirs["LONG"]; conf != 0 {
+		t.Errorf("a negative-expectancy strategy maps to 0 confidence; got %.2f", conf)
 	}
 	// A strategy with <CalibrationMinTrades trades is omitted → hardcoded fallback.
 	if _, ok := cal["RISEUSDT"]["momentum"]; ok {
@@ -136,8 +137,13 @@ func TestCalibrate_KeepsProfitableLowWinRate(t *testing.T) {
 		t.Skipf("fixture produced %d trades (<%d); cannot exercise the calibration path", res.Trades, CalibrationMinTrades)
 	}
 	cal := Calibrate([]strategy.Strategy{strategy.Momentum{}}, map[string][]binance.Kline{"UPUSDT": momentumWinnersCandles()})
-	conf, ok := cal["UPUSDT"]["momentum"]
+	dirs, ok := cal["UPUSDT"]["momentum"]
 	if res.AvgPnLPct-roundTripFeePct > 0 {
+		// Momentum fires LONG on uptrend; check the LONG direction.
+		conf := 0.0
+		if ok {
+			conf = dirs["LONG"]
+		}
 		if !ok || conf <= 0 {
 			t.Errorf("a positive-expectancy strategy (avg %.2f%%, win rate %.0f%%) must keep confidence >0; got ok=%v conf=%.2f",
 				res.AvgPnLPct, res.WinRate*100, ok, conf)
