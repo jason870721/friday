@@ -60,6 +60,8 @@ func main() {
 	trailGiveFlag := flag.Float64("trail-give", 1.0, "Tiered: once trailing, close if uPnL gives back to this many R.")
 	liveGatesFlag := flag.Bool("live-gates", false, "Apply the live entry gates the raw engine omits: signal-persistence (same MTF direction held ≥2 consecutive 5m bars) and no-chop (skip when price sits on its 5m MA20 with a neutral 45–55 RSI). Isolates how much live filtering changes the raw edge.")
 	trendAlignFlag := flag.Bool("trend-align", false, "Only open in the direction of the 4h trend (4h close vs 4h MA20): suppress longs while 4h is below its MA20 and shorts while above. Tests whether the long-side bleed in a downtrend is cured by higher-TF trend alignment. MTF mode only.")
+	erMinFlag := flag.Float64("er-min", 0, "Whipsaw filter: require the 5m Kaufman Efficiency Ratio (|net move| / Σ|bar moves| over -er-lookback bars) ≥ this to open. ~1 = clean trend, ~0 = chop. 0 = off. Suppresses entries in oscillating ranges where trend signals get sawed.")
+	erLookbackFlag := flag.Int("er-lookback", 20, "Whipsaw filter: lookback (5m bars) for the Efficiency Ratio.")
 	flag.Parse()
 
 	symbols := parseSymbols(*symbolsFlag)
@@ -113,6 +115,8 @@ func main() {
 		bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
 		bt.liveGates = *liveGatesFlag
 		bt.trendAlign = *trendAlignFlag
+		bt.erMin = *erMinFlag
+		bt.erLookback = *erLookbackFlag
 		lim5 := days * 288
 		if lim5 > 1500 {
 			lim5 = 1500
@@ -166,6 +170,9 @@ func main() {
 	bt := newBacktest(*balanceFlag, *leverageFlag, *riskFlag, *feeFlag, *tpMultFlag, *slMultFlag, *regimeGateFlag)
 	bt.setTiered(*tieredFlag, *tp1Flag, *tp2Flag, *tier1FracFlag, *trailStartFlag, *trailGiveFlag, *breakevenFlag)
 	bt.liveGates = *liveGatesFlag
+	bt.trendAlign = *trendAlignFlag
+	bt.erMin = *erMinFlag
+	bt.erLookback = *erLookbackFlag
 	for i, sd := range results {
 		if sd.err != nil {
 			continue
@@ -243,6 +250,8 @@ type backtestEngine struct {
 	regimeGate   bool    // only open in a TRENDING regime
 	liveGates    bool    // apply the live persistence + no-chop entry gates
 	trendAlign   bool    // only open in the direction of the 4h trend (price vs 4h MA20)
+	erMin        float64 // whipsaw filter: min 5m Efficiency Ratio to open (0 = off)
+	erLookback   int     // Efficiency Ratio lookback in 5m bars
 	// Tiered exit (mirrors the live prompt). R = the stop distance.
 	tiered     bool
 	tp1        float64 // tier-1 TP in R
@@ -417,6 +426,26 @@ func exitDecision(pos *position, price float64) (exitPrice float64, reason strin
 // (expected move ≥ 0.24%), risk-based sizing (risk% ÷ 2×ATR), and a stop that is
 // the tighter of 2×ATR or the consensus invalidation (when ≥1×ATR away). No-op
 // when NEUTRAL or already in a position. Returns true if it opened.
+// efficiencyRatio is Kaufman's Efficiency Ratio over the last n closes:
+// |close[last] − close[last-n]| / Σ|close[i] − close[i-1]|. 1.0 = a perfectly
+// straight move, →0 = pure chop (lots of motion, no net progress). ok=false when
+// there aren't n+1 closes, or the path length is zero.
+func efficiencyRatio(window []binance.Kline, n int) (float64, bool) {
+	if n < 1 || len(window) < n+1 {
+		return 0, false
+	}
+	seg := window[len(window)-n-1:]
+	net := math.Abs(seg[len(seg)-1].Close - seg[0].Close)
+	var path float64
+	for i := 1; i < len(seg); i++ {
+		path += math.Abs(seg[i].Close - seg[i-1].Close)
+	}
+	if path == 0 {
+		return 0, false
+	}
+	return net / path, true
+}
+
 // trend4h returns the 4h trend direction (last 4h close vs its 20-bar MA): Long
 // above, Short below, Neutral when there aren't enough 4h bars to judge.
 func trend4h(k4 []binance.Kline) strategy.Direction {
@@ -504,6 +533,15 @@ func (bt *backtestEngine) openFromConsensus(symbol string, window []binance.Klin
 			return false
 		}
 		if chop, ok := onMABand(window); ok && chop {
+			return false
+		}
+	}
+	// Whipsaw filter (-er-min): the Kaufman Efficiency Ratio over the last
+	// er-lookback 5m bars must clear the threshold. ER ≈ 1 in a clean directional
+	// move, ≈ 0 in an oscillating range — this is what the flat-on-MA no-chop gate
+	// and the slow 4h ADX regime read both miss.
+	if bt.erMin > 0 {
+		if er, ok := efficiencyRatio(window, bt.erLookback); ok && er < bt.erMin {
 			return false
 		}
 	}
