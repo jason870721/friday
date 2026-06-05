@@ -166,10 +166,19 @@ func LogStopClose(event risk.StopCloseEvent) {
 		pnl -= estRoundTripFeeRate * event.MarkPrice * event.PositionQty
 	}
 
-	// Close reason in Chinese for the notification + memory (止損/停利).
+	// Close reason in Chinese for the notification + memory (止損/停利/移動停利).
+	// breachReason only knows the MECHANISM (which line the mark crossed), not the
+	// outcome: a "stop-loss" line that the Risk Manager trailed UP above entry
+	// (tier-1 break-even, then trailing) closes IN PROFIT when touched. Labelling
+	// that "止損" on a WIN is self-contradictory (the record reads "止損" with a
+	// positive net), so a profitable stop-line trigger is a trailing profit-lock →
+	// "移動停利".
 	reasonLabel := "止損"
-	if event.Reason == "take-profit" {
+	switch {
+	case event.Reason == "take-profit":
 		reasonLabel = "停利"
+	case pnl > 0:
+		reasonLabel = "移動停利"
 	}
 
 	rec := memory.TradeRecord{

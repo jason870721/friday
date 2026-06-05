@@ -74,6 +74,13 @@ FRIDAY_RECALIBRATE_HOURS=4
 # out-of-sample returns near breakeven; risk = occasional missed/late fills.
 # Closes always go MARKET. Default off.
 # FRIDAY_MAKER_ENTRY=true
+# Discretionary mode: the Analyst decides DIRECTION and the Risk Manager decides
+# EXIT timing from the raw multi-timeframe indicators, using their own judgment,
+# instead of validating the deterministic strategy engine. More flexible, but the
+# decision can no longer be backtested (cmd/backtest replays the engine, not the
+# LLM). The code-enforced safety layer (circuit breaker, margin/group caps, fee
+# budget, stop monitor, liquidation) is UNCHANGED. Default off (engine-validated).
+# FRIDAY_DISCRETIONARY=true
 
 # Operations & observability (PRD-021).
 # Paper trading: no real orders — a virtual book trades against live market data.
@@ -230,6 +237,13 @@ func New(emitter orchestrator.RoleEmitter) (*orchestrator.Orchestrator, *config.
 	portfolioValidator := risk.NewPortfolioGroupValidator(groups)
 	fridaytool.SetPortfolioValidator(&portfolioValidator)
 	orchestrator.SetPortfolioGroupsHint(groups.PromptHint())
+
+	// Discretionary mode (FRIDAY_DISCRETIONARY=true): the Analyst decides
+	// direction and the Risk Manager decides exit timing from the raw indicators,
+	// instead of validating the deterministic strategy engine. Trades flexibility
+	// for backtestability (cmd/backtest can't replay an LLM decision); the
+	// code-enforced safety layer (breaker, caps, stop monitor) is unaffected.
+	orchestrator.SetDiscretionary(strings.EqualFold(os.Getenv("FRIDAY_DISCRETIONARY"), "true"))
 
 	// PRD-015: calibrate strategy confidences from a startup backtest sweep over
 	// recent 4h candles, so each strategy votes with its real per-symbol win rate

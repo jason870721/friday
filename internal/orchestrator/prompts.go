@@ -18,15 +18,38 @@ import (
 
 // --- entry points: a finished system prompt per role ---
 
+// discretionary, when true, swaps the Analyst and Risk Manager templates for
+// their DISCRETIONARY variants (FRIDAY_DISCRETIONARY=true): the agent decides
+// direction and exit timing from the raw indicators instead of validating the
+// deterministic strategy engine. Set once at bootstrap via SetDiscretionary,
+// before New builds the agents; the code-enforced safety layer is unaffected by
+// it. The Executor template is mode-independent (it only places what the Risk
+// Manager specifies), so it is not swapped.
+var discretionary bool
+
+// SetDiscretionary selects discretionary-mode role prompts. Called once at
+// bootstrap from the FRIDAY_DISCRETIONARY env flag, before orchestrator.New.
+func SetDiscretionary(on bool) { discretionary = on }
+
 // analystSystemPrompt takes the submit tool's NAME so the parallel fleet can
 // give each per-symbol agent a UNIQUE submit tool (e.g. submit_analysis_BTCUSDT)
 // — evva dedups custom tools by name across agents, so a shared name would make
 // the whole fleet collide on one capture. The single-agent path passes
 // submitAnalysisName.
 func analystSystemPrompt(syms []MarketSymbol, submitName string) string {
-	return renderPrompt(analystSystemTmpl, syms, submitName)
+	tmpl := analystSystemTmpl
+	if discretionary {
+		tmpl = analystDiscretionaryTmpl
+	}
+	return renderPrompt(tmpl, syms, submitName)
 }
-func riskSystemPrompt(syms []MarketSymbol) string     { return renderPrompt(riskSystemTmpl, syms, submitRiskName) }
+func riskSystemPrompt(syms []MarketSymbol) string {
+	tmpl := riskSystemTmpl
+	if discretionary {
+		tmpl = riskDiscretionaryTmpl
+	}
+	return renderPrompt(tmpl, syms, submitRiskName)
+}
 func executorSystemPrompt(syms []MarketSymbol) string { return renderPrompt(executorSystemTmpl, syms, submitExecName) }
 
 // renderPrompt substitutes the per-session tokens in a prompt template. A
