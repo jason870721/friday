@@ -28,10 +28,10 @@ func TestStopEntryPrice_Paper(t *testing.T) {
 	globalPaper = pp
 	t.Cleanup(func() { globalPaper = prev })
 
-	if got := stopEntryPrice(context.Background(), "BTCUSDT"); got != 27000 {
-		t.Errorf("stopEntryPrice(BTCUSDT) = %g; want 27000", got)
+	if got, _ := stopEntryAndLeverage(context.Background(), "BTCUSDT"); got != 27000 {
+		t.Errorf("stopEntryAndLeverage(BTCUSDT) entry = %g; want 27000", got)
 	}
-	if got := stopEntryPrice(context.Background(), "ETHUSDT"); got != 0 {
-		t.Errorf("stopEntryPrice(ETHUSDT, flat) = %g; want 0", got)
+	if got, lev := stopEntryAndLeverage(context.Background(), "ETHUSDT"); got != 0 || lev != 0 {
+		t.Errorf("stopEntryAndLeverage(ETHUSDT, flat) = (%g, %g); want (0, 0)", got, lev)
 	}
 }

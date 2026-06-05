@@ -27,6 +27,7 @@ type StopLevels struct {
 	PositionQty  float64 // base-asset size to close on breach
 	PositionSide string  // DirLong / DirShort
 	EntryPrice   float64 // entry price of the position (for PnL estimation; 0 = unknown)
+	Leverage     float64 // position leverage (for ROE on a triggered close; 0 = unknown)
 }
 
 // active reports whether these levels are worth monitoring.
@@ -50,6 +51,7 @@ type StopCloseEvent struct {
 	PositionSide string  // DirLong or DirShort
 	EntryPrice   float64 // entry price (0 = unknown)
 	MarkPrice    float64
+	Leverage     float64 // position leverage (for ROE; 0 = unknown)
 	Reason       string  // "stop-loss" or "take-profit"
 }
 
@@ -61,10 +63,10 @@ type StopCloseCallback func(event StopCloseEvent)
 
 // StopMonitor watches registered levels and flattens on breach.
 type StopMonitor struct {
-	broker    StopBroker
-	interval  time.Duration
-	logger    *slog.Logger
-	onClose   StopCloseCallback
+	broker   StopBroker
+	interval time.Duration
+	logger   *slog.Logger
+	onClose  StopCloseCallback
 
 	mu     sync.Mutex
 	levels map[string]StopLevels
@@ -163,6 +165,7 @@ func (m *StopMonitor) check(ctx context.Context) {
 					PositionSide: l.PositionSide,
 					EntryPrice:   l.EntryPrice,
 					MarkPrice:    mark,
+					Leverage:     l.Leverage,
 					Reason:       reason,
 				})
 			}

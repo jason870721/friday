@@ -29,6 +29,32 @@ var (
 	nativeStopOrders = map[string]nativeStopPair{}
 )
 
+// openSnapshot records a position's entry / qty / leverage captured when its stop
+// is armed, so log_trade can report the closed trade's ROE (PnL ÷ margin) even
+// though its own inputs carry none of these. Keyed by symbol, overwritten on the
+// next arm. Unlike the StopMonitor's levels (cleared on close), this is NOT
+// cleared — log_trade runs AFTER the close and still needs the open params.
+type openSnapshot struct{ entry, qty, leverage float64 }
+
+var (
+	openSnapMu sync.Mutex
+	openSnaps  = map[string]openSnapshot{}
+)
+
+func recordOpenSnapshot(symbol string, entry, qty, leverage float64) {
+	openSnapMu.Lock()
+	defer openSnapMu.Unlock()
+	openSnaps[symbol] = openSnapshot{entry: entry, qty: qty, leverage: leverage}
+}
+
+// openSnapshotFor returns the last-armed open params for a symbol (for ROE).
+func openSnapshotFor(symbol string) (openSnapshot, bool) {
+	openSnapMu.Lock()
+	defer openSnapMu.Unlock()
+	s, ok := openSnaps[symbol]
+	return s, ok
+}
+
 // globalStopMonitor is the process-wide StopMonitor (PRD-009), installed at
 // startup by main via SetStopMonitor. nil when the monitor isn't running
 // (e.g. no Binance credentials).
@@ -164,14 +190,20 @@ func (BinanceStopMonitorTool) Execute(ctx context.Context, logger *slog.Logger, 
 		return tools.Result{IsError: true, Content: "binance_stop_monitor: stop monitor is not running (no Binance credentials?)"}, nil
 	}
 
-	// Capture the position's entry price so a monitor-triggered close can ESTIMATE
-	// its PnL (LogStopClose needs entry vs mark). The tool isn't told the entry, so
-	// read it from the just-opened position here — without it event.EntryPrice is
-	// 0 and EVERY monitor close reports +0.00 PnL (a $0 LOSS), which is wrong and
-	// feeds the breaker garbage. Best-effort: a miss leaves entry 0 (old behaviour).
-	entry := 0.0
+	// Capture the position's entry price AND leverage so a monitor-triggered close
+	// can ESTIMATE its PnL (LogStopClose needs entry vs mark) and its ROE (PnL over
+	// margin = entry×qty/leverage). The tool isn't told either, so read them from
+	// the just-opened position here — without entry every monitor close reports
+	// +0.00 PnL (a $0 LOSS), and without leverage there's no ROE. Best-effort: a
+	// miss leaves them 0 (entry 0 → PnL skipped; leverage 0 → ROE omitted).
+	entry, leverage := 0.0, 0.0
 	if in.Quantity > 0 && (in.StopPrice > 0 || in.TakeProfitPrice > 0) {
-		entry = stopEntryPrice(ctx, in.Symbol)
+		entry, leverage = stopEntryAndLeverage(ctx, in.Symbol)
+		// Keep a snapshot for log_trade's ROE (survives the close, unlike the
+		// monitor levels). Only when we actually captured an entry.
+		if entry > 0 {
+			recordOpenSnapshot(in.Symbol, entry, in.Quantity, leverage)
+		}
 	}
 
 	levels := risk.StopLevels{
@@ -180,6 +212,7 @@ func (BinanceStopMonitorTool) Execute(ctx context.Context, logger *slog.Logger, 
 		PositionQty:  in.Quantity,
 		PositionSide: in.PositionSide,
 		EntryPrice:   entry,
+		Leverage:     leverage,
 	}
 	globalStopMonitor.SetLevels(in.Symbol, levels)
 
@@ -215,30 +248,32 @@ func (BinanceStopMonitorTool) Execute(ctx context.Context, logger *slog.Logger, 
 		in.Symbol, in.PositionSide, in.Quantity, in.StopPrice, in.TakeProfitPrice, nativeNote)}, nil
 }
 
-// stopEntryPrice resolves the entry price of the symbol's open position so the
-// StopMonitor can estimate PnL on a triggered close. In paper mode it reads the
-// virtual book; otherwise it queries the exchange position. Best-effort: any
-// miss (no client, no position, parse error) returns 0, and LogStopClose then
-// skips the estimate exactly as before.
-func stopEntryPrice(ctx context.Context, symbol string) float64 {
+// stopEntryAndLeverage resolves the entry price AND leverage of the symbol's open
+// position so the StopMonitor can estimate PnL (entry vs mark) and ROE (PnL over
+// margin) on a triggered close. In paper mode it reads the virtual book; otherwise
+// it queries the exchange position (/fapi/v2/positionRisk, which carries both).
+// Best-effort: any miss (no client, no position, parse error) returns 0s — PnL is
+// then skipped and ROE omitted, exactly as before.
+func stopEntryAndLeverage(ctx context.Context, symbol string) (entry, leverage float64) {
 	if globalPaper != nil {
 		for _, p := range globalPaper.Positions() {
 			if p.Symbol == symbol {
-				return p.Entry
+				return p.Entry, p.Leverage
 			}
 		}
-		return 0
+		return 0, 0
 	}
 	cli, err := sharedBinanceClient()
 	if err != nil {
-		return 0
+		return 0, 0
 	}
 	rows, err := cli.Positions(ctx, symbol)
 	if err != nil || len(rows) == 0 {
-		return 0
+		return 0, 0
 	}
-	entry, _ := strconv.ParseFloat(rows[0].EntryPrice, 64)
-	return entry
+	entry, _ = strconv.ParseFloat(rows[0].EntryPrice, 64)
+	leverage, _ = strconv.ParseFloat(rows[0].Leverage, 64)
+	return entry, leverage
 }
 
 // closeSideFor returns the order side that FLATTENS a position of the given

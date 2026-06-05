@@ -194,9 +194,19 @@ func LogStopClose(event risk.StopCloseEvent) {
 		if event.Reason == "take-profit" {
 			reason = "停利"
 		}
+		// ROE on margin (matches Binance's ROE%): PnL ÷ initial margin, where
+		// margin = entry notional ÷ leverage. Appended only when we captured the
+		// leverage and entry at arm-time; omitted otherwise (no misleading number).
+		roeStr := ""
+		if event.EntryPrice > 0 && event.PositionQty > 0 && event.Leverage > 0 {
+			margin := event.EntryPrice * event.PositionQty / event.Leverage
+			if margin > 0 {
+				roeStr = fmt.Sprintf("，回報率 %+.1f%%（%gx）", pnl/margin*100, event.Leverage)
+			}
+		}
 		title := fmt.Sprintf("🛑 Friday StopMonitor: %s %s%s", event.Symbol, reason, tag)
-		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f",
-			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice)
+		body := fmt.Sprintf("%s %s %s約 %+.2f USDT，平倉價 %.4f%s",
+			bias, event.Symbol, outcomeWord, pnl, event.MarkPrice, roeStr)
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			// best-effort; don't fail the close for a notify error
 		}

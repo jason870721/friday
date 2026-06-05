@@ -159,6 +159,17 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 	// Large-PnL alert (PRD-021 §3): notify when this close's net wallet impact
 	// exceeds ±FRIDAY_NOTIFY_PNL_PCT of balance — a significant move the operator
 	// should know about without watching the TUI.
+	// Per-trade ROE on margin (matches Binance's ROE%): the reconciled net PnL over
+	// the position's initial margin (entry×qty ÷ leverage), read from the snapshot
+	// captured when the stop was armed (log_trade's own inputs carry no entry/qty/
+	// leverage). Omitted when no snapshot or leverage is unknown.
+	roeStr := ""
+	if snap, ok := openSnapshotFor(in.Symbol); ok && snap.entry > 0 && snap.qty > 0 && snap.leverage > 0 {
+		if margin := snap.entry * snap.qty / snap.leverage; margin > 0 {
+			roeStr = fmt.Sprintf("，回報率 %+.1f%%（%gx）", effective/margin*100, snap.leverage)
+		}
+	}
+
 	largeClose := globalNotifier != nil && balance > 0 && abs(effective) >= notifyPnLPct*balance
 	if largeClose {
 		tag := ""
@@ -166,8 +177,8 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 			tag = " [PAPER]"
 		}
 		title := fmt.Sprintf("📊 Friday 大額平倉: %s %s%s", in.Symbol, outcomeWord(effective), tag)
-		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（%.1f%% / 餘額 $%.2f），策略=%s",
-			in.Bias, in.Symbol, effective, effective/balance*100, balance, orNone(in.Strategy))
+		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（帳戶 %.1f%% / 餘額 $%.2f）%s，策略=%s",
+			in.Bias, in.Symbol, effective, effective/balance*100, balance, roeStr, orNone(in.Strategy))
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			logger.Warn("log_trade.notify_failed", "err", nerr)
 		}
@@ -182,8 +193,8 @@ func (LogTradeTool) Execute(ctx context.Context, logger *slog.Logger, raw json.R
 			tag = " [PAPER]"
 		}
 		title := fmt.Sprintf("💼 Friday 平倉: %s %s%s", in.Symbol, outcomeWord(effective), tag)
-		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（%.1f%% / 餘額 $%.2f），策略=%s",
-			in.Bias, in.Symbol, effective, effective/balance*100, balance, orNone(in.Strategy))
+		body := fmt.Sprintf("%s %s 淨盈虧 %+.4f USDT（帳戶 %.1f%% / 餘額 $%.2f）%s，策略=%s",
+			in.Bias, in.Symbol, effective, effective/balance*100, balance, roeStr, orNone(in.Strategy))
 		if nerr := globalNotifier.Notify(title, body); nerr != nil {
 			logger.Warn("log_trade.notify_failed", "err", nerr)
 		}
