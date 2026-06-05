@@ -33,14 +33,30 @@ func makerEntryEnabled() bool {
 	return false
 }
 
+// makerSuitableStrategy reports whether an entry's strategy is a PASSIVE,
+// fade-type setup for which a post-only maker LIMIT can realistically fill.
+// Mean-reversion / Bollinger entries buy a dip / sell a rip — price is reverting
+// TOWARD the entry, so a maker order at the mark rests and gets filled as the
+// market ticks into it. Momentum / breakout / ema_cross CHASE the move — price
+// runs AWAY from a passive limit, so a maker entry there just rejects or times
+// out and falls back to taker anyway (the live finding behind this gate). For
+// those, and for an unknown/blank strategy, go straight to a taker MARKET so the
+// entry isn't missed. Matching is substring + case-insensitive so "mean_reversion",
+// "mean-reversion", "MeanReversion", "bollinger" all hit.
+func makerSuitableStrategy(strategy string) bool {
+	s := strings.ToLower(strings.TrimSpace(strategy))
+	return strings.Contains(s, "mean") || strings.Contains(s, "boll")
+}
+
 // placeEntryOrder fills `quantity`, preferring a post-only maker LIMIT (half the
 // fee) and falling back to a MARKET taker if it won't rest or doesn't fully fill.
-// reduce_only or maker disabled → straight MARKET.
-func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logger, symbol string, side binance.OrderSide, quantity float64, reduceOnly bool) (*binance.OrderResponse, error) {
+// reduce_only, maker disabled, or a momentum/breakout (non-passive) strategy →
+// straight MARKET (see makerSuitableStrategy).
+func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logger, symbol string, side binance.OrderSide, quantity float64, reduceOnly bool, strategy string) (*binance.OrderResponse, error) {
 	if reduceOnly {
 		return cli.MarketOrder(ctx, symbol, side, quantity, true) // a close never rests
 	}
-	if !makerEntryEnabled() {
+	if !makerEntryEnabled() || !makerSuitableStrategy(strategy) {
 		recordEntryFill(symbol, "taker")
 		return cli.MarketOrder(ctx, symbol, side, quantity, false)
 	}
@@ -131,7 +147,8 @@ const binanceOrderSchema = `{
 		"symbol":      {"type": "string", "description": "Binance Futures symbol, e.g. BTCUSDT."},
 		"side":        {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY = long / close short; SELL = short / close long."},
 		"quantity":    {"type": "number", "exclusiveMinimum": 0, "description": "Quantity in base asset, e.g. 0.002. Must respect symbol step size."},
-		"reduce_only": {"type": "boolean", "default": false, "description": "If true, order can only reduce/close an existing position."}
+		"reduce_only": {"type": "boolean", "default": false, "description": "If true, order can only reduce/close an existing position."},
+		"strategy":    {"type": "string", "description": "OPTIONAL. The strategy that triggered this OPEN (momentum / breakout / mean_reversion / ema_cross / bollinger / divergence), from the Risk Manager's reason. When FRIDAY_MAKER_ENTRY is on, a passive fade strategy (mean_reversion / bollinger) is entered as a post-only maker LIMIT to halve the fee; momentum/breakout and all closes stay MARKET. Ignored for reduce_only."}
 	}
 }`
 
@@ -148,6 +165,7 @@ type binanceOrderInput struct {
 	Side       string  `json:"side"`
 	Quantity   float64 `json:"quantity"`
 	ReduceOnly bool    `json:"reduce_only,omitempty"`
+	Strategy   string  `json:"strategy,omitempty"`
 }
 
 func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw json.RawMessage) (tools.Result, error) {
@@ -265,7 +283,7 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		}
 	}
 
-	ord, err := placeEntryOrder(ctx, cli, logger, in.Symbol, side, in.Quantity, in.ReduceOnly)
+	ord, err := placeEntryOrder(ctx, cli, logger, in.Symbol, side, in.Quantity, in.ReduceOnly, in.Strategy)
 	if err != nil {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: %v", err)}, nil
 	}

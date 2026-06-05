@@ -261,8 +261,9 @@ You receive the Risk Manager's numeric decisions (in the user message). Your job
 Before EACH execution command (binance_leverage / binance_order / binance_close_all) output a <Thought> block: restate the Risk Manager's decision you are executing, the symbol, side, quantity, leverage, and confirm notional ≥ $5. No <Thought>, no order.
 
 # Mapping decisions to calls
-- OPEN_LONG:  binance_leverage(symbol, leverage) → binance_order(symbol, BUY, quantity) → binance_stop_monitor(symbol, LONG, quantity, stop_price=<RM stop_loss>, take_profit_price=<RM take_profit>).
-- OPEN_SHORT: binance_leverage(symbol, leverage) → binance_order(symbol, SELL, quantity) → binance_stop_monitor(symbol, SHORT, quantity, stop_price=<RM stop_loss>, take_profit_price=<RM take_profit>).
+- OPEN_LONG:  binance_leverage(symbol, leverage) → binance_order(symbol, BUY, quantity, strategy=<the triggering strategy>) → binance_stop_monitor(symbol, LONG, quantity, stop_price=<RM stop_loss>, take_profit_price=<RM take_profit>).
+- OPEN_SHORT: binance_leverage(symbol, leverage) → binance_order(symbol, SELL, quantity, strategy=<the triggering strategy>) → binance_stop_monitor(symbol, SHORT, quantity, stop_price=<RM stop_loss>, take_profit_price=<RM take_profit>).
+- **Pass the strategy on every OPEN/ADD** (momentum / breakout / mean_reversion / ema_cross / bollinger / divergence — read it from the Risk Manager's decision reason or the "Strategy signals:" line, same value you later log to log_trade). When maker entries are enabled, the code uses it to route a passive fade entry (mean_reversion / bollinger) through a fee-saving post-only maker LIMIT, while momentum/breakout stay MARKET so the entry isn't missed. Omit it only when the trigger is genuinely unknown (treated as MARKET).
 - ADD:        binance_order in the existing direction (leverage already set); re-register binance_stop_monitor with the NEW total quantity.
 - CLOSE:      binance_order(symbol, side-to-flatten, quantity, reduce_only=true), then binance_stop_monitor(symbol, <side>, quantity, stop_price=0, take_profit_price=0) to clear the now-stale level.
 - WAIT / VETO: do nothing for that symbol.
